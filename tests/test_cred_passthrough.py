@@ -304,6 +304,52 @@ def test_bundle_for_populates_blend_capable_map(settings, store, monkeypatch):
         "该模型 feats 为空 ⇒ False（带模型名的 i2i 用它应被拦下）")
 
 
+def test_bundle_for_populates_i2i_image_limits(settings, store, monkeypatch):
+    """🔴 `bundle_for` 建 cfg 时必须**顺带回填** i2i 垫图上限（同一张快照）。
+
+    2026-10-10 放开垫图上限：校验侧"声明优先、静态兜底"，
+    声明来自 `input_image_limit` 的**数组形态**（`byte_edit: max_image_num`）。
+    回填断了 ⇒ 永远走静态兜底 —— 声明就成了死旋钮（与 blend 门控当年
+    "登记了却没接线"同款病，用同款门禁盯住）。
+    手搓 spec **没有**新字段 ⇒ 当"没声明"处理，不报错（getattr 防御）。
+    """
+    from app.models import i2i_image_limits
+    from app.service import Service
+
+    class _Spec:
+        def __init__(self, feats, limits=None, scalar=None):
+            self.feats = feats
+            self.input_image_limits = limits
+            self.input_image_limit = scalar
+
+    class _Snap:
+        specs = {
+            # Pro：数组形态声明 byte_edit=10（实测形状）
+            "high_aes_general_v50p_large": _Spec(
+                ("byte_edit",), limits={"byte_edit": 10}),
+            # 另一个模型：只有标量形态 → 退模型级统一值
+            "high_aes_general_v50_flash": _Spec((), scalar=2),
+            # 手搓老形态：两个属性都没有 → 不进表
+            "legacy_spec": _Spec(()),
+        }
+
+    class _FakeCfg:
+        def __init__(self, _client):
+            pass
+
+        def snapshot(self):
+            return _Snap()
+
+    monkeypatch.setattr("app.service.ModelConfigCache", _FakeCfg)
+
+    svc = Service(settings, store=store, client=None, uploader=None, cfg=None)
+    svc.bundle_for("522ceab845a313502b72f5067534d191")
+    m = i2i_image_limits()
+    assert m.get("high_aes_general_v50p_large") == 10, "数组声明必须按 ability 读出"
+    assert m.get("high_aes_general_v50_flash") == 2, "标量声明退模型级统一值"
+    assert "legacy_spec" not in m, "没有声明的模型不进表 ⇒ 校验走静态兜底"
+
+
 
 def test_blend_gate_rejects_unsupported_model_before_submit(
         client, client_state, fake_jimeng, fake_uploader, service):

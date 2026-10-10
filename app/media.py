@@ -26,8 +26,8 @@ import httpx
 from .config import Settings
 from .errors import InvalidParameterError, UpstreamUnavailableError
 
-#: 多张垫图时**同时下载**几张。与 `Capability.max_images`（blend 上限 4）同量级。
-#: 下载是纯网络等待，并发收益接近线性；再高没有收益 —— 上限本来只有 4。
+#: 多张垫图时**同时下载**几张。与 `Capability.max_images`（blend 上限 10）同量级；
+#: 并发 4 对 10 张只是分三波，下载是纯网络等待、并发收益接近线性，够用。
 MAX_DOWNLOAD_PARALLELISM = 4
 
 #: 上游产物 URL 的形态（实测）：

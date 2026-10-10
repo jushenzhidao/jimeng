@@ -76,7 +76,7 @@ def test_multiple_input_images_are_never_silently_truncated(client):
         本来就是**列表**，所以**支持多张垫图**：全部上传、全部进草稿；
       · 后编辑三族（hd / pro-hd / outpaint）—— 上游用单个 `origin_image` 承载，
         多给必须**响亮 400**，不许静默丢；
-      · 全局另有一道 4 张的合理性上限（挡住"一次塞几百个 URL"）。
+      · 全局另有一道 10 张的合理性上限（挡住"一次塞几百个 URL"）。
 
     换句话说：**"支持"与"拒绝"必须是明确的两种行为，不允许有第三种（忽略）**。
     """

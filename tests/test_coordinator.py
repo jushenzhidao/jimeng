@@ -414,19 +414,36 @@ def test_model_without_declared_count_options_is_flagged(
 
 
 def test_image_count_has_a_global_ceiling(client, service):
-    """全局合理性上限：一次塞 6 张直接拒（真正的额度由能力声明决定）。
+    """全局合理性上限：一次塞 12 张直接拒（真正的额度由能力声明决定）。
 
-    ⚠️ `jimeng-i2i` 的按能力上限（4）与这里全局上限相等，所以"i2i 超限"这条
-    **不可单独到达** —— 全局那道先拦。两道并存的用意：全局那道挡住"一次塞几百个
-    URL"，免得在解析出能力之前就先做昂贵的图片校验；能力那道负责精确额度。
+    ⚠️ 2026-10-10 放开后 `jimeng-i2i` 的按能力上限（10）与这里全局上限相等，
+    所以"i2i 超限"这条**不可单独到达** —— 全局那道先拦。两道并存的用意：
+    全局那道挡住"一次塞几百个 URL"，免得在解析出能力之前就先做昂贵的图片校验；
+    能力那道负责精确额度（服务端按模型声明回填，可能小于 10）。
+    🔴 两道必须**一起**改：2026-10-10 前 capability 已声明 10 而全局钉 4，
+    结果"5 张就被全局 400"，声明形同虚设（用户截图实锤）。
     """
     r = client.post(BASE, json={"model": "jimeng-i2i", "prompt": "x",
-                                "image": [_data_uri(b) for b in _PNGS] * 2},
+                                "image": [_data_uri(b) for b in _PNGS] * 4},
                     headers=AUTH)
     assert r.status_code == 400, r.text
     msg = r.json()["error"]["message"]
-    assert "最多 4 张" in msg
+    assert "最多 10 张" in msg
+    assert "收到 12 张" in msg
     assert "jimeng-i2i" in msg, "要指路：只有 i2i 支持多张垫图"
+
+
+def test_i2i_accepts_more_than_four_reference_images(client):
+    """🔴 2026-10-10 放开：i2i 垫图 5~10 张**放行**（此前被全局 4 拦死）。
+
+    上游声明 `byte_edit: max_image_num=10`（docs/UPSTREAM.md §11），
+    适配器此前的保守值 4 比官方更紧 —— 调用方发 5 张就吃 400，
+    报错还暗示"4 是官方口径"，实为误导向。这条钉住"不再回退"。
+    """
+    refs = ["https://a/%d.png" % i for i in range(6)]   # 6 张：旧的 4 会拒、新的放行
+    r = client.post(BASE, json={"model": "jimeng-i2i", "prompt": "合成",
+                                "image": refs}, headers=AUTH)
+    assert r.status_code == 202, r.text
 
 
 @pytest.mark.parametrize("model,expect_tool", [

@@ -54,6 +54,10 @@ class ModelSpec:
     default_count: int | None = None
     resolution_map: dict[str, Any] | None = None
     input_image_limit: int | None = None
+    #: `input_image_limit` 的**数组形态**（按 ability 分）：
+    #: ``[{'max_image_num': 10, 'ability_name': 'byte_edit'}]`` → ``{'byte_edit': 10}``。
+    #: 标量与数组二选一出现（实测 5.0 Pro 给数组、`byte_edit` 就是 blend）。
+    input_image_limits: dict[str, int] | None = None
     feats: tuple[str, ...] | None = None
     raw: dict[str, Any] = field(default_factory=dict)
 
@@ -144,6 +148,20 @@ class ModelConfigCache:
     def input_image_limit(self, model: str) -> int | None:
         spec = self._spec(model)
         return spec.input_image_limit if spec else None
+
+    def input_image_limit_for(self, model: str, ability: str) -> int | None:
+        """该模型**某 ability** 声明的输入图上限。
+
+        优先读**按 ability 分**的数组形态（实测 5.0 Pro 的 `byte_edit` = 10）；
+        只有标量形态时退回模型级统一值；两者都没有 → None
+        （= 服务端没给依据，调用方走静态兜底，不许猜）。
+        """
+        spec = self._spec(model)
+        if not spec:
+            return None
+        if spec.input_image_limits is not None:
+            return spec.input_image_limits.get(ability)
+        return spec.input_image_limit
 
     def resolution_map(self, model: str) -> dict[str, Any] | None:
         spec = self._spec(model)
@@ -262,12 +280,15 @@ def _parse_model_list(items: list, notes: list[str]) -> dict[str, ModelSpec]:
         elif isinstance(feats_raw, list):
             feats = tuple(sorted(str(x) for x in feats_raw))
 
+        lim_n, lim_map = _parse_input_image_limit(it.get("input_image_limit"))
+
         specs[key] = ModelSpec(
             key=key,
             count_options=opts,
             default_count=_as_int(it.get("default_generate_count")),
             resolution_map=rmap,
-            input_image_limit=_as_int(it.get("input_image_limit")),
+            input_image_limit=lim_n,
+            input_image_limits=lim_map,
             feats=feats,
             raw=it,
         )
@@ -298,6 +319,36 @@ def _as_int(v: Any) -> int | None:
     if isinstance(v, str) and v.strip().lstrip("-").isdigit():
         return int(v.strip())
     return None
+
+
+def _parse_input_image_limit(v: Any) -> tuple[int | None, dict[str, int] | None]:
+    """`input_image_limit` 有**两种实测形态**，分别解析、互不猜：
+
+    · **标量**（int / 数字串）→ ``(n, None)`` —— 模型级统一上限；
+    · **数组**（按 ability 分）→ ``(None, {ability_name: max_image_num})``。
+      实测：``[{'max_image_num': 10, 'ability_name': 'byte_edit'}]``
+      （`byte_edit` 就是 blend / 图生图；5.0 Lite 未声明该字段）。
+      🔴 2026-10-10 前 `_as_int()` 读数组恒得 None ⇒ 声明了却读不出，
+      i2i 只能钉保守值 4 —— 本函数就是为放开它而写。
+    · 其他形状 → ``(None, None)``（= 读不到）。**任何元素畸形则整体不认**
+      （与"认不出的字段一律当读不到"同一纪律：一半真一半猜比全猜更危险）。
+    """
+    n = _as_int(v)
+    if n is not None:
+        return n, None
+    if not isinstance(v, (list, tuple)):
+        return None, None
+    out: dict[str, int] = {}
+    for it in v:
+        if not isinstance(it, dict):
+            return None, None
+        ability = it.get("ability_name")
+        num = _as_int(it.get("max_image_num"))
+        if not (isinstance(ability, str) and ability.strip()) \
+                or num is None or num <= 0:
+            return None, None
+        out[ability.strip()] = num
+    return (None, out) if out else (None, None)
 
 
 __all__ = ["ModelSpec", "Snapshot", "ModelConfigCache", "parse_common_config",

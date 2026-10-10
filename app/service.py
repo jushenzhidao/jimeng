@@ -281,15 +281,40 @@ def view(rec: TaskRecord) -> tuple[int, dict[str, Any]]:
 # 服务
 # ---------------------------------------------------------------------------
 
-#: 多张垫图时**同时上传**几张。与 `Capability.max_images`（blend 上限 4）同量级；
+#: 多张垫图时**同时上传**几张。与 `Capability.max_images`（blend 上限 10）同量级；
 #: 再高没有收益 —— 每次上传要走 apply/put/commit 三段，而且并发取 STS 本来就有双检锁
 #: （不会退化成每张各签一次），瓶颈在上游侧的往返，不在我们开几个线程。
 MAX_UPLOAD_PARALLELISM = 4
 
 #: `image` 数组的**全局**合理性上限。真正的额度由各能力声明
-#: （`Capability.max_images`）决定；这里只拦"一次塞几百个 URL"这种明显不合理的请求，
+#: （`Capability.max_images` + 服务端按模型的声明回填）决定；
+#: 这里只拦"一次塞几百个 URL"这种明显不合理的请求，
 #: 免得在还没解析出能力之前就先去做昂贵的图片校验。
-MAX_INPUT_IMAGES = 4
+#: 🔴 必须 ≥ 最大的按能力上限：2026-10-10 放开 i2i 到服务端声明的 10 张
+#: （`input_image_limit` 数组形态的 `byte_edit: max_image_num`）⇒ 这里同步 4 → 10；
+#: 将来上游声明再调大，改能力上限时**必须连着改这里**（否则全局先拦、
+#: 能力值形同虚设 —— 就是这次截图里"5 张被 400"的成因）。
+MAX_INPUT_IMAGES = 10
+
+
+def _spec_image_limit(spec: Any) -> int | None:
+    """从一条模型 spec 里取 `byte_edit`（blend）的垫图上限**声明值**。
+
+    数组形态（`spec.input_image_limits`，按 ability 精确值）优先，
+    标量形态（`spec.input_image_limit`，模型级统一值）兜底；
+    都没有 ⇒ None（该模型不进回填表 ⇒ 校验走静态上限）。
+    getattr 防御：snapshot 可能来自测试手搓的 spec（没有新字段不报错，
+    只是当"没声明"处理）。
+    """
+    limits = getattr(spec, "input_image_limits", None)
+    if isinstance(limits, dict):
+        v = limits.get("byte_edit")
+        if isinstance(v, int) and not isinstance(v, bool) and v > 0:
+            return v
+    scalar = getattr(spec, "input_image_limit", None)
+    if isinstance(scalar, int) and not isinstance(scalar, bool) and scalar > 0:
+        return scalar
+    return None
 
 
 #: 上传**一张**被限流时最多尝试几次（指数退避，封顶 8s）。
@@ -488,14 +513,24 @@ class Service:
         cfg = cfg or self.cfg
         if cfg is None:
             models.set_blend_capable({})
+            models.set_i2i_image_limits({})
             return 0
         snap = cfg.snapshot()
         if snap is None:
             models.set_blend_capable({})
+            models.set_i2i_image_limits({})
             return 0
         models.set_blend_capable({
             key: bool(spec.feats and "byte_edit" in spec.feats)
             for key, spec in snap.specs.items()
+        })
+        #: 同一张快照顺带回填**垫图上限**（`input_image_limit` 按 ability 分，
+        #: `byte_edit` 就是 blend）。getattr 防御：快照可能来自测试手搓的 spec。
+        models.set_i2i_image_limits({
+            key: lim
+            for key, spec in snap.specs.items()
+            # 数组形态（按 ability 精确值）优先，标量形态退模型级统一值
+            if (lim := _spec_image_limit(spec)) is not None
         })
         return len(snap.specs)
 

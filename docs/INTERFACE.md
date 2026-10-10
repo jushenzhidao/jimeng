@@ -279,9 +279,9 @@ Content-Type: application/json
 |---|---|---|
 | `jimeng-t2i`（文生图） | 0 | 必须传 `[]`；传了会 400 |
 | `jimeng-hd` / `jimeng-pro-hd` / `jimeng-outpaint` | **1** | 上游用单个 `origin_image` 承载；**多传会明确 400** |
-| `jimeng-i2i`（图生图） | **1–4**（多张垫图） | 上游草稿的 `image_uri_list` / `image_list` 本来就是列表；**顺序即请求顺序** |
+| `jimeng-i2i`（图生图） | **1–10**（多张垫图） | 上游草稿的 `image_uri_list` / `image_list` 本来就是列表；**顺序即请求顺序**。10 = 服务端声明（`byte_edit: max_image_num`），未读到声明时按 10 兜底 |
 
-- 全局另有一道 4 张的合理性上限（挡住"一次塞几百个 URL"）。
+- 全局另有一道 10 张的合理性上限（挡住"一次塞几百个 URL"）。
 - 🔴 **三种行为只有两种**：要么**支持**（全部上传、全部进草稿），要么**明确拒绝**。
   **绝不存在第三种（收下 N 张却只用第 1 张）** —— 那会让调用方以为用了 N 张。
 - 张数超限一律 `400 invalid_parameter`（`param="image"`），信息里会写明上限与应有做法。

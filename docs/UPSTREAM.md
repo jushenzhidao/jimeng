@@ -260,10 +260,18 @@ STS 双检锁 + 内容哈希→uri 缓存 + in-flight 去重（并发同内容 8
 **输入图上限** —— `input_image_limit` 原生是**数组、按 ability 分**：
 `[{'max_image_num': 10, 'ability_name': 'byte_edit'}]`
 （`byte_edit` 就是 blend / 图生图那个 ability；5.0 Lite 未声明该字段）。
-🔴 我们这边 `capabilities.py` 用 `_as_int()` 读它 ⇒ **对数组恒得 `None`**
-（且目前没有消费方，所以是"声明了却常为 None 的死旋钮"）。
-⚠️ 也就是说 `Capability.max_images`（i2i 现在写死 4）**比上游声明的 10 更保守** ——
-要放开得先按数组解析这个字段。
+
+> ✅ **2026-10-10 已放开**（历史结论保留如下）：`capabilities.py` 新增
+> `_parse_input_image_limit()` 同时认**标量与数组**两形态，
+> `ModelSpec.input_image_limits` 存按 ability 的映射；
+> `refresh_blend_capability` 回填进 `models._I2I_IMAGE_LIMITS`，
+> 校验侧**声明优先、静态兜底**（`Capability.max_images` = 10 = 上游声明快照）。
+> 全局 `MAX_INPUT_IMAGES` 同步 4 → 10（两处必须一起改，否则全局先拦）。
+>
+> 🔴 我们这边 `capabilities.py` 用 `_as_int()` 读它 ⇒ **对数组恒得 `None`**
+> （且目前没有消费方，所以是"声明了却常为 None 的死旋钮"）。
+> ⚠️ 也就是说 `Capability.max_images`（i2i 现在写死 4）**比上游声明的 10 更保守** ——
+> 要放开得先按数组解析这个字段。
 
 ⇒ 运行期读取并缓存（`app/upstream/jimeng/capabilities.py`），
 **代码里那份快照只作探测失败时的兜底，且会如实标注降级**。

@@ -365,16 +365,18 @@ CAPABILITIES: tuple[Capability, ...] = (
         #: 草稿里是 `abilities.blend.ability_list[0].image_uri_list`（列表）
         #: 与 `image_list`（列表）—— 所以多张垫图就是往这两个列表里多放元素，
         #: 不需要额外的组件串链（后编辑那三族才需要）。
-        #: ⚠️ 4 是**保守值**：上游声明的比它宽 —— `get_common_config` 的
-        #: `input_image_limit` = `[{'max_image_num': 10, 'ability_name': 'byte_edit'}]`
-        #: （`byte_edit` 就是 blend）⇒ 5.0 Pro 允许 **10** 张垫图。
-        #: 但那个字段我们**读不出来**（`capabilities.py` 用 `_as_int()` 读数组 ⇒ 恒 None），
-        #: 所以先钉 4。要放开得先把解析改成按数组取 `max_image_num`，
-        #: 并同步抬高全局 `MAX_INPUT_IMAGES`。详见 `docs/UPSTREAM.md` §11。
-        max_images=4,
+        #: 🔴 10 = **上游声明值的静态快照**（2026-10-10 放开，此前钉保守值 4）：
+        #: `get_common_config` 的 `input_image_limit` 按 ability 给
+        #: `[{'max_image_num': 10, 'ability_name': 'byte_edit'}]`
+        #: （`byte_edit` 就是 blend）⇒ 5.0 Pro 声明 **10** 张垫图。
+        #: 运行期由 `refresh_blend_capability` 把服务端声明回填进
+        #: `_I2I_IMAGE_LIMITS`（按上游模型各自生效），此处 10 只是
+        #: "没读到能力表"时的兜底。详见 `docs/UPSTREAM.md` §11。
+        max_images=10,
         notes="输入图由本服务自动上传成即梦资产 uri；**必须给 prompt**"
               "（描述要怎么改）——这是它与后编辑三工具的关键区别。"
-              "支持**多张垫图**（最多 4 张，超出会明确报错）。"
+              "支持**多张垫图**（服务端声明上限 10 张，未读到声明时按 10 兜底；"
+              "超出会明确报错）。"
               "支持**指定张数** `n`（走 `abilities.gen_option.gen_count`）。"
               "⚠️ 上游**预报**积分与张数不成正比：n=1 报 59 / n=4 报 55 —— 那是 "
               "`forecast`（高估口径），**实扣为 0**（免费，账号所有者确认；"
@@ -745,6 +747,37 @@ def blend_capable_map() -> dict[str, bool]:
     return dict(_BLEND_CAPABLE)
 
 
+#: 由 `service.Service` 从能力表回填：`{上游 key: byte_edit 的 max_image_num}`。
+#: 数据源 = `get_common_config` 的 `input_image_limit`（**按 ability 分的数组**，
+#: 实测 5.0 Pro 声明 `byte_edit: 10`）。**没回填的模型** ⇒ 用
+#: `Capability.max_images` 的静态兜底（10）—— 5.0 Lite 未声明该字段，
+#: 属于"没有依据"，静态兜底就是给这种模型用的。
+_I2I_IMAGE_LIMITS: dict[str, int] = {}
+
+
+def set_i2i_image_limits(mapping: dict[str, int]) -> None:
+    """回填"各上游模型的垫图上限"（由 Service 调，测试可直接注入）。
+
+    值 <=0 或非正的条目**丢弃**（声明畸形 = 没有依据，走静态兜底）。
+    """
+    _I2I_IMAGE_LIMITS.clear()
+    _I2I_IMAGE_LIMITS.update(
+        {k: int(v) for k, v in mapping.items() if isinstance(v, (int, float))
+         and int(v) > 0})
+
+
+def i2i_image_limits() -> dict[str, int]:
+    """当前已回填的垫图上限表（**副本**）。空 dict = 没读到 ⇒ 全走静态兜底。"""
+    return dict(_I2I_IMAGE_LIMITS)
+
+
+def i2i_image_limit_for(upstream_key: str | None) -> int | None:
+    """该上游模型的垫图上限**声明值**；没读到返回 None（调用方用静态兜底）。"""
+    if not upstream_key:
+        return None
+    return _I2I_IMAGE_LIMITS.get(upstream_key)
+
+
 def resolve(model: str | None, *, has_image: bool,
             n_images: int = 1, video: bool = False) -> tuple[Capability, str | None]:
     """解析 `model`，返回 (能力, 上游模型 key 或 None)。
@@ -822,7 +855,8 @@ def resolve(model: str | None, *, has_image: bool,
             raise InvalidParameterError(
                 f"model {raw!r}（{cap.title}）属于{'视频' if cap.media == 'video' else '图片'}族，"
                 f"请走 {where}。", param="model")
-        _check_shape(cap, raw=raw, has_image=has_image, n_images=n_images)
+        _check_shape(cap, raw=raw, has_image=has_image, n_images=n_images,
+                     upstream_model=upstream_model)
         return cap, upstream_model
 
     # ---- 默认能力：只在无歧义时给（**在声明的媒体池内**推导）----
@@ -841,8 +875,11 @@ def resolve(model: str | None, *, has_image: bool,
              and not (has_image and not c.image_required)]
     if len(cands) == 1:
         # 默认分支同样要过形态校验（含张数上限）—— 否则"省掉 model"就成了绕过校验的口子
+        # 🔴 upstream_model 传**执行期等价值**：默认分支里 t2i/i2i 都不带显式
+        # 上游模型 ⇒ 执行侧 `or DEFAULT_MODEL` 兜底 —— 校验侧必须用同一个 key
+        # 查声明值，否则会出现"校验按 A 的上限、执行跑 B 的模型"的错位。
         _check_shape(cands[0], raw=cands[0].api_id, has_image=has_image,
-                     n_images=n_images)
+                     n_images=n_images, upstream_model=DEFAULT_UPSTREAM_MODEL)
         eff = (DEFAULT_UPSTREAM_MODEL if cands[0].name == "t2i" else None)
         if raw and _LAST_FALLBACK:
             _LAST_FALLBACK[raw] = eff or cands[0].api_id
@@ -861,8 +898,15 @@ def resolve(model: str | None, *, has_image: bool,
 
 
 def _check_shape(cap: Capability, *, raw: str, has_image: bool,
-                 n_images: int = 1) -> None:
-    """能力与请求形态必须自洽 —— 不自洽就在**发出上游请求之前**报 400。"""
+                 n_images: int = 1,
+                 upstream_model: str | None = None) -> None:
+    """能力与请求形态必须自洽 —— 不自洽就在**发出上游请求之前**报 400。
+
+    `upstream_model`：执行期将使用的**上游模型 key**（i2i 常为 None ⇒ 执行侧
+    会兜底 `DEFAULT_MODEL`，调用方应传同一个等价值）。它只参与**垫图上限**的
+    精确化：i2i 的上限优先用服务端按模型声明的值（`_I2I_IMAGE_LIMITS`），
+    没读到声明才退 `Capability.max_images` 静态兜底。
+    """
     if cap.image_required and not has_image:
         raise InvalidParameterError(
             f"model {raw!r}（{cap.title}）需要输入图，但本次请求的 image 为空。"
@@ -873,14 +917,23 @@ def _check_shape(cap: Capability, *, raw: str, has_image: bool,
             f"model {raw!r}（{cap.title}）不接受输入图，但本次请求带了 image。"
             f"请改用 jimeng-i2i / jimeng-hd / jimeng-pro-hd / jimeng-outpaint。",
             param="image")
-    if n_images > cap.max_images:
-        multi = ("支持多张垫图，但" if cap.max_images > 1 else "")
+    #: 垫图上限：**声明优先，静态兜底**（"能读的就不许猜"的镜像面：
+    #: 读得到声明就别再拿静态快照当真值）。
+    #: 🔴 只对 `i2i` 生效：声明值是上游按 **blend 的 `byte_edit` ability** 给的，
+    #: 不能拿去放宽 audit / omni-video（它们的素材语义不同、上限是各自的 4）。
+    limit = cap.max_images
+    if cap.name == "i2i":
+        declared = i2i_image_limit_for(upstream_model or DEFAULT_UPSTREAM_MODEL)
+        if declared:
+            limit = declared
+    if n_images > limit:
+        multi = ("支持多张垫图，但" if limit > 1 else "")
         raise InvalidParameterError(
-            f"model {raw!r}（{cap.title}）{multi}最多接受 {cap.max_images} 张输入图，"
+            f"model {raw!r}（{cap.title}）{multi}最多接受 {limit} 张输入图，"
             f"本次给了 {n_images} 张。"
             f"（本服务**不会静默忽略多余的图** —— 那会让你以为用了 {n_images} 张、"
-            f"实际只用了 {cap.max_images} 张。"
-            + ("要多张垫图请用 jimeng-i2i。" if cap.max_images == 1 else "")
+            f"实际只用了 {limit} 张。"
+            + ("要多张垫图请用 jimeng-i2i。" if limit == 1 else "")
             + "）",
             param="image")
 

@@ -531,6 +531,62 @@ def test_blend_capability_is_read_from_server_not_hardcoded():
     assert upstream_supports_blend("never-heard-of-this-model") is False
 
 
+# ---------------------------------------------------------------------------
+# i2i 垫图上限：静态兜底 10 + 服务端声明回填（2026-10-10 放开，此前钉 4）
+# ---------------------------------------------------------------------------
+
+def test_i2i_accepts_up_to_ten_reference_images():
+    """🔴 静态兜底 = 10（上游声明的 `byte_edit: max_image_num` 快照）。
+
+    此前钉 4 比官方更紧：调用方发 5 张就吃 400，报错还把 4 说是"官方口径"。
+    6 张（旧值必拒）与 10 张（新上界）都必须能过 resolve 的形态校验。
+    """
+    from app.models import resolve, set_i2i_image_limits
+
+    set_i2i_image_limits({})          # 没读到声明 ⇒ 静态兜底
+    for n in (6, 10):
+        cap, _ = resolve("jimeng-i2i", has_image=True, n_images=n)
+        assert cap.name == "i2i"
+    with pytest.raises(Exception) as ei:
+        resolve("jimeng-i2i", has_image=True, n_images=11)
+    assert "最多接受 10 张" in str(ei.value)
+
+
+def test_i2i_declared_limit_overrides_static_when_backfilled():
+    """服务端声明**优先于**静态兜底：声明 3 就按 3 拦（声明更小也照拦）。
+
+    "能读的就不许猜"的镜像面 —— 读得到声明就别拿静态快照当真值；
+    反过来声明比静态宽（如 20）也应放行到声明值。
+    """
+    from app.models import DEFAULT_UPSTREAM_MODEL, resolve, set_i2i_image_limits
+
+    try:
+        set_i2i_image_limits({DEFAULT_UPSTREAM_MODEL: 3})
+        with pytest.raises(Exception) as ei:
+            resolve("jimeng-i2i", has_image=True, n_images=4)
+        assert "最多接受 3 张" in str(ei.value)
+        resolve("jimeng-i2i", has_image=True, n_images=3)      # 恰好等于：放行
+
+        set_i2i_image_limits({DEFAULT_UPSTREAM_MODEL: 20})
+        resolve("jimeng-i2i", has_image=True, n_images=15)     # 超静态、合声明
+    finally:
+        set_i2i_image_limits({})   # 🔴 模块级状态，别串味到别的用例
+
+
+def test_i2i_declared_limit_does_not_leak_to_other_capabilities():
+    """声明是 **blend 的 `byte_edit`** 给的，不能拿去放宽 audit / omni-video
+    （它们的素材语义不同、各自上限 4）。"""
+    from app.models import DEFAULT_UPSTREAM_MODEL, resolve, set_i2i_image_limits
+
+    try:
+        set_i2i_image_limits({DEFAULT_UPSTREAM_MODEL: 10})
+        with pytest.raises(Exception) as ei:
+            resolve("jimeng-omni-video", has_image=True, n_images=5, video=True)
+        assert "最多接受 4 张" in str(ei.value)
+    finally:
+        set_i2i_image_limits({})
+
+
 def test_upstream_name_tables_do_not_drift():
     """`UPSTREAM_MODEL_KEYS` 与 `UPSTREAM_WEB_NAMES` 必须是**同一集合**。
 

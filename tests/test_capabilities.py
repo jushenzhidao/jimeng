@@ -90,6 +90,65 @@ def test_boolean_is_not_accepted_as_a_number():
 
 
 # ---------------------------------------------------------------------------
+# input_image_limit：标量与**数组**两形态（2026-10-10 放开 i2i 垫图上限的依据）
+# ---------------------------------------------------------------------------
+
+#: 实测数组形态（5.0 Pro）：按 ability 分，`byte_edit` 就是 blend / 图生图。
+ARRAY_SAMPLE = {
+    "data": {"model_list": [
+        {"model_req_key": "high_aes_general_v50p",
+         "input_image_limit": [
+             {"max_image_num": 10, "ability_name": "byte_edit"}]},
+    ]}
+}
+
+
+def test_input_image_limit_array_form_is_parsed_per_ability():
+    """🔴 此前 `_as_int()` 读数组恒得 None ⇒ 声明了却读不出，i2i 只能钉 4。
+    数组形态必须按 ability 解析出来。"""
+    specs, _ = parse_common_config(ARRAY_SAMPLE)
+    spec = specs["high_aes_general_v50p"]
+    assert spec.input_image_limit is None, "数组形态不该再产出标量"
+    assert spec.input_image_limits == {"byte_edit": 10}
+
+
+def test_input_image_limit_scalar_form_still_works():
+    """标量形态（老样本 SAMPLE 里 v50 的 `input_image_limit: 1`）保持原语义。"""
+    specs, _ = parse_common_config(SAMPLE)
+    assert specs["high_aes_general_v50"].input_image_limit == 1
+    assert specs["high_aes_general_v50"].input_image_limits is None
+
+
+def test_input_image_limit_malformed_array_is_rejected_wholesale():
+    """任何元素畸形 ⇒ **整体**当读不到（一半真一半猜比全猜更危险）。"""
+    for bad in (
+        ["not-a-dict"],                                     # 元素不是 dict
+        [{"ability_name": "byte_edit"}],                    # 缺 max_image_num
+        [{"max_image_num": 10}],                            # 缺 ability_name
+        [{"max_image_num": 0, "ability_name": "byte_edit"}],  # 0 无意义
+        [{"max_image_num": True, "ability_name": "byte_edit"}],  # bool 不是数
+    ):
+        specs, _ = parse_common_config(
+            {"data": {"model_list": [{"model_req_key": "m",
+                                      "input_image_limit": bad}]}})
+        assert specs["m"].input_image_limits is None, f"畸形形态被当真了：{bad}"
+        assert specs["m"].input_image_limit is None
+
+
+def test_input_image_limit_for_query_prefers_array_then_scalar():
+    """查询优先按 ability 精确值；只有标量时退模型级统一值；都没有 → None。"""
+    c = _StubClient(ARRAY_SAMPLE)
+    cache = ModelConfigCache(c, ttl=999)
+    assert cache.input_image_limit_for("high_aes_general_v50p", "byte_edit") == 10
+    assert cache.input_image_limit_for("high_aes_general_v50p", "other") is None
+    assert cache.input_image_limit_for("no_such_model", "byte_edit") is None
+
+    c2 = _StubClient(SAMPLE)
+    cache2 = ModelConfigCache(c2, ttl=999)
+    assert cache2.input_image_limit_for("high_aes_general_v50", "byte_edit") == 1
+
+
+# ---------------------------------------------------------------------------
 # 缓存行为
 # ---------------------------------------------------------------------------
 
