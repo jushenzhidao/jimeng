@@ -46,6 +46,8 @@ from .coordinator import Coordinator
 from .errors import (
     AdapterError,
     AuthError,
+    ContentPolicyError,
+    EmptyResultError,
     InvalidParameterError,
     SyncUnavailableError,
 )
@@ -321,6 +323,16 @@ def _install_routes(app: FastAPI) -> None:
           · 没有推进者（协调器线程没在跑）→ **503**（`sync_unavailable`）快速
             失败，而不是让调用方白等 —— 那种部署形态下任务根本不会被推进。
 
+        🔴 2026-10-10 用户口径 —— 终态失败里**两种直接抛 HTTP 错误**，
+        不再回 200 + failure 体：
+          · **空图**（上游报成功却零产物）→ **500**（`EmptyResultError`）；
+          · **内容审核拒绝** → **451**（`ContentPolicyError`，换 prompt/素材
+            才有用，原样重试必再拒）。
+        判据是落库的 `error.type`（`_fail` 存的就是 `to_error()["error"]`），
+        不做 message 字符串匹配。其余失败（风控/限流/额度/上游故障…）
+        保持 `view()` 的 200 + failure 体 —— 它们的语义是"任务完成了、
+        结果是失败"，且部分带 Retry-After，转成裸 HTTP 码反而丢信息。
+
         内部链路与异步受理完全一致：落库 → 叫醒协调器 → 等库里的状态变化。
         等待期间**不发任何上游请求**（推进是协调器线程的职责，这里只读库）。
         """
@@ -340,6 +352,22 @@ def _install_routes(app: FastAPI) -> None:
         coordinator.wake()
         rec = svc.wait_terminal(rec.task_id, credential,
                                 max_wait=settings.sync_max_wait)
+
+        # 🔴 2026-10-10 用户口径：终态失败按类型转 HTTP 错误（空图 500 /
+        # 审核 451），判据是落库 error 里的 `type` —— `_fail` 存的就是
+        # `to_error()["error"]`，type 与错误类一一对应，重建即可。
+        # detail 原样带回（fail_key、upstream_status 等排查上下文不丢）。
+        if rec.status == "failure":
+            stored = rec.error or {}
+            etype = stored.get("type")
+            if etype == ContentPolicyError.err_type:
+                raise ContentPolicyError(
+                    stored.get("message") or "内容审核未通过",
+                    **(stored.get("detail") or {}))
+            if etype == EmptyResultError.err_type:
+                raise EmptyResultError(
+                    stored.get("message") or "上游报成功但零产物",
+                    **(stored.get("detail") or {}))
 
         status_code, payload = view(rec)
         headers: dict[str, str] = {}

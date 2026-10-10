@@ -40,6 +40,7 @@ from .errors import (
     CapabilityNotWiredError,
     CapabilityUnavailableError,
     ContentPolicyError,
+    EmptyResultError,
     InvalidParameterError,
     RiskControlError,
     TaskNotFoundError,
@@ -1543,8 +1544,12 @@ class Service:
         # 终态 `status=50` 却**零产物**时，报 `success` + 空 `data` 就是
         # "静默按少的交付"的极端情形 —— 调用方会拿到一个看起来成功、
         # 实际什么都没有的响应。这种一律按失败处理。
+        # 🔴 用 `EmptyResultError`（500）而不是 502"上游故障"：
+        # 同步端点要按 error.type 精确识别它并抛 HTTP 500
+        # （用户口径 2026-10-10）—— 混在 upstream_error 里就得靠
+        # 字符串匹配 message，那太脆。
         if not st.images:
-            self._fail(rec, UpstreamUnavailableError(
+            self._fail(rec, EmptyResultError(
                 f"上游报成功但**零产物**（status={st.status} {st.status_name}）。"
                 f"本服务不交付空成功，请重试或联系上游。",
                 upstream="jimeng", upstream_status=st.status_name))

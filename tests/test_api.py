@@ -11,7 +11,8 @@ from typing import Any
 
 import pytest
 
-from tests.conftest import AUTH, AUTH_B, KEY_B, failed_state, ok_state
+from tests.conftest import (AUTH, AUTH_B, KEY_B, failed_state, ok_state,
+                            submitted_state)
 
 BASE = "/async/v1/images/generations"
 
@@ -542,13 +543,64 @@ def test_sync_single_call_returns_final_result(sync_client, client_state,
 
 
 def test_sync_failure_is_a_200_with_failure_status(sync_client, fake_jimeng):
-    """任务失败也是"完整的答案"：直接回 `failure` 体，调用方无需再轮询。"""
+    """普通失败（风控/限流/额度/上游故障…）仍是"完整的答案"：
+    直接回 `failure` 体，调用方无需再轮询。
+
+    🔴 边界（2026-10-10 用户口径）：**空图**与**内容审核**两种失败
+    不走这条路 —— 它们直接抛 500 / 451（见下面两个用例）。
+    """
     fake_jimeng.states = [failed_state("generate_failed")]
     r = sync_client.post(SYNC, json={"model": "jimeng-t2i", "prompt": "x"},
                          headers=AUTH)
     assert r.status_code == 200, r.text
     assert r.json()["status"] == "failure"
     assert r.json()["error"]
+
+
+def test_sync_empty_result_raises_500(sync_client, fake_jimeng):
+    """🔴 空图（终态成功却零产物）⇒ 同步接口**直接抛 500**。
+
+    用户口径 2026-10-10：调用方拿一个 200 + `data: []` 的"成功体"
+    等于被骗 —— 同步是一锤子买卖，没有东西就说没有，用状态码说。
+    判据链：零产物落库为 `empty_result_error` ⇒ 同步端点按 type 转抛。
+    """
+    from app.upstream.jimeng.client import TaskState
+
+    empty = TaskState(submit_id="upstream-submit-id", status=50,
+                      status_name="success", finished=True, failed=False)
+    empty.images = []  # 不构造任何 GeneratedImage —— 就是零产物
+    fake_jimeng.states = [submitted_state(), empty]
+
+    r = sync_client.post(SYNC, json={"model": "jimeng-t2i", "prompt": "x"},
+                         headers=AUTH)
+    assert r.status_code == 500, r.text
+    err = r.json()["error"]
+    assert err["type"] == "empty_result_error"
+    assert "零产物" in err["message"]
+
+
+def test_sync_content_policy_raises_451(sync_client, fake_jimeng):
+    """🔴 内容审核拒绝 ⇒ 同步接口**直接抛 451**。
+
+    用户口径 2026-10-10：审核失败原样重试必再拒（还可能每次都计费），
+    200 + failure 体骗不出这个性质 —— 451 让调用方一眼分流。
+    场景用 2026-10-02 实锤的形态：`fail_code` 为空、真因只在
+    `fail_starling_key`（版权拦截）。
+    """
+    from app.upstream.jimeng.client import TaskState
+
+    blocked = TaskState(submit_id="upstream-submit-id", status=30,
+                        status_name="generate_failed", finished=True,
+                        failed=True, fail_code=None,
+                        fail_key="web_fail2generate_copyright_block")
+    fake_jimeng.states = [submitted_state(), blocked]
+
+    r = sync_client.post(SYNC, json={"model": "jimeng-t2i", "prompt": "x"},
+                         headers=AUTH)
+    assert r.status_code == 451, r.text
+    err = r.json()["error"]
+    assert err["type"] == "content_policy_violation"
+    assert err["message"]
 
 
 def test_sync_timeout_degrades_to_async_polling(client_factory):

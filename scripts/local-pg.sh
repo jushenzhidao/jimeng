@@ -54,7 +54,7 @@ cmd_init() {
   pwfile="$(mktemp)"
   # 用文件传密码，避免出现在 ps 的命令行里
   printf '%s' "$PGPASSWORD_LOCAL" > "$pwfile"
-  info "初始化集群：$PGDATA（超级用户 $PGUSER_LOCAL，端口 $PGPORT）"
+  info "初始化集群：$PGDATA（超级用户 $PGUSER_LOCAL，端口 ${PGPORT}）"
   "$PGBIN/initdb" -D "$PGDATA" -U "$PGUSER_LOCAL" --pwfile="$pwfile" \
     --encoding=UTF8 --locale=C --auth-local=scram-sha-256 --auth-host=scram-sha-256 \
     >"$INITDB_LOG" 2>&1 || { rm -f "$pwfile"; die "initdb 失败，见 $INITDB_LOG"; }
@@ -66,7 +66,7 @@ cmd_start() {
   need_bin pg_ctl
   [ -s "$PGDATA/PG_VERSION" ] || die "数据目录未初始化，先跑：$0 init"
   if running; then
-    info "已在运行（端口 $PGPORT）"
+    info "已在运行（端口 ${PGPORT}）"
   else
     info "启动中…"
     # 只监听回环：开发库不该暴露到局域网
@@ -108,7 +108,7 @@ cmd_stop() {
 
 cmd_status() {
   if running; then
-    info "运行中：$PGDATA（端口 $PGPORT）"
+    info "运行中：$PGDATA（端口 ${PGPORT}）"
   else
     info "未运行：$PGDATA"
   fi

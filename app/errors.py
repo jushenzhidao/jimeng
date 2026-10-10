@@ -116,6 +116,26 @@ class UpstreamUnavailableError(AdapterError):
     retryable = True
 
 
+class EmptyResultError(AdapterError):
+    """上游报**成功**却**零产物** —— 本服务不交付空成功（用户口径 2026-10-10）。
+
+    🔴 与 `UpstreamUnavailableError`（上游故障·可重试）刻意分开：
+    零产物不是"上游打不通"，是"上游说好了却没交货" —— 调用方要的
+    不是"可重试"的分类学，是一个**没有东西**的明确宣告。
+
+    同步端点（`POST /v1/images/generations`）对它**直接抛 HTTP 500**
+    （`view()` 的"失败也回 200"只服务异步查询族 —— 那里调用方还要
+    继续轮询别的任务；同步是"一锤子买卖"，200 里藏失败等于骗人）。
+    之所以从 502 改 500：按口径它落在"我方交付失败"一侧，不是
+    "上游暂时不可用" —— 别让调用方的 502 重试逻辑对它空转。
+    """
+
+    status_code = 500
+    err_type = "empty_result_error"
+    err_code = "upstream_empty_result"
+    retryable = True
+
+
 class UpstreamTimeoutError(AdapterError):
     status_code = 504
     err_type = "upstream_timeout_error"
@@ -201,7 +221,7 @@ class SyncUnavailableError(AdapterError):
 __all__ = [
     "AdapterError", "InvalidParameterError", "ContentPolicyError",
     "RiskControlError", "UpstreamRateLimitError", "UpstreamQuotaError",
-    "UpstreamUnavailableError", "UpstreamTimeoutError",
+    "UpstreamUnavailableError", "UpstreamTimeoutError", "EmptyResultError",
     "CapabilityUnavailableError", "CapabilityNotWiredError",
     "SyncUnavailableError", "AuthError", "TaskNotFoundError",
     "TaskStateError",
