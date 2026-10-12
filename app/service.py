@@ -279,7 +279,12 @@ def view(rec: TaskRecord) -> tuple[int, dict[str, Any]]:
 
 
 def empty_result_error() -> EmptyResultError:
-    """「上游报成功却零产物」→ `EmptyResultError`。
+    """「上游报成功却零产物」→ `EmptyResultError`（**HTTP 451**，2026-10-12 用户口径）。
+
+    口径：空图**多由上游侧的内容审核所致**（审核把产物全掐了、状态机仍报成功）
+    ⇒ 与内容审核同类归 **451**，让调用方一眼分流成"别原样重试"。
+    刻意保持独立 `type`/`code`（不复用 `ContentPolicyError`）：对外同为 451，
+    但服务端日志可区分，且空图**不进负缓存**（见 `errors.EmptyResultError`）。
 
     🔴 对外**只给错误本身**（`message` / `type` / `code`），**一个 `detail`
     字段都不给**（2026-10-12 口径：抛错信息里只带错误信息，
@@ -1144,12 +1149,23 @@ class Service:
 
     @staticmethod
     def _validate_image(raw: Any) -> list[str]:
+        """把请求里的 `image` 归一成 URL 列表。
+
+        🔴 **空 / 未传 / `[]` / `""` 一律视为"没有输入图"（= 文生图）**
+        （用户口径 2026-10-12：`image` 为空或没传**默认就是文生图**）——
+        不该因为调用方传了个空串就报 400。只有**非空字符串**才是真写错了
+        （把数组形态写成了标量），此时给明确 400 讲清正确写法。
+        """
         if raw is None:
             return []
         if isinstance(raw, str):
+            if not raw.strip():
+                # 空串 / 纯空白 = 没有输入图 ⇒ 文生图（不报错）。
+                return []
             raise InvalidParameterError(
-                "image 必须是**数组**（文生图传 `[]`）；收到的是字符串。"
-                "若要传单张图请写 `\"image\": [\"https://…\"]`。",
+                "image 必须是**数组**；文生图可留空（或传 `[]`）。"
+                "若要传单张图请写 `\"image\": [\"https://…\"]`"
+                "（收到的是字符串，不是数组）。",
                 param="image")
         if not isinstance(raw, list):
             raise InvalidParameterError("image 必须是数组", param="image")
@@ -1580,9 +1596,9 @@ class Service:
         # 终态 `status=50` 却**零产物**时，报 `success` + 空 `data` 就是
         # "静默按少的交付"的极端情形 —— 调用方会拿到一个看起来成功、
         # 实际什么都没有的响应。这种一律按失败处理。
-        # 🔴 用 `EmptyResultError`（500）而不是 502"上游故障"：
-        # 同步端点要按 error.type 精确识别它并抛 HTTP 500
-        # （用户口径 2026-10-10）—— 混在 upstream_error 里就得靠
+        # 🔴 用 `EmptyResultError`（**451**，2026-10-12 用户口径：空图多由
+        # 上游审核所致）而不是 502"上游故障"：同步端点要按 error.type
+        # 精确识别它并抛对应状态码 —— 混在 upstream_error 里就得靠
         # 字符串匹配 message，那太脆。
         # 🔴 2026-10-12：**对外只给错误本身**（message/type/code），不带 detail
         # —— 客户端不该看到我方的模型标签、上游状态码与计数（口径：

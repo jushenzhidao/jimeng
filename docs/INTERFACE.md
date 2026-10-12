@@ -101,7 +101,7 @@ POST /v1/images/generations          Authorization: Bearer <key>
 | 结局 | 状态码 | 响应体 |
 |---|---|---|
 | 预算内到终态（成功） | `200` | 与异步查询的终态体**逐键一致**（见 §2） |
-| 预算内到终态（**空图**） | `500` | `error.code = "upstream_empty_result"`；错误体**只有** `message`/`type`/`code`，**无 `detail`**（现场只进服务端日志，见 §6） |
+| 预算内到终态（**空图**） | `451` | `error.code = "upstream_empty_result"`（2026-10-12：空图多由上游内容审核所致 ⇒ 与审核同类归 451，但 `code` 独立、服务端可区分、**不进负缓存**）；错误体**只有** `message`/`type`/`code`，**无 `detail`**（现场只进服务端日志，见 §6） |
 | 预算内到终态（**内容审核拒绝**） | `451` | `error.code = "content_policy_violation"` —— 换 prompt / 换图才有用 |
 | 预算内到终态（其余失败） | `200` | 与异步一致：`{task_id, status:"failure", error}` |
 | 预算耗尽仍在跑 | `202` | `{task_id, status}` + `Location: /async/v1/images/generations/{id}` |
@@ -280,7 +280,7 @@ Content-Type: application/json
 
 | 能力 | 接受几张 | 说明 |
 |---|---|---|
-| `jimeng-t2i`（文生图） | 0 | 必须传 `[]`；传了会 400 |
+| `jimeng-t2i`（文生图） | 0 | 留空 / 不传 / `[]` / `""` 均可（都当"无输入图"）；传**非空**数组或非空字符串会 400 |
 | `jimeng-hd` / `jimeng-pro-hd` / `jimeng-outpaint` | **1** | 上游用单个 `origin_image` 承载；**多传会明确 400** |
 | `jimeng-i2i`（图生图） | **1–10**（多张垫图） | 上游草稿的 `image_uri_list` / `image_list` 本来就是列表；**顺序即请求顺序**。10 = 服务端声明（`byte_edit: max_image_num`），未读到声明时按 10 兜底 |
 
@@ -318,7 +318,7 @@ Content-Type: application/json
 |---|---|---|
 | `model` | 否* | 见 §3。留空时按 `image` 是否为空推导 —— 但**只在无歧义时**给默认 |
 | `prompt` | 看能力 | `t2i` / `i2i` 必需；后编辑族不需要 |
-| `image` | 否 | **数组**。文生图传 `[]`；传字符串会被明确拒绝并给出正确写法 |
+| `image` | 否 | **数组**。文生图**可留空**（不传 / `[]` / `""` 都算空）；传**非空**字符串会被明确拒绝并给出正确写法 |
 | `size` | 否 | `"2048x2048"`。默认 `2048x2048`（抓包实测唯一跑通的档位） |
 | `n` | 否 | 出图张数。会**吸附**到该模型服务端声明的合法取值（见 §4） |
 | `seed` | 否 | 整数 |
@@ -598,7 +598,7 @@ Authorization: Bearer <key>
 | `upstream_rate_limited` | 429 | 上游限流，**可退避重试**（带 `Retry-After`） |
 | `upstream_quota_exhausted` | 429 | 积分/日额度耗尽，**重试无效** |
 | `risk_control_challenge` | 429 | 命中风控，**重试会延长标记**，服务已进入冷却 |
-| `upstream_empty_result` | 500 | 上游报成功却**零产物**（一张都没有）。本服务不交付空成功 ⇒ 同步端点直接 500（异步族仍是 200 + `status:"failure"`）。错误体**只有** `message` / `type` / `code` —— **不带 `detail`**，不回显模型名、能力 key、上游状态码与计数、上游 id |
+| `upstream_empty_result` | 451 | 上游报成功却**零产物**（一张都没有）。本服务不交付空成功 ⇒ 同步端点直接 451（异步族仍是 200 + `status:"failure"`）。2026-10-12：空图多由上游内容审核所致 ⇒ 与内容审核同类归 451，但 `code` 单独一个、服务端日志可区分、**不进负缓存**。错误体**只有** `message` / `type` / `code` —— **不带 `detail`**，不回显模型名、能力 key、上游状态码与计数、上游 id |
 | `upstream_error` | 502 | 上游 5xx / 非 JSON / WAF 页 |
 | `upstream_not_configured` | 503 | 没有可用的上游凭据（Bearer 未带即梦 sessionid，或它已失效）—— **部署/调用方凭据问题**，不是参数写错 |
 | `sync_unavailable` | 503 | 服务没有任务推进者（协调器未运行）⇒ 同步等待无法履行，请改用异步端点或开启协调器 |

@@ -84,7 +84,8 @@ class GenerationRequest(BaseModel):
 
     model: str | None = Field(default=None, description="能力/模型名，如 jimeng-t2i（留空则按有无输入图推导）")
     prompt: str | None = Field(default=None, description="提示词")
-    image: Any = Field(default=None, description="输入图**数组**；文生图传 []")
+    image: Any = Field(default=None,
+                       description="输入图**数组**；文生图可留空（或传 []）")
     size: str | None = Field(default=None, description="如 2048x2048")
     n: int | None = Field(default=None, description="出图张数（会吸附到该模型声明的合法取值）")
     seed: int | None = None
@@ -325,7 +326,8 @@ def _install_routes(app: FastAPI) -> None:
 
         🔴 2026-10-10 用户口径 —— 终态失败里**两种直接抛 HTTP 错误**，
         不再回 200 + failure 体：
-          · **空图**（上游报成功却零产物）→ **500**（`EmptyResultError`）；
+          · **空图**（上游报成功却零产物）→ **451**（`EmptyResultError`；
+            2026-10-12 口径：空图多由上游内容审核所致，故与审核同类归 451）；
           · **内容审核拒绝** → **451**（`ContentPolicyError`，换 prompt/素材
             才有用，原样重试必再拒）。
         判据是落库的 `error.type`（`_fail` 存的就是 `to_error()["error"]`），

@@ -123,17 +123,25 @@ class EmptyResultError(AdapterError):
     零产物不是"上游打不通"，是"上游说好了却没交货" —— 调用方要的
     不是"可重试"的分类学，是一个**没有东西**的明确宣告。
 
-    同步端点（`POST /v1/images/generations`）对它**直接抛 HTTP 500**
-    （`view()` 的"失败也回 200"只服务异步查询族 —— 那里调用方还要
-    继续轮询别的任务；同步是"一锤子买卖"，200 里藏失败等于骗人）。
-    之所以从 502 改 500：按口径它落在"我方交付失败"一侧，不是
-    "上游暂时不可用" —— 别让调用方的 502 重试逻辑对它空转。
+    🔴 **HTTP 451**（2026-10-12 用户口径：空图多由上游内容审核所致）：
+    审核把产物整批掐掉、但上游状态机仍报成功 —— 这种"报成功却交不出
+    合规产物"归到"内容因合规原因不可用"一侧，用 451 让调用方一眼分流成
+    **别原样重试**。`retryable=False` 与 451 一致（同 `ContentPolicyError`）。
+
+    ⚠️ **刻意不复用 `ContentPolicyError`**，尽管对外状态码相同：
+      · `err_type` / `err_code` 保持独立（`empty_result_error` /
+        `upstream_empty_result`）—— 服务端日志与 `/stats` 才能把
+        "上游真审核拒"与"上游空产物"分开看；
+      · `service._advance` 的负缓存只在 `isinstance(err, ContentPolicyError)`
+        时记录 ⇒ 空图**不进负缓存**（一次性的空产物不该把 prompt 钉死 24h）。
+    同步端点（`POST /v1/images/generations`）按 `err_type` 精确识别它并抛
+    这个码（`view()` 的"失败也回 200"只服务异步查询族，见 `app/main.py`）。
     """
 
-    status_code = 500
+    status_code = 451
     err_type = "empty_result_error"
     err_code = "upstream_empty_result"
-    retryable = True
+    retryable = False
 
 
 class UpstreamTimeoutError(AdapterError):

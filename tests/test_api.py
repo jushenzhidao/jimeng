@@ -69,6 +69,27 @@ def test_image_must_be_an_array_with_actionable_message(client):
     assert "[]" in msg, "报错要给出正确写法，而不是只说「错了」"
 
 
+def test_empty_image_defaults_to_t2i(client):
+    """🔴 `image` 为空 / 未传 / `""` / `[]` 一律当"没有输入图"（= 文生图）。
+
+    用户口径 2026-10-12：`image` 为空或没传**默认就是文生图** ——
+    不该因为调用方传了个空串（或纯空白）就报 400。
+    只有**非空字符串**才是真写错了数组形态（见上一个用例）。
+    """
+    for img in ("", "   ", [], None):
+        payload: dict = {"model": "jimeng-t2i", "prompt": "x"}
+        if img is not None:
+            payload["image"] = img
+        r = client.post(BASE, json=payload, headers=AUTH)
+        assert r.status_code == 202, f"image={img!r} 应被当作文生图：{r.text}"
+
+        # 空图时连 `model` 都可省（`resolve` 无歧义地推导成 t2i）。
+        without_model = {k: v for k, v in payload.items() if k != "model"}
+        r2 = client.post(BASE, json=without_model, headers=AUTH)
+        assert r2.status_code == 202, \
+            f"image={img!r} 省略 model 应推导为 t2i：{r2.text}"
+
+
 def test_multiple_input_images_are_never_silently_truncated(client):
     """核心纪律不变：**绝不许**"收下 N 张、却只用 1 张"。
 
@@ -557,11 +578,13 @@ def test_sync_failure_is_a_200_with_failure_status(sync_client, fake_jimeng):
     assert r.json()["error"]
 
 
-def test_sync_empty_result_raises_500(sync_client, fake_jimeng):
-    """🔴 空图（终态成功却零产物）⇒ 同步接口**直接抛 500**。
+def test_sync_empty_result_raises_451(sync_client, fake_jimeng):
+    """🔴 空图（终态成功却零产物）⇒ 同步接口**直接抛 451**。
 
     用户口径 2026-10-10：调用方拿一个 200 + `data: []` 的"成功体"
     等于被骗 —— 同步是一锤子买卖，没有东西就说没有，用状态码说。
+    2026-10-12 口径：空图多由上游内容审核所致 ⇒ 归到"内容因合规原因
+    不可用"一侧，用 451 让调用方一眼分流成"别原样重试"。
     判据链：零产物落库为 `empty_result_error` ⇒ 同步端点按 type 转抛。
     """
     from app.upstream.jimeng.client import TaskState
@@ -574,9 +597,10 @@ def test_sync_empty_result_raises_500(sync_client, fake_jimeng):
 
     r = sync_client.post(SYNC, json={"model": "jimeng-t2i", "prompt": "x"},
                          headers=AUTH)
-    assert r.status_code == 500, r.text
+    assert r.status_code == 451, r.text
     err = r.json()["error"]
     assert err["type"] == "empty_result_error"
+    assert err["code"] == "upstream_empty_result"
     assert "零产物" in err["message"]
 
     # 🔴 2026-10-12 口径（用户）：抛错信息里**只带错误信息** ——
