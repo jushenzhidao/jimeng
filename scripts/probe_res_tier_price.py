@@ -46,6 +46,27 @@ POLL_TIMEOUT = 300.0
 CREDIT_HISTORY_PATH = "/commerce/v1/benefits/user_credit_history"
 
 
+def billing_verdict(records: list[dict], sid: str) -> str:
+    """**对账判据**（纯函数，便于回归）。
+
+    🔴 只认 `submit_id` 的**精确相等**。2026-10-12 修：原实现是
+    `sid in json.dumps(整个响应)` —— 子串匹配，于是 `--check -` 也会
+    "已出账"（响应里到处是 '-'），短串/前缀一律假阳。计费是红线，判据不许松。
+
+    返回 `"hit"` / `"elsewhere"` / `"miss"`：
+      · hit       —— 出现在 `records[].submit_id` 里，**这才是出账证据**；
+      · elsewhere —— 只出现在响应别的字段（给人一点线索，**不构成**证据）；
+      · miss      —— 哪儿都没有（可能只是结算延迟）。
+    """
+    ids = {str(r.get("submit_id")) for r in (records or [])}
+    if sid in ids:
+        return "hit"
+    # `ensure_ascii=False`：否则中文被转义成 \uXXXX，中文线索永远命中不了
+    if sid and sid in json.dumps(records, ensure_ascii=False):
+        return "elsewhere"
+    return "miss"
+
+
 def _load_dotenv() -> None:
     p = REPO / ".env"
     if not p.is_file():
@@ -120,9 +141,16 @@ def main() -> int:
         for r in d.get("records") or []:
             print(f"  submit={r.get('submit_id')} amount={r.get('amount')} "
                   f"title={r.get('title')} t={r.get('create_time')}")
-        blob = json.dumps(d)
+        records = d.get("records") or []
         for sid in want:
-            print(f"  {sid}: {'✅ 已出账' if sid in blob else '尚未出现（延迟或未计费）'}")
+            v = billing_verdict(records, sid)
+            if v == "hit":
+                print(f"  {sid}: ✅ 已出账")
+            elif v == "elsewhere":
+                print(f"  {sid}: ⚠️ 未出现在 submit_id 列表中（仅在其他字段里出现过，"
+                      f"不构成出账证据）")
+            else:
+                print(f"  {sid}: 尚未出现（延迟或未计费）")
         return 0
 
     # ---- dry：两份草稿的自检（零消耗）----

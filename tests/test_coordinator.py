@@ -9,6 +9,7 @@ from __future__ import annotations
 import base64
 import json
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -16,7 +17,7 @@ from app.errors import RiskControlError
 from app.service import Service
 from app.store import TaskRecord
 from app.upstream.jimeng import JimengQuotaError, JimengRateLimitError, JimengRiskError
-from tests.conftest import AUTH, failed_state, ok_state, submitted_state
+from tests.conftest import AUTH, AUTH_B, failed_state, ok_state, submitted_state
 
 BASE = "/async/v1/images/generations"
 
@@ -524,6 +525,42 @@ def test_quota_error_fails_immediately_and_does_not_retry(client, client_state,
     assert rec.status == "failure"
     assert rec.error["code"] == "upstream_quota_exhausted"
     assert fake_jimeng.of("submit"), "至少试过一次"
+
+
+def test_quota_exhaustion_silences_only_that_credential(
+        client, client_state, fake_jimeng, service):
+    """🔴 2026-10-12：`ret=1006` 是**账号属性**（"积分不足**或**没有相关权益"）
+    ⇒ 静默只挂在**该凭据**上，别人照常派发。
+
+    改之前它写的是全局 `_cooldown_until`：实测 `quota_holds=1` 让 10 分钟里
+    592 个 tick 全被跳过 —— 一个号没额度，全站队列一条都发不出去。
+    """
+    fake_jimeng.fail_submit = JimengQuotaError("no credits", code=1006)
+    tid_a = _create(client)                       # 凭据 A（AUTH）
+    client_state.coordinator.tick()
+    assert service.store.get(tid_a).status == "failure"
+
+    st = service.gate.stats()
+    assert st["cooling_for"] == 0, "额度耗尽不是风控 —— 不该全站停摆"
+    assert st["quota_silent"] == 1, "该凭据要进静默"
+    assert st["quota_cooling_max"] > 0
+
+    # 凭据 A 的下一个新任务：**不派发**（不烧钱、不刷上游）
+    before = len(fake_jimeng.of("submit"))
+    tid_a2 = _create(client)
+    client_state.coordinator.tick()
+    assert service.store.get(tid_a2).status == "queued"
+    assert len(fake_jimeng.of("submit")) == before, "静默凭据不该再打上游"
+
+    # 🔴 换一个凭据（B）：**照常派发** —— 这条就是"不再连坐"的判据
+    fake_jimeng.fail_submit = None
+    r = client.post(BASE, json={"model": "jimeng-t2i", "prompt": "换个号"},
+                    headers=AUTH_B)
+    assert r.status_code == 202, r.text
+    tid_b = r.json()["task_id"]
+    client_state.coordinator.tick()
+    assert service.store.get(tid_b).status != "queued", "别的凭据必须照常跑"
+    assert fake_jimeng.of("submit")[-1]["prompt"] == "换个号"
 
 
 def test_risk_error_enters_cooldown_and_fails(client, client_state, fake_jimeng,
@@ -1401,7 +1438,8 @@ def test_dispatch_starvation_is_counted_not_silent(settings):
 
         def list_by_status(self, *a, **k):
             self.list_calls += 1
-            return [object()]          # 有一条待派发
+            # 有一条待派发（要能读出 `upstream_sessionid` —— 派发侧按它判静默）
+            return [SimpleNamespace(upstream_sessionid=None)]
 
     class _Gate:
         def __init__(self, cooling: float) -> None:
@@ -1409,6 +1447,9 @@ def test_dispatch_starvation_is_counted_not_silent(settings):
 
         def stats(self) -> dict:
             return {"cooling_for": self.cooling}
+
+        def quota_silent_keys(self) -> set:
+            return set()
 
     class _Svc:
         def __init__(self, running: int, cooling: float = 0.0) -> None:
@@ -1441,3 +1482,4 @@ def test_dispatch_starvation_is_counted_not_silent(settings):
     co3._dispatch_queued()
     assert len(free.sent) == 1 and co3.dispatched == 1
     assert co3.dispatch_full == 0 and co3.dispatch_cooling == 0
+    assert co3.dispatch_quota_silent == 0

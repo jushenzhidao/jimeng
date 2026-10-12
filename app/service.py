@@ -2449,8 +2449,11 @@ class Service:
         elif isinstance(err, UpstreamQuotaError):
             # 额度耗尽：进静默期。**不做"锁到明天"** —— 上游重置时刻未必是本地零点，
             # 静默期到点自然重试，能自愈。
+            # 🔴 按**凭据**静默，不是全站：`ret=1006` 是"这个账号积分不足/
+            # 无权益"，与别人无关（见 `UpstreamGate.mark_quota_exhausted`）。
             self.gate.mark_quota_exhausted(
-                min(self.settings.jm_cooldown * 2, 3600.0))
+                min(self.settings.jm_cooldown * 2, 3600.0),
+                key=rec.upstream_sessionid)
 
         attempts = rec.attempts + 1
         if err.retryable and attempts < DISPATCH_MAX_ATTEMPTS:

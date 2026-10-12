@@ -35,6 +35,11 @@ class GateStats:
     total_wait_s: float = 0.0
     last_at: float = 0.0
     cooling_for: float = 0.0
+    #: 🔴 处于**额度静默**的凭据数（按凭据，不是全站）。与 `cooling_for`
+    #:（风控，全局）**分开**暴露 —— 两个数的处置办法完全不同。
+    quota_silent: int = 0
+    #: 这些额度静默里最长的剩余秒数
+    quota_cooling_max: float = 0.0
 
     def as_dict(self) -> dict:
         return {
@@ -45,6 +50,8 @@ class GateStats:
             "waits": self.waits,
             "total_wait_s": round(self.total_wait_s, 2),
             "cooling_for": round(self.cooling_for, 1),
+            "quota_silent": self.quota_silent,
+            "quota_cooling_max": round(self.quota_cooling_max, 1),
         }
 
 
@@ -63,7 +70,10 @@ class UpstreamGate:
         self._lock = threading.Lock()
         self._window: deque[float] = deque()
         self._last_at = 0.0
+        #: 风控冷却（**全局**，见 `mark_risk_hit`）
         self._cooldown_until = 0.0
+        #: 额度静默（**按凭据**，见 `mark_quota_exhausted`）
+        self._quota_until: dict[str | None, float] = {}
         self._stats = GateStats()
 
     # ---------------------------------------------------------------- 内部
@@ -136,13 +146,21 @@ class UpstreamGate:
             if self.cooldown > 0:
                 self._cooldown_until = time.time() + self.cooldown
 
-    def mark_quota_exhausted(self, seconds: float) -> None:
-        """额度耗尽 → 进入**静默期**（`seconds` 秒内不再发起请求）。
+    def mark_quota_exhausted(self, seconds: float, *,
+                             key: str | None = None) -> None:
+        """额度耗尽 → **该凭据**进入静默期（`seconds` 秒内不再派发它的任务）。
 
         与 `mark_risk_hit()` 刻意分开，两件事性质不同：
           · 风控命中 = **我们的节奏**触发了上游保护机制，计 `risk_hits`；
           · 额度耗尽 = 与我们的行为无关，只是一个**不会因重试而变好的计数器**，
             计 `quota_holds`。
+
+        🔴 2026-10-12 修：静默**按凭据存**（`key` = 调用方的 sessionid）。
+        此前它写的是全局 `_cooldown_until` ⇒ **一个账号积分不足，全站停 1200s**
+        （实测：`quota_holds=1` 让 10 分钟里 592 个 tick 全被跳过，队列里
+        别人的任务一条都发不出去）。而上游 `ret=1006`（"积分不足**或**没有
+        相关权益"）本来就是**账号属性**，与别的调用方毫无关系。
+        风控（`mark_risk_hit`）**保持全局** —— 它可能是 IP/设备级的，宁严勿松。
 
         时长刻意**有界**：不做"锁到明天"—— 上游重置时刻未必是本地零点，
         静默期到点自然重试，能自愈。
@@ -151,7 +169,26 @@ class UpstreamGate:
             return
         with self._lock:
             self._stats.quota_holds += 1
-            self._cooldown_until = max(self._cooldown_until, time.time() + seconds)
+            self._quota_until[key] = max(self._quota_until.get(key, 0.0),
+                                         time.time() + seconds)
+
+    def quota_cooling_for(self, key: str | None) -> float:
+        """该凭据的**额度静默**剩余秒数（0 = 不在静默期）。"""
+        now = time.time()
+        with self._lock:
+            until = self._quota_until.get(key, 0.0)
+            if until <= now:
+                self._quota_until.pop(key, None)
+                return 0.0
+            return until - now
+
+    def quota_silent_keys(self) -> set:
+        """当前处于额度静默的**凭据集合**（顺手清掉过期的）。"""
+        now = time.time()
+        with self._lock:
+            for k in [k for k, v in self._quota_until.items() if v <= now]:
+                self._quota_until.pop(k, None)
+            return set(self._quota_until)
 
     def reset_cooldown(self) -> None:
         with self._lock:
@@ -159,8 +196,19 @@ class UpstreamGate:
 
     def stats(self) -> dict:
         with self._lock:
+            # `cooling_for` **只表示风控冷却**（全局）—— 协调器据它决定
+            # "这一轮谁都不发"。额度静默别混进来，见 `mark_quota_exhausted`。
             self._stats.cooling_for = self._cooling_for()
             self._stats.last_at = self._last_at
+            now = time.time()
+            quiet = {k: v for k, v in self._quota_until.items() if v > now}
+            if len(quiet) != len(self._quota_until):
+                # 键是调用方给的（可以很多）⇒ 不扫就无界增长
+                self._quota_until.clear()
+                self._quota_until.update(quiet)
+            self._stats.quota_silent = len(quiet)
+            self._stats.quota_cooling_max = max(
+                (v - now for v in quiet.values()), default=0.0)
             return {"name": self.name,
                     "min_interval": self.min_interval,
                     "per_minute": self.per_minute,

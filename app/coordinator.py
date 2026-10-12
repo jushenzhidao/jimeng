@@ -42,6 +42,9 @@ log = logging.getLogger(__name__)
 
 #: 每轮处理多少个 in_progress 任务。有 JM_CONCURRENCY 兜着，这里给个宽松上界即可。
 _POLL_BATCH = 32
+#: 每轮**扫描**多少条排队任务。刻意大于派发额度：处于额度静默的凭据可能有
+#: 任务堵在队首，窗口太小的话后面的正常任务永远轮不到（派发饥饿）。
+_DISPATCH_SCAN = 64
 #: 多久做一次维护（清理过期终态任务）
 _MAINTENANCE_EVERY = 300.0
 
@@ -72,6 +75,8 @@ class Coordinator:
         #: ⇒ 新任务排 15 分钟不动，日志零线索）。
         self.dispatch_full = 0        # 因"在途数已达并发上限"而跳过派发的轮次
         self.dispatch_cooling = 0     # 因"上游冷却中"而跳过派发的轮次
+        #: 因"**该凭据**额度静默中"而跳过的任务数（按凭据，不是全站）
+        self.dispatch_quota_silent = 0
         self.dispatched = 0           # 真正派发出去的任务数
 
     # ------------------------------------------------------------------ 线程
@@ -201,9 +206,21 @@ class Coordinator:
         if self.service.gate.stats()["cooling_for"] > 0:
             self.dispatch_cooling += 1
             return
-        for rec in store.list_by_status("queued", limit=budget, order="oldest"):
+        # 额度静默（`ret=1006`）是**按凭据**的：那是"这个账号积分不足/无权益"，
+        # 与别的调用方毫无关系 ⇒ 只跳过该凭据的任务。2026-10-12 前这里是靠
+        # `cooling_for` 做的**全站**停摆，一个号没额度就把所有人拖死。
+        silent = self.service.gate.quota_silent_keys()
+        sent = 0
+        for rec in store.list_by_status("queued", limit=_DISPATCH_SCAN,
+                                        order="oldest"):
+            if rec.upstream_sessionid in silent:
+                self.dispatch_quota_silent += 1
+                continue
             self.service.dispatch(rec)
             self.dispatched += 1
+            sent += 1
+            if sent >= budget:
+                break
 
     def _poll_running(self) -> None:
         """推进所有在途任务 —— **上游查询合并成一次**（见 `Service.poll_many`）。
@@ -241,6 +258,7 @@ class Coordinator:
                 "dispatched": self.dispatched,
                 "dispatch_full": self.dispatch_full,
                 "dispatch_cooling": self.dispatch_cooling,
+                "dispatch_quota_silent": self.dispatch_quota_silent,
                 "running": self.running}
 
 
