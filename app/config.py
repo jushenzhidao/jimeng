@@ -125,6 +125,17 @@ class Settings:
     #: 关掉即回到"直出请求档位"的旧行为（仍然照旧留痕告知 4k 更贵）。
     upscale_4k_enabled: bool = True
 
+    #: 超清腿**失败后**允许的重试次数 —— **只作用于这条免费的腿**。
+    #: 🔴 2026-10-12 收尾实测：新号 6 次放大里 **1 次**上游 `generate_failed`
+    #: （`ret=0` 受理成功 + `item_list: []`；老号 4/4 成功，合计 9/10）⇒ **偶发**。
+    #: 超清**免费**（两个账号账单实锤零出账，见 `docs/UPSTREAM.md` §21），
+    #: 而它是"请求 >2k"的**唯一**清晰度来源 ⇒ 「先重试、再退回 2k」严格优于
+    #: 「一失败就退回 2k」（边际成本 0，最坏多一次免费调用）。
+    #: 只重试**瞬时**失败：提交抛异常 / 上游终态无产物；
+    #: **确定性**的前置条件不满足（缺 `item_id`、id 非数字）不重试 —— 重试必然同样失败。
+    #: 设 **0** = 回到「一失败即退 2k」的旧行为。
+    upscale_max_retries: int = 1
+
     # ------------------------------------------------------------ 同步接口
     #: `POST /v1/images/generations`（创建 + 轮询合并）的**总等待预算**（秒）：
     #: 预算内到终态就直接回最终体；超预算降级回 `202 + task_id`（调用方转异步轮询）。
@@ -280,6 +291,7 @@ class Settings:
             coordinator_enabled=_b("COORDINATOR_ENABLED", True),
             continue_enabled=_b("CONTINUE_ENABLED", False),
             upscale_4k_enabled=_b("UPSCALE_4K_ENABLED", True),
+            upscale_max_retries=_i("UPSCALE_MAX_RETRIES", 1),
             coordinator_tick=_f("COORDINATOR_TICK", 1.0),
             coordinator_lease=_f("COORDINATOR_LEASE", 30.0),
             sync_max_wait=_f("SYNC_MAX_WAIT", 300.0),

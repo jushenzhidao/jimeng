@@ -1677,32 +1677,40 @@ class Service:
         return json.dumps(info, ensure_ascii=False)
 
     def _submit_upscale_leg(self, rec: TaskRecord, plan: dict[str, Any],
-                            img: dict[str, Any]) -> tuple[bool, str]:
-        """提交**一张**的 `normal_hd`（**引用形态**）。返回 `(成功?, submit_id|原因)`。
+                            img: dict[str, Any]) -> tuple[bool, str, bool]:
+        """提交**一张**的 `normal_hd`（**引用形态**）。
+        返回 `(成功?, submit_id|原因, 值得重试?)`。
 
         🔴 引用形态（`item_id` + `origin_history_id`，**不带** `origin_image`）
         是 2026-10-12 实跑验证过的形态（`submit_id=1be406f7…`，status=50），
         也正是即梦 UI"就地超清"走的路 ⇒ **不需要**把产物下载再上传。
+
+        🔴 第 3 项（2026-10-12 收尾加）**区分两类失败**，只有瞬时失败才值得重试：
+        · **瞬时**（上游调用抛异常）⇒ `True`。实测 6 次放大里 1 次上游
+          `generate_failed`，而这条腿**免费**、又是"请求 >2k"的唯一清晰度来源
+          （见 `settings.upscale_max_retries`）；
+        · **确定性的前置条件不满足**（缺 `item_id` / id 不是数字 / 没有客户端）
+          ⇒ `False`：重试必然同样失败，只是白多一次上游调用。
         """
         if self.client is None:
-            return False, "本服务未配置上游客户端"
+            return False, "本服务未配置上游客户端", False
         item_id = img.get("item_id")
         hist = plan.get("hist")
         if not item_id or not hist:
-            return False, "该张缺 item_id / history（引用形态的必要条件）"
+            return False, "该张缺 item_id / history（引用形态的必要条件）", False
         try:
             item_num, hist_num = int(item_id), int(hist)
         except (TypeError, ValueError):
             # 即梦的 item_id / history_record_id 都是数字；非数字 ⇒ 不是我们能引用的形态
-            return False, "该张的 item_id / history 不是数字 id"
+            return False, "该张的 item_id / history 不是数字 id", False
         opts = self.cfg.count_options(DEFAULT_MODEL) if self.cfg else None
         try:
             sid = self.client.edit("normal_hd", item_id=item_num,
                                    origin_history_id=hist_num, count=1,
                                    count_options=opts)
         except Exception as e:            # noqa: BLE001 —— 超分腿失败不判任务失败
-            return False, f"{type(e).__name__}: {e}"
-        return True, sid
+            return False, f"{type(e).__name__}: {e}", True
+        return True, sid, False
 
     def _upscale_begin(self, rec: TaskRecord, st: Any,
                        images: list[dict[str, Any]], plan: dict[str, Any],
@@ -1711,6 +1719,9 @@ class Service:
         plan = dict(plan)
         plan.update({
             "stage": "upscale", "src": images, "out": [], "i": 0,
+            # 逐张的**提交次数**（`str(下标) -> 次数`）：重试预算的账本，见
+            # `_upscale_pump` / `_upscale_settle`。
+            "tries": {},
             "credits": getattr(st, "cost", None),
             "hist": (getattr(st, "history_record_id", None)
                      or rec.upstream_history_id),
@@ -1723,17 +1734,43 @@ class Service:
                 f"（引用形态，2026-10-12 实测成立）。"])
         self._upscale_pump(rec, plan)
 
+    def _upscale_retry_budget(self) -> int:
+        """超清腿允许的重试次数（`UPSCALE_MAX_RETRIES`，默认 1；**0 = 不重试**）。"""
+        try:
+            return max(0, int(self.settings.upscale_max_retries))
+        except (TypeError, ValueError):   # 脏配置不该炸链路
+            return 0
+
     def _upscale_pump(self, rec: TaskRecord, plan: dict[str, Any]) -> None:
         """推进超清队列：能提交就提交当前这张；提交不出去就记为该张退回 2k 原图、
-        继续下一张；全部走完则收尾（见 `_upscale_finish`）。"""
+        继续下一张；全部走完则收尾（见 `_upscale_finish`）。
+
+        🔴 **重试**（2026-10-12 收尾）：**瞬时**失败允许重投同一张，上限
+        `settings.upscale_max_retries`（默认 1）。这张腿**免费**、而它是"请求 >2k"
+        的唯一清晰度来源 ⇒「先重试、再退回 2k」严格优于「一失败就退回」。
+        重试判据是 `_submit_upscale_leg` 的第 3 个返回值（确定性失败不重试），
+        逐张的提交次数记在 `plan["tries"]` 上（**跨轮持久化**在 `extra_json` 里，
+        所以"进程重启后继续轮询"不会把重试预算重置掉）。
+        """
         src = plan["src"]
+        budget = self._upscale_retry_budget()
+        tries: dict[str, int] = plan.setdefault("tries", {})
         while plan["i"] < len(src):
             j = plan["i"]
-            ok, sid_or_why = self._submit_upscale_leg(rec, plan, src[j])
+            key = str(j)
+            tries[key] = tries.get(key, 0) + 1
+            ok, sid_or_why, retryable = self._submit_upscale_leg(rec, plan, src[j])
             if ok:
                 self.store.patch(rec.task_id, upstream_submit_id=sid_or_why,
                                  extra_json=self._extra_with(rec, plan))
                 return
+            if retryable and tries[key] <= budget:
+                plan["notes"].append(
+                    f"🔁 第 {j + 1} 张超清**提交失败**（{sid_or_why}）⇒ 重试"
+                    f"（第 {tries[key]} 次 / 上限 {budget} 次，超清免费）。")
+                self.store.patch(rec.task_id,
+                                 extra_json=self._extra_with(rec, plan))
+                continue
             plan["out"].append(src[j])
             plan["legs_failed"] += 1
             plan["notes"].append(
@@ -1762,6 +1799,27 @@ class Service:
         if up is None:
             why = (getattr(st, "failed_reason", "") or
                    getattr(st, "status_name", "") or "无产物")
+            key = str(j)
+            tries: dict[str, int] = plan.setdefault("tries", {})
+            budget = self._upscale_retry_budget()
+            if tries.get(key, 0) <= budget:
+                # 🔴 上游**给了终态但没产物**（实测形态：`ret=0` 受理成功 +
+                # `generate_failed` + `item_list: []`）⇒ 属**瞬时**，重投同一张，
+                # 而不是直接退回 2k（超清免费，重试不额外计费）。
+                tried = tries.get(key, 0)
+                plan["notes"].append(
+                    f"🔁 第 {j + 1} 张超清未成功（{why}）⇒ 重试"
+                    f"（已试 {tried} 次 / 上限 {budget} 次，超清免费）。")
+                OBS.warning(
+                    "upscale leg retrying", task_id=rec.task_id, model=rec.model,
+                    capability=rec.cap_key, index=j, tried=tried, budget=budget,
+                    gen_submit_id=rec.gen_submit_id,
+                    upstream_status=getattr(st, "status_name", None),
+                    failed_reason=why)
+                self.store.patch(rec.task_id,
+                                 extra_json=self._extra_with(rec, plan))
+                self._upscale_pump(rec, plan)
+                return
             plan["legs_failed"] += 1
             plan["notes"].append(
                 f"⚠️ 第 {j + 1} 张超清未成功（{why}）⇒ 该张按 **2k 原图**交付。")
@@ -1794,6 +1852,10 @@ class Service:
             deg.append(
                 f"🔁 4k 改道收尾：{len(plan['out'])} 张中 **{plan['legs_failed']} 张"
                 f"未能超清**，按 2k 原图交付（已逐张留痕）。")
+        _retried = sum(1 for v in (plan.get("tries") or {}).values() if v > 1)
+        if _retried:
+            deg.append(f"🔁 4k 改道收尾：其中 **{_retried} 张超清重试过**"
+                       f"（瞬时失败；超清免费，重试**不额外计费**）。")
         sizes = "、".join(f"{im.get('width')}x{im.get('height')}"
                           for im in plan["out"] if im.get("width"))
         deg.append(f"🔁 4k 改道完成：请求 {plan['requested_size']}，"

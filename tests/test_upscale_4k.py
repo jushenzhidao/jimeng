@@ -6,6 +6,11 @@
 「2k 生成 + 超清就地放大」以降低消耗；超分腿失败则**交付 2k 原图 + 响亮留痕**
 （不判任务失败）；非 1:1 按**输入比例就地放大**交付（尺寸 = 2k 槽的 2×）。
 
+**重试**（2026-10-12 收尾加）：超清腿是**免费**的，且它是"请求 >2k"的**唯一**
+清晰度来源 ⇒ 遇到**瞬时**失败（提交抛异常 / 上游终态无产物）先按
+`UPSCALE_MAX_RETRIES`（默认 **1**）重投同一张，**用尽才退回 2k**。
+**确定性**失败（缺 `item_id`、id 非数字）不重试 —— 重试必然同样失败。
+
 实测依据见 `docs/UPSTREAM.md` §21：
 · 超清的**引用形态**成立（`item_id` + `origin_history_id`，**不带** `origin_image`）；
 · 超清 = **固定 2×**（源 2560×1440 → 5120×2880），**不吸附**到 4k 槽；
@@ -273,7 +278,70 @@ def test_i2i_4k_is_also_rerouted(client, service, fake_jimeng):
 
 def test_upscale_leg_failure_delivers_the_2k_original(
         client, client_state, fake_jimeng, service):
-    """超分腿失败 ⇒ **交付 2k 原图 + 响亮留痕**，任务仍是 success（用户口径）。"""
+    """超分腿失败 ⇒ **交付 2k 原图 + 响亮留痕**，任务仍是 success（用户口径）。
+
+    ⚠️ 2026-10-12 收尾后语义收窄为「**重试用尽**才退回 2k」：瞬时失败会先按
+    `UPSCALE_MAX_RETRIES`（默认 1）重投同一张。这条用例因此给**两次连续失败**
+    （一次吃重试、一次吃尽预算），验证"退回 2k"这个**最终**语义没变。
+    """
+    fake_jimeng.states = [
+        submitted_state(),
+        _gen_ok(["https://cdn/gen.png"], items=(777,)),
+        failed_state("generate_failed"),
+        failed_state("generate_failed"),
+    ]
+    tid = _create(client, size="4096x4096")
+    drive(client_state, 4)
+
+    rec = service.store.get(tid)
+    assert rec.status == "success", "超分腿失败**不许**判任务失败（2k 图已到手）"
+    assert [i["url"] for i in rec.images] == ["https://cdn/gen.png"]
+    assert len(fake_jimeng.of("edit")) == 2, \
+        "默认预算 1 ⇒ 一共只发 2 次（首发 + 1 次重试），不许无限重试"
+    note = " ".join(rec.degradations)
+    assert "超清未成功" in note and "2k 原图" in note
+    assert "重试" in note, "试过重试也要留痕（降级可见的同一条纪律）"
+    assert "未能超清" in note, "收尾时要给出'几张没放大'的总计"
+
+
+# ---------------------------------------------------------------------------
+# 超清腿的有界重试（2026-10-12 收尾）
+# ---------------------------------------------------------------------------
+
+
+def test_a_transient_upscale_failure_is_retried_and_then_delivered(
+        client, client_state, fake_jimeng, service):
+    """**瞬时**失败（上游终态无产物）重投同一张，成功则照常交付**放大图**。
+
+    依据：新号实测 6 次放大里 **1 次**上游 `generate_failed`（`ret=0` 受理成功 +
+    `item_list: []`；老号 4/4 成功，合计 9/10）⇒ **偶发**。这条腿**免费**，
+    所以"先重试"的边际成本是 0，而它是"请求 >2k"的唯一清晰度来源。
+    """
+    fake_jimeng.states = [
+        submitted_state(),
+        _gen_ok(["https://cdn/gen.png"], items=(777,)),
+        failed_state("generate_failed"),
+        _upscale_ok("https://cdn/up.png"),
+    ]
+    tid = _create(client, size="4096x4096")
+    drive(client_state, 4)
+
+    rec = service.store.get(tid)
+    assert rec.status == "success"
+    assert [i["url"] for i in rec.images] == ["https://cdn/up.png"], \
+        "重试成功后必须交付**放大图**，不是退回 2k"
+    edits = fake_jimeng.of("edit")
+    assert len(edits) == 2, "同一次失败必须真的重投（且只多投 1 次）"
+    assert edits[1]["item_id"] == edits[0]["item_id"], "重试的是**同一张**"
+    note = " ".join(rec.degradations)
+    assert "重试" in note, "重试必须留痕"
+    assert "未能超清" not in note, "重试成功就不该再报'未能超清'"
+
+
+def test_retry_budget_zero_restores_the_immediate_fallback(
+        client, client_state, fake_jimeng, service):
+    """`UPSCALE_MAX_RETRIES=0` ⇒ 回到**旧行为**：一次失败即退 2k、不重投。"""
+    service.settings.upscale_max_retries = 0
     fake_jimeng.states = [
         submitted_state(),
         _gen_ok(["https://cdn/gen.png"], items=(777,)),
@@ -283,11 +351,29 @@ def test_upscale_leg_failure_delivers_the_2k_original(
     drive(client_state, 3)
 
     rec = service.store.get(tid)
-    assert rec.status == "success", "超分腿失败**不许**判任务失败（2k 图已到手）"
+    assert rec.status == "success"
+    assert [i["url"] for i in rec.images] == ["https://cdn/gen.png"]
+    assert len(fake_jimeng.of("edit")) == 1, "预算 0 ⇒ 不许重投"
+    assert "重试" not in " ".join(rec.degradations), "没重试就不该出现重试留痕"
+
+
+def test_a_deterministic_failure_is_never_retried(
+        client, client_state, fake_jimeng, service):
+    """**确定性**失败（本地产物没有 `item_id`）⇒ 一次都不重投（重试必然同样失败）。"""
+    fake_jimeng.states = [
+        submitted_state(),
+        _gen_ok(["https://cdn/gen.png"], items=(None,)),
+    ]
+    tid = _create(client, size="4096x4096")
+    drive(client_state, 2)
+
+    assert not fake_jimeng.of("edit"), "缺 item_id 时连首发都不该发"
+    rec = service.store.get(tid)
+    assert rec.status == "success"
     assert [i["url"] for i in rec.images] == ["https://cdn/gen.png"]
     note = " ".join(rec.degradations)
-    assert "超清未成功" in note and "2k 原图" in note
-    assert "未能超清" in note, "收尾时要给出'几张没放大'的总计"
+    assert "item_id" in note and "重试" not in note, \
+        "确定性失败要写明原因，且**不许**重试"
 
 
 def test_missing_item_id_falls_back_to_2k_with_the_reason(
