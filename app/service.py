@@ -1409,7 +1409,10 @@ class Service:
 
         now = int(time.time())
         self.store.patch(rec.task_id, status="in_progress",
-                         upstream_submit_id=sid, started_at=now,
+                         upstream_submit_id=sid,
+                         # 🔴 计费锚点：这条是**真花钱**的生成腿（超清腿免费，
+                         # 它稍后会把 `upstream_submit_id` 覆盖掉，见 store.TaskRecord）
+                         gen_submit_id=sid, started_at=now,
                          # 续生成（action=2）要求「原样再带一遍草稿」⇒ 必须存下来
                          # ⚠️ 用 getattr 兜住测试替身（假客户端没有这个属性）
                          draft_json=getattr(self.client, "last_draft", None) or None,
@@ -1579,6 +1582,8 @@ class Service:
         n_used = (rec.continuations or 0) + 1
         self.store.patch(
             rec.task_id, status="in_progress", upstream_submit_id=sid,
+            # 续生成同样是**计费**的生成腿 ⇒ 计费锚点跟着走（超清腿不会写这列）
+            gen_submit_id=sid,
             images=have, continuations=n_used,
             degradations=list(rec.degradations) + [
                 f"⚠️ 上游只完成 {len(have)} 张（请求 n={want}）⇒ 已自动续生成"
@@ -1764,7 +1769,10 @@ class Service:
             OBS.warning(
                 "upscale leg failed", task_id=rec.task_id, model=rec.model,
                 capability=rec.cap_key, index=j,
+                # 🔴 两个 id 都打：`upstream_submit_id` = 这条超清腿（免费），
+                # `gen_submit_id` = 真扣费的那条生成腿 —— 对账要用后者。
                 upstream_submit_id=rec.upstream_submit_id,
+                gen_submit_id=rec.gen_submit_id,
                 upstream_status=getattr(st, "status_name", None),
                 failed_reason=why)
         plan["out"].append(up)

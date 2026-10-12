@@ -997,3 +997,26 @@ Lite + `size=4096x4096`（⇒ 4k 档）⇒ 终态 `status=50`、产物 **4096²*
 ⇒ **竖图请求被判成横图槽**（要竖版拿到横版）。已改成按带方向的 `w/h` 匹配
 （`slot_for_ratio_in`）。回归用例：`test_slot_for_ratio_keeps_orientation`。
 教训：**"比例相同"不等于"槽位相同"** —— 归一化掉方向的那一刻，判据就丢了信息。
+
+### 21.6 🔴 计费锚点：`gen_submit_id`（2026-10-12，实测踩出来的）
+
+**现象**：4k 改道跑通后，拿 `tasks.upstream_submit_id` 去
+`user_credit_history` 对账 —— **查不到**（"尚未出现"）；而真扣的 3 积分
+挂在**生成腿**的 submit_id 上，只能翻服务端日志 `task submitted` 才找回来。
+
+**根因**：`upstream_submit_id` 的语义是"**当前在途那一条**"——
+超清腿提交成功后 `_upscale_pump` 会把它**改写成超清腿的 id**
+（在途轮询要查它；`tests/test_upscale_4k.py` 里那条
+`assert rec.upstream_submit_id == fake_jimeng.submitted[-1]` 钉的就是这个行为）。
+于是：**免费**的超清腿 id 占住了**计费对账**的字段，真花钱那条**反而丢了**。
+而这正是最需要对账的路径 —— 4k 改道现在是**默认行为**。
+
+**修**：新增列 `gen_submit_id` = **计费锚点**（最近一次**生成腿**的 submit_id：
+派发时写、续生成时跟着走；**超清腿永不写这一列**）。
+- 迁移：靠启动期幂等补列（`TaskStore._ensure_video_columns`，从模型元数据机械派生），
+  **无需手工 ALTER**；回归 `test_new_model_columns_are_auto_migrated_on_an_existing_table`。
+- ⚠️ 同时**必须**把字段登记进 `store._PATCHABLE` —— 漏了就是
+  `ValueError: 未知字段 ['gen_submit_id']`（这次被用例当场逮住）。
+- 对账口径：**`gen_submit_id` ⇒ 计费；`upstream_submit_id` ⇒ 在途轮询**。
+  在**改道任务**上要改成 `gen_submit_id`（§11.5 那句的适用范围收窄）。
+- 留痕：`upscale leg failed` 的 warning 里**两个 id 都打**，现场一把就能对账。

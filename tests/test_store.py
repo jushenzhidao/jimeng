@@ -17,6 +17,28 @@ from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from app.store import TaskStore, build_engine, mask_dsn
 
 
+def _columns(store: TaskStore) -> set:
+    from sqlalchemy import inspect
+    return {c["name"] for c in inspect(store.engine).get_columns("tasks")}
+
+
+def test_new_model_columns_are_auto_migrated_on_an_existing_table(settings):
+    """模型加字段 ⇒ **启动期自动补列**（`_ensure_video_columns`），不靠手工 ALTER。
+
+    这条不是"顺手测一下"：漏迁移的症状是 `store.patch()` 报
+    `column does not exist`，而且**只在新字段被写到时才炸** —— 平时全绿。
+    所以必须有一条用例把"老库上跑新代码"这条路径钉住。
+    """
+    from sqlalchemy import text
+    st = TaskStore(settings.db_target)
+    with st.engine.begin() as c:
+        c.execute(text("ALTER TABLE tasks DROP COLUMN gen_submit_id"))
+    assert "gen_submit_id" not in _columns(st), "前提：列已真的被删掉"
+
+    TaskStore(settings.db_target)              # 再装配一次 = 模拟"老库 + 新代码"
+    assert "gen_submit_id" in _columns(st), "启动期就该把它补回来"
+
+
 def _rec(**kw) -> dict:
     now = int(time.time())
     base = dict(

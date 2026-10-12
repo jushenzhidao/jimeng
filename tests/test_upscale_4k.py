@@ -149,6 +149,53 @@ def test_4k_size_is_rerouted_to_2k_then_upscaled(
     assert any("4k 改道完成" in d for d in rec.degradations)
 
 
+def test_the_billing_anchor_survives_the_upscale_leg(
+        client, client_state, fake_jimeng, service):
+    """🔴 `upstream_submit_id` 会被**超清腿**覆盖（在途轮询要查它）⇒ 真扣费那条
+    生成腿的 id 必须另存 `gen_submit_id`。
+
+    否则 4k 改道之后，"这次到底扣没扣"就**没有 submit_id 可查**了 ——
+    而本仓库的对账纪律就是"按 submit_id 回 `user_credit_history` 查"。
+    线上实测（2026-10-12）：库里那个字段变成了超清腿 id、账单里查不到；
+    真扣的 3 积分挂在生成腿 id 上，只能翻日志。
+    """
+    fake_jimeng.states = [
+        submitted_state(),
+        _gen_ok(["https://cdn/gen.png"], items=(777,)),
+        _upscale_ok("https://cdn/up.png"),
+    ]
+    tid = _create(client, size="4096x4096")
+    drive(client_state, 1)
+    gen_sid = service.store.get(tid).gen_submit_id
+    assert gen_sid == fake_jimeng.submitted[0], "**派发时**就要记下生成腿的 id"
+
+    client_state.coordinator.tick()           # 2k 生成成功 ⇒ 接超清腿
+    rec = service.store.get(tid)
+    assert rec.upstream_submit_id == fake_jimeng.submitted[-1] != gen_sid, \
+        "前提：轮询字段确实切到了超清腿（且两者本就不同）"
+    assert rec.gen_submit_id == gen_sid, "超清腿**不许**覆盖计费锚点"
+
+    client_state.coordinator.tick()           # 超清腿终态 ⇒ 收尾
+    rec = service.store.get(tid)
+    assert rec.status == "success"
+    assert rec.gen_submit_id == gen_sid, "收尾后锚点仍指向**真扣费**那条生成腿"
+    assert rec.upstream_submit_id != gen_sid, "而在途字段指向超清腿（免费）"
+
+
+def test_direct_generation_anchor_is_the_very_same_leg(
+        client, client_state, fake_jimeng, service):
+    """没改道时两者**相同** —— 锚点不是"另造一个值"，它就是生成腿本身。"""
+    fake_jimeng.states = [
+        submitted_state(),
+        _gen_ok(["https://cdn/a.png"], items=(11,)),
+    ]
+    tid = _create(client, size="2048x2048")
+    drive(client_state, 2)
+    rec = service.store.get(tid)
+    assert rec.status == "success"
+    assert rec.gen_submit_id == rec.upstream_submit_id == fake_jimeng.submitted[0]
+
+
 def test_each_image_gets_its_own_upscale_leg(
         client, client_state, fake_jimeng, service):
     """n=2 ⇒ **每张一条**超清腿（引用形态一次只引用一张作品），逐张推进。"""

@@ -48,6 +48,9 @@ SUBMIT = "/async/v1/images/generations"
 POLL_INTERVAL = 6.0
 POLL_TIMEOUT = 420.0
 
+#: `--only` 的取值 → 计划里标签的前缀（i2i 不在 plan 里，单独处理）
+_ONLY_PREFIX = {"1x1": "1:1", "16x9": "16:9", "9x16": "9:16"}
+
 PROMPTS = {
     "1x1": "一只橘猫坐在木窗台上晒太阳，水彩插画风格，暖色调",
     "16x9": "黄昏的海岸线与远处的灯塔，胶片摄影风格，宽幅构图",
@@ -127,6 +130,10 @@ def main() -> int:
     ap.add_argument("--base", default=BASE_DEFAULT)
     ap.add_argument("--credential", default="",
                     help="本服务的 Bearer 凭据（即 sessionid 透传）；或设 JIMENG_SESSIONID")
+    ap.add_argument("--only", choices=["1x1", "16x9", "9x16", "i2i"],
+                    help="只跑一个形态 —— **定向复现**用（省积分）。缺省跑全部 4 形态")
+    ap.add_argument("--input-url", default="",
+                    help="`--only i2i` 的垫图 URL；不给则用本轮 t2i 的第 1 张产物")
     args = ap.parse_args()
 
     cred = args.credential or _env("JIMENG_SESSIONID")
@@ -146,12 +153,25 @@ def main() -> int:
            {"model": "jimeng-i2i", "prompt": PROMPTS["i2i"],
             "size": "4096x4096", "n": 1}, (4096, 4096))
 
-    print("== 计划（4 形态 / 5 张；超清腿免费、2k 生成腿按账号单价）==")
+    # `--only`：定向复现。典型用途 —— 某形态的**超清腿**偶发失败过，
+    # 要判"偶发 vs 系统性"（全量重跑太贵）。
+    only = args.only
+    if only == "i2i":
+        plan = []                      # i2i 走"追加"那一段，不上 t2i
+    elif only:
+        plan = [x for x in plan if x[0].startswith(_ONLY_PREFIX[only])]
+    run_i2i = (only is None) or (only == "i2i")
+
+    total = sum(n for _, _, _, n in plan) + (1 if run_i2i else 0)
+    print(f"== 计划（{'全部 4 形态' if not only else f'只跑 {only}'}；"
+          f"超清腿免费、2k 生成腿按账号单价）==")
     for label, body, want, n in plan:
         print(f"  {label}: size={body['size']} n={n} ⇒ 期望交付 {n}×{want[0]}×{want[1]}")
-    print(f"  {i2i[0]}: size={i2i[1]['size']} ⇒ 期望交付 {i2i[2][0]}×{i2i[2][1]}"
-          f"（垫图 = 用例 1 的产物）")
-    print("  ⇒ 合计 5 张 2k 生成；账号实测 3/张 ⇒ 预计 15 积分")
+    if run_i2i:
+        src = args.input_url or "用例 1 的产物"
+        print(f"  {i2i[0]}: size={i2i[1]['size']} ⇒ 期望交付 "
+              f"{i2i[2][0]}×{i2i[2][1]}（垫图 = {src}）")
+    print(f"  ⇒ 合计 {total} 张 2k 生成；账号实测 3/张 ⇒ 预计 {total * 3} 积分")
     if not args.go:
         print("\n[dry_run] 未发任何请求（零消耗）。加 --go 真跑。")
         return 0
@@ -166,9 +186,11 @@ def main() -> int:
         print(f"  ✓ {label}: task_id={r['task_id']}")
         tasks.append((label, r["task_id"], want, n))
 
-    if not tasks:
+    if not tasks and plan:
         print("没有任何任务被受理，终止。")
         return 1
+    if not tasks:                       # `--only i2i`：本段无事可做
+        print("（只跑 i2i：本次不发 t2i）")
 
     print("\n== 轮询到终态 ==")
     done: dict[str, dict] = {}
@@ -209,8 +231,10 @@ def main() -> int:
         if isinstance(r.get("error"), dict):
             print(f"    error: {r['error']}")
 
+    first_url = first_url or args.input_url
     if first_url:
-        print("\n== 追加 i2i（垫图 = 上面第 1 张产物）==")
+        src = "--input-url" if args.input_url else "上面第 1 张产物"
+        print(f"\n== 追加 i2i（垫图 = {src}）==")
         label, body, want = i2i
         body = {**body, "image": [first_url]}
         code, r = _req(args.base + SUBMIT, body=body, credential=cred)
@@ -238,6 +262,10 @@ def main() -> int:
                 else:
                     bad += 1
                 print(f"    {mark} 期望 {want[0]}×{want[1]}  实际 {dim}")
+
+    if run_i2i and not first_url:
+        # 别静默跳过 —— 少了 i2i 就等于这个形态**没测**
+        print("\n⚠️ 没有可用垫图（t2i 全失败且未给 `--input-url`）⇒ **i2i 形态未测**")
 
     print(f"\n== 小结：尺寸符合 {ok} 张 / 不符 {bad} 张 ==")
     print("  （改道是否生效、每张走了哪条腿，看服务端 `degradations`："

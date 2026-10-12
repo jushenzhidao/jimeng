@@ -157,7 +157,19 @@ class TaskRecord(SQLModel, table=True):
 
     # ---- 上游与结果 ----
     #: 即梦的 `submit_id`。**绝不对外暴露**（对外只有本地 task_id）。
+    #: ⚠️ 语义是"**当前在途那一条**"：4k 改道接上超清腿后，它会被改写成
+    #: **超清腿**的 id（轮询要查它）。所以它**不能**当计费锚点，见下一列。
     upstream_submit_id: Optional[str] = None
+    #: 🔴 **计费锚点**（2026-10-12 新增）：最近一次**生成腿**（真花钱的那条 ——
+    #: 2k 生成 / 直出 / 续生成）的 `submit_id`。**超清腿的 id 永不写进来**。
+    #:
+    #: 为什么必须与 `upstream_submit_id` 分开：本仓库的对账纪律是
+    #: "按 submit_id 回 `user_credit_history` 查这次到底扣没扣"（见
+    #: `_terminal_error` 与 `_advance` 的注释）。而 4k 改道会再提交一条
+    #: **免费**的超清腿并覆盖 `upstream_submit_id` ⇒ 真扣费那条 id 就从
+    #: 记录里**消失**了。线上实测（2026-10-12）：`upstream_submit_id` 变成
+    #: 超清腿的 id，账单里查不到；真扣的 3 积分挂在生成腿的 id 上，只能翻日志。
+    gen_submit_id: Optional[str] = None
     #: 🔴 续生成（action=2）的**必需字段** —— 上游回执里本来就有（history_record_id），
     #: 我们原先**只解析不持久化** ⇒ 异步/重启之后就没法续。
     upstream_history_id: Optional[str] = None
@@ -221,7 +233,7 @@ class Meta(SQLModel, table=True):
 _PATCHABLE = {
     "credential_id", "model", "cap_key", "upstream_model", "status", "prompt",
     "image_refs", "size", "n", "seed", "negative_prompt", "duration_ms",
-    "aspect_ratio", "extra_json", "upstream_submit_id",
+    "aspect_ratio", "extra_json", "upstream_submit_id", "gen_submit_id",
     "upstream_history_id", "draft_json", "continuations",
     "images", "credits", "error", "degradations", "created_at", "updated_at",
     "started_at", "finished_at", "attempts", "lease_owner", "lease_until",
