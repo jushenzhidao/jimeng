@@ -232,7 +232,10 @@ def main() -> int:
             print(f"    error: {r['error']}")
 
     first_url = first_url or args.input_url
-    if first_url:
+    # 🔴 `--only` 必须**真的**把其余形态挡掉，否则"定向复现省积分"就是假的
+    # （2026-10-12 实测踩到：`--only 1x1` 照样跑了 i2i，预估 3 张实跑 3 张对不上，
+    # 因为垫图来自 t2i 产物、`if first_url` 恒真）。判据用 `run_i2i`，别用 first_url。
+    if run_i2i and first_url:
         src = "--input-url" if args.input_url else "上面第 1 张产物"
         print(f"\n== 追加 i2i（垫图 = {src}）==")
         label, body, want = i2i
