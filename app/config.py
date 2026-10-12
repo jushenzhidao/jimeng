@@ -115,6 +115,16 @@ class Settings:
     coordinator_tick: float = 1.0
     coordinator_lease: float = 30.0
 
+    # ------------------------------------------------- 4k 改道（2k + 超清）
+    #: 🔴 2026-10-12（用户口径）：请求**清晰度 > 2k** 的图片任务一律改走
+    #: 「2k 生成 + 超清就地放大」以降本。依据（`docs/UPSTREAM.md` §21）：
+    #: · 4k 是**独立计费档**，直出明显更贵 —— 非会员账号上实测余额 17 时
+    #:   **连提交都被 `ret=1006` 拒**（"积分不足**或**没有相关权益"）；
+    #: · 超清**免费**（UI 标价 + 实测零出账 + 用户口径，三者吻合）；
+    #: · 超清服务端实测**固定 2×**（源 2560×1440 → 5120×2880），比例与输入一致。
+    #: 关掉即回到"直出请求档位"的旧行为（仍然照旧留痕告知 4k 更贵）。
+    upscale_4k_enabled: bool = True
+
     # ------------------------------------------------------------ 同步接口
     #: `POST /v1/images/generations`（创建 + 轮询合并）的**总等待预算**（秒）：
     #: 预算内到终态就直接回最终体；超预算降级回 `202 + task_id`（调用方转异步轮询）。
@@ -269,6 +279,7 @@ class Settings:
             task_timeout=_f("TASK_TIMEOUT", 1800.0),
             coordinator_enabled=_b("COORDINATOR_ENABLED", True),
             continue_enabled=_b("CONTINUE_ENABLED", False),
+            upscale_4k_enabled=_b("UPSCALE_4K_ENABLED", True),
             coordinator_tick=_f("COORDINATOR_TICK", 1.0),
             coordinator_lease=_f("COORDINATOR_LEASE", 30.0),
             sync_max_wait=_f("SYNC_MAX_WAIT", 300.0),

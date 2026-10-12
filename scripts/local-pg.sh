@@ -108,7 +108,10 @@ cmd_stop() {
 
 cmd_status() {
   if running; then
-    info "运行中：$PGDATA（端口 ${PGPORT}）"
+    # ⚠️ `${PGDATA}` 的花括号**不是风格偏好**：`$PGDATA（` 里紧跟的非 ASCII
+    # 字符会被 shell 当成变量名的一部分 ⇒ `set -u` 下直接报
+    # "PGDATA：: unbound variable"。变量后跟非 ASCII 一律加花括号。
+    info "运行中：${PGDATA}（端口 ${PGPORT}）"
   else
     info "未运行：$PGDATA"
   fi

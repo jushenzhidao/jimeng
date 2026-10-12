@@ -239,6 +239,9 @@ UPSTREAM_MODEL_CREDITS: dict[str, int | None] = {
     # `credits_measured` 是**单值**字段、表达不了"按档定价"——
     # 调用方若拿它当"这个模型恒免费"就会在 4k 上踩坑。
     # 4k 的真实单价见 docs/UPSTREAM.md 与 `service.create` 的分档留痕。
+    # 🔴 2026-10-12：**4k 请求默认会自动改走「2k 生成 + 超清」**（超清免费，
+    # 见 `Settings.upscale_4k_enabled`）⇒ 那笔 4/张在改道成立时**不再发生**；
+    # 只有改道不成立（开关关 / 能力表读不到 / 该比例无 2k 槽）才直出 4k。
     "high_aes_general_v50": 0,
     "high_aes_general_v50p_large": 8,     # 2026-09-20 实测（三尺寸同价）
     "high_aes_general_v43": None,
@@ -320,8 +323,12 @@ CAPABILITIES: tuple[Capability, ...] = (
         credits_measured=0,
         notes="上游模型 high_aes_general_v50（Seedream 5.0 Lite）；异步建任务→轮询，"
               "⚠️ **能力级的 0 只对 2k 档成立**（4k 是独立计费项 image_basic_v5_4k，"
-              "**实测 4/张**，submit_id 07144215）⇒ 传 4k 尺寸会在 degradations "
-              "里留痕提示额外扣费；"
+              "**实测 4/张**，submit_id 07144215）⇒ **传 4k 尺寸默认会自动改走"
+              "「2k 生成 + 超清就地放大」以省掉这笔钱**（`UPSCALE_4K_ENABLED`，"
+              "2026-10-12；超清免费、实测固定 2×，见 docs/UPSTREAM.md §21），"
+              "改道与交付尺寸都进 degradations 留痕；"
+              "只有**改道不成立**（开关关 / 能力表读不到 / 该比例无 2k 槽）时"
+              "才直出 4k、并留痕提示额外扣费；"
               "**建任务即计费**。"
               "实测一次出图端到端 17.9-19s（1 张 2048×2048）。"
               "本能力也接受**直接写上游模型 key 或 web 面板名**来换模型，"

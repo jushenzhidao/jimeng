@@ -334,12 +334,17 @@ class FakeConfigCache:
 
     def __init__(self, options: tuple[int, ...] = (1, 2, 3, 4, 5, 6, 7, 8),
                  note: str | None = None,
-                 declared: tuple[int, ...] | None = None) -> None:
+                 declared: tuple[int, ...] | None = None,
+                 rmap: dict | None = None) -> None:
         self.options = options
         self.note = note
         #: **服务端声明值**（不做兜底的那个）。默认与 `options` 一致 = 已声明。
         #: 设成 None 可模拟"该模型就是不声明张数选项"（实测真实存在这种模型）。
         self.declared = options if declared is None else declared
+        #: `resolution_map`（比例 → 精确像素）。**默认 None = 读不到能力表** ——
+        #: 这也是绝大多数用例的期望（4k 改道因此**惰性不生效**，旧行为不变）。
+        #: 要测 4k 改道，显式传一份（见 `tests/test_upscale_4k.py::V50_RMAP`）。
+        self.rmap = rmap
         self.calls = 0
 
     def count_options(self, model: str) -> tuple[int, ...]:
@@ -353,7 +358,13 @@ class FakeConfigCache:
         return None
 
     def resolution_map(self, model: str) -> dict | None:
-        return None
+        return self.rmap
+
+    def slot_for_ratio(self, model: str, bucket: str,
+                       width: int, height: int) -> tuple[int, int] | None:
+        """复用**生产同一份**判据（`slot_for_ratio_in`）—— 替身与实现不许漂移。"""
+        from app.upstream.jimeng.capabilities import slot_for_ratio_in
+        return slot_for_ratio_in(self.rmap, bucket, width, height)
 
     def feats(self, model: str) -> tuple[str, ...] | None:
         return None

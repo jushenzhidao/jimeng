@@ -167,6 +167,12 @@ class ModelConfigCache:
         spec = self._spec(model)
         return spec.resolution_map if spec else None
 
+    def slot_for_ratio(self, model: str, bucket: str,
+                       width: int, height: int) -> tuple[int, int] | None:
+        """该模型 `bucket` 档里**同比例**的槽位像素（判据见 `slot_for_ratio_in`）。"""
+        return slot_for_ratio_in(self.resolution_map(model),
+                                 bucket, width, height)
+
     def feats(self, model: str) -> tuple[str, ...] | None:
         spec = self._spec(model)
         return spec.feats if spec else None
@@ -216,6 +222,55 @@ class ModelConfigCache:
 # ---------------------------------------------------------------------------
 # 解析（防御式）
 # ---------------------------------------------------------------------------
+
+
+def slot_for_ratio_in(rmap: Any, bucket: str, width: int,
+                      height: int) -> tuple[int, int] | None:
+    """在一份 `resolution_map` 里找**同比例**的槽位像素。
+
+    纯函数（不碰缓存/网络）⇒ 单测与假替身都能复用**同一份判据**，
+    不会出现"测试通过、线上换了实现"的漂移。
+
+    形状（实测，见 `docs/UPSTREAM.md` §11）：
+    `{"2k": {"image_ratio_sizes": [{"ratio_type": 1, "width": 2048,
+    "height": 2048}, ...]}, "4k": {...}}`。两种承载都容错
+    （桶值直接是数组也认），认不出就返回 None。
+
+    🔴 **配不上就返回 None**（调用方必须**保守放弃**改道）—— 绝不"按比例乘"
+    猜一个尺寸：4k 档**不是** 2k 的整数倍（16:9 是 2560×1440 → 5404×3040，
+    2.11×），自己乘出来的值上游未必接受、且与声明的契约像素不符。
+
+    🔴 **必须按带方向的 `w/h` 匹配、不能用 `min/max`**（2026-10-12 被
+    `tests/test_upscale_4k.py` 抓出的真 bug）：§11 那张表把**竖横分开**
+    （ratio_type 2=3:4 竖、4=4:3 横；5=9:16 竖、3=16:9 横；6=2:3 / 7=3:2），
+    而 3:4 与 4:3 的"短长边比"**同值 0.75** ⇒ 用 `min/max` 时两者距离相同、
+    谁在数组里靠前谁赢 ⇒ 竖图请求会被判成横图槽（要竖版拿到横版）。
+    """
+    if not isinstance(rmap, dict) or not width or not height:
+        return None
+    entries = rmap.get(bucket)
+    if isinstance(entries, dict):
+        entries = entries.get("image_ratio_sizes")
+    if not isinstance(entries, list) or not entries:
+        return None
+    want = width / height
+    best: tuple[int, int] | None = None
+    best_d: float | None = None
+    for e in entries:
+        if not isinstance(e, dict):
+            continue
+        w, h = e.get("width"), e.get("height")
+        if not (isinstance(w, int) and isinstance(h, int) and w and h):
+            continue
+        d = abs(w / h - want)
+        if best_d is None or d < best_d:
+            best, best_d = (w, h), d
+    # 2% 阈值：同一比例跨档只差 ~1.4e-4（5404×3040 的 w/h vs 2560×1440 的 w/h），
+    # 而**表内相邻比例**的最小间距是 4:3(1.3333) ↔ 3:2(1.5) = 0.1667 ⇒
+    # 0.02 既容得下舍入、又留了一整个数量级的余量，不会认错比例。
+    if best is None or best_d is None or best_d > 0.02:
+        return None
+    return best
 
 
 def parse_common_config(cfg: dict) -> tuple[dict[str, ModelSpec], list[str]]:

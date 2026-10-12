@@ -870,21 +870,13 @@ def test_lite_is_free_at_2k_but_charged_at_4k():
     assert "07144215" in text, "Lite 4k 实扣 4 的submit_id 证据丢失了"
 
 
-def test_4k_size_is_reported_as_charged_tier():
-    """🔴 请求 **4k 尺寸**必须在 `degradations` 里**响亮告知额外扣费**。
-
-    受理层此前对 `size` **零留痕** ⇒ 传 4k 会被静默按 4k 档扣钱。
-    这条钉住"跨收费档必须留痕"，且**只对 4k 说**（默认 2k 不制造噪音）。
-    """
-    import inspect
-    from app.service import Service
-
-    src = inspect.getsource(Service.create)
-    assert 'if _rtype == "4k":' in src, \
-        "4k 是独立计费档，必须有专门留痕分支"
-    assert "image_basic_v5_4k" in src, \
-        "留痕文案要指名真实计费项，让调用方能自己去上游对账"
-    assert "degradations.append" in src, "留痕必须进 degradations（会被回给调用方）"
+# 🔴 `test_4k_size_is_reported_as_charged_tier` 已**移除**（2026-10-12）：
+# 它用 `inspect.getsource` grep `Service.create` 的源码字串 —— 那测的是"源码长什么样"，
+# 不是行为（改个变量名就红、而真正的漏留痕却可能绿）。它的两项主张现在都有
+# **行为级**用例接管，见 `tests/test_upscale_4k.py`：
+#   · 4k 必须留痕 ⇒ `test_direct_4k_when_capability_table_is_unreadable`
+#     （断言 degradations 里指名了 `image_basic_v5_4k`）；
+#   · 4k 现在**默认改走 2k + 超清**（见 docs/UPSTREAM.md §21）⇒ 同文件那 8 条。
 
 # ---------------------------------------------------------------------------
 # model 后缀指定分辨率档（2026-10-02 方案 B）

@@ -950,20 +950,38 @@ class Service:
             # 🔴 2026-10-02（用户纠正"lite 4k 并不免费"触发）：
             # **分辨率档会改计费**，而受理层此前对 `size` **零留痕** ——
             # 调用方传 4k 会被静默按 4k 档扣钱。
-            # 已实测 Lite（Seedream 5.0）：2k **0** / 4k **4**（`submit_id=07144215…`）
-            # ⇒ "Lite 免费"只对 **2k** 成立，别把它当恒免费。
-            # 只在**跨过已知收费档**时留痕（默认 2k 什么都不说，避免噪音）。
             try:
                 _w, _h = parse_size(str(size))
                 _rtype = resolution_type_for_size(_w, _h)
             except Exception:            # noqa: BLE001 —— 已在上面校验过，这里只兜住意外
+                _w = _h = 0
                 _rtype = None
-            if _rtype == "4k":
-                degradations.append(
-                    f"size={size} 落在**4k 档**（比默认的 2k 档贵）："
-                    f"该档是**独立计费项**（如 Lite 的 "
-                    f"image_basic_v5_4k），会按张数额外扣积分"
-                    f"（实测 4/张）。要免费档请显式传 2k 尺寸（如 2048x2048）。")
+            # 🔴 **有效请求档**必须是"两条入口的并集"：
+            #   ① `model` 后缀（`-4k`）—— 此时 `size` 是**默认的 2048x2048**，
+            #      只看 `size` 会把这条入口整条漏掉；
+            #   ② `size` 就近吸附。
+            _req_tier = tier or _rtype
+            if _req_tier == "4k":
+                # 🔴 2026-10-12（用户口径）：请求清晰度 > 2k 的一律改走
+                # 「2k 生成 + 超清就地放大」以降本，见 `docs/UPSTREAM.md` §21。
+                _plan = self._plan_upscale(
+                    cap=cap, model_key=upstream_model or DEFAULT_MODEL,
+                    width=_w, height=_h)
+                if _plan is not None:
+                    size = _plan["gen_size"]
+                    tier = "2k"    # 🔴 落库 / 提交 / 负缓存键都用**实际**档位
+                    extra_info = {**(extra_info or {}), "upscale": _plan}
+                    degradations.append(self._upscale_note(_plan))
+                else:
+                    # 改道不成（开关关 / 能力不适用 / 能力表读不到 / 该比例无 2k 槽）
+                    # ⇒ **保守直出 4k** 并照旧留痕：宁可照收 4k 的钱，也不猜一个尺寸。
+                    degradations.append(
+                        f"size={size} 落在**4k 档**（比默认的 2k 档贵）："
+                        f"该档是**独立计费项**（如 Lite 的 "
+                        f"image_basic_v5_4k），会按张数额外扣积分。"
+                        f"⚠️ 本次**未能**改走「2k 生成 + 超清放大」"
+                        f"（改道开关关 / 能力表读不到 / 该比例没有 2k 槽），"
+                        f"按请求档原样提交。")
 
         #: ⚠️ **不传 `n` 与传 `n=...` 是两种情况，必须分开处理。**
         #:
@@ -1529,6 +1547,255 @@ class Service:
                  trigger="partial_45", continuations=n_used,
                  have=len(have), want=want)
 
+    # -------------------------------------------- 4k 改道（2k + 超清就地放大）
+
+    @staticmethod
+    def _upscale_plan_of(rec: TaskRecord) -> dict[str, Any] | None:
+        """取任务上的 4k 改道计划（`extra_json.upscale`）；没有则 None。"""
+        try:
+            info = json.loads(rec.extra_json or "{}")
+        except Exception:                # noqa: BLE001 —— 脏数据不该炸链路
+            return None
+        plan = info.get("upscale") if isinstance(info, dict) else None
+        return plan if isinstance(plan, dict) else None
+
+    def _plan_upscale(self, *, cap: models.Capability, model_key: str,
+                      width: int, height: int) -> dict[str, Any] | None:
+        """能不能把本次 4k 请求改走「2k 生成 + 超清就地放大」？能则返回计划。
+
+        四道判据，**任一不满足就返回 None**（调用方退回"直出 4k"并照旧留痕）：
+
+        1. 开关 `UPSCALE_4K_ENABLED` 开着；
+        2. 能力是**图片生成**（t2i / i2i）—— 后编辑族 / 视频 / 素材预审不适用；
+        3. 服务端能力表**读到了**，且**同比例的 2k 与 4k 槽都声明了**
+           （读不到就不改：宁可照付 4k 的钱，也**不猜**一个尺寸）；
+        4. 2k 槽确实**小于** 4k 槽（防呆：别把 4k 请求"改道"成一个更大的）。
+        """
+        if not self.settings.upscale_4k_enabled:
+            return None
+        if cap.name not in ("t2i", "i2i"):
+            return None
+        if self.cfg is None:
+            return None
+        slot4 = self.cfg.slot_for_ratio(model_key, "4k", width, height)
+        slot2 = self.cfg.slot_for_ratio(model_key, "2k", width, height)
+        if not slot4 or not slot2 or slot2 == slot4:
+            return None
+        return {
+            "requested_size": f"{slot4[0]}x{slot4[1]}",
+            "gen_size": f"{slot2[0]}x{slot2[1]}",
+            "stage": "generate",
+            "hist": None,
+            "src": [],
+            "out": [],
+            "i": 0,
+            "legs_failed": 0,
+            "notes": [],
+            "credits": None,
+        }
+
+    @staticmethod
+    def _upscale_note(plan: dict[str, Any]) -> str:
+        """改道留痕（**降级必须可见**）—— 交付尺寸与请求档位的关系必须写清楚。"""
+        rw, rh = (int(x) for x in str(plan["requested_size"]).split("x"))
+        gw, gh = (int(x) for x in str(plan["gen_size"]).split("x"))
+        head = (f"🔁 请求的是 **4k 档**（{plan['requested_size']}）⇒ 已自动改走"
+                f"「2k 生成（{plan['gen_size']}）+ 超清就地放大」以降低消耗"
+                f"（4k 直出更贵；超清**免费**，服务端实测**固定 2×**）。")
+        if gw * 2 == rw and gh * 2 == rh:
+            return head + f"交付尺寸 {gw * 2}x{gh * 2}，**与 4k 档声明的像素一致**。"
+        return head + (
+            f"交付尺寸为 **{gw * 2}x{gh * 2}**（= 2k 槽的 2×，比例与输入一致）——"
+            f"它**不等于** 4k 档声明的 {plan['requested_size']}：超清是固定 2×、"
+            f"不吸附到 4k 槽（见 docs/UPSTREAM.md §21）。本服务按"
+            f"「**按输入比例就地放大**」口径交付。")
+
+    @staticmethod
+    def _extra_with(rec: TaskRecord, plan: dict[str, Any]) -> str:
+        """把改道计划并回 `extra_json`（保留 `ark_model` 等既有键）。
+
+        ⚠️ 读的是 `rec.extra_json`（同一轮里多次 patch 时它是**上一次读库的快照**）——
+        这里只**覆盖 `upscale` 这一个键**、其余键原样带走，所以陈旧不会串味。
+        """
+        try:
+            info = json.loads(rec.extra_json or "{}")
+        except Exception:                # noqa: BLE001
+            info = {}
+        if not isinstance(info, dict):
+            info = {}
+        info["upscale"] = plan
+        return json.dumps(info, ensure_ascii=False)
+
+    def _submit_upscale_leg(self, rec: TaskRecord, plan: dict[str, Any],
+                            img: dict[str, Any]) -> tuple[bool, str]:
+        """提交**一张**的 `normal_hd`（**引用形态**）。返回 `(成功?, submit_id|原因)`。
+
+        🔴 引用形态（`item_id` + `origin_history_id`，**不带** `origin_image`）
+        是 2026-10-12 实跑验证过的形态（`submit_id=1be406f7…`，status=50），
+        也正是即梦 UI"就地超清"走的路 ⇒ **不需要**把产物下载再上传。
+        """
+        if self.client is None:
+            return False, "本服务未配置上游客户端"
+        item_id = img.get("item_id")
+        hist = plan.get("hist")
+        if not item_id or not hist:
+            return False, "该张缺 item_id / history（引用形态的必要条件）"
+        try:
+            item_num, hist_num = int(item_id), int(hist)
+        except (TypeError, ValueError):
+            # 即梦的 item_id / history_record_id 都是数字；非数字 ⇒ 不是我们能引用的形态
+            return False, "该张的 item_id / history 不是数字 id"
+        opts = self.cfg.count_options(DEFAULT_MODEL) if self.cfg else None
+        try:
+            sid = self.client.edit("normal_hd", item_id=item_num,
+                                   origin_history_id=hist_num, count=1,
+                                   count_options=opts)
+        except Exception as e:            # noqa: BLE001 —— 超分腿失败不判任务失败
+            return False, f"{type(e).__name__}: {e}"
+        return True, sid
+
+    def _upscale_begin(self, rec: TaskRecord, st: Any,
+                       images: list[dict[str, Any]], plan: dict[str, Any],
+                       deg: list[str]) -> None:
+        """2k 生成腿成功后**启动**超清队列（任务保持 `in_progress`，先不判成功）。"""
+        plan = dict(plan)
+        plan.update({
+            "stage": "upscale", "src": images, "out": [], "i": 0,
+            "credits": getattr(st, "cost", None),
+            "hist": (getattr(st, "history_record_id", None)
+                     or rec.upstream_history_id),
+        })
+        self.store.patch(
+            rec.task_id, extra_json=self._extra_with(rec, plan),
+            upstream_history_id=plan["hist"],
+            degradations=list(deg) + [
+                f"🔁 2k 生成已完成（{len(images)} 张），开始**逐张超清就地放大**"
+                f"（引用形态，2026-10-12 实测成立）。"])
+        self._upscale_pump(rec, plan)
+
+    def _upscale_pump(self, rec: TaskRecord, plan: dict[str, Any]) -> None:
+        """推进超清队列：能提交就提交当前这张；提交不出去就记为该张退回 2k 原图、
+        继续下一张；全部走完则收尾（见 `_upscale_finish`）。"""
+        src = plan["src"]
+        while plan["i"] < len(src):
+            j = plan["i"]
+            ok, sid_or_why = self._submit_upscale_leg(rec, plan, src[j])
+            if ok:
+                self.store.patch(rec.task_id, upstream_submit_id=sid_or_why,
+                                 extra_json=self._extra_with(rec, plan))
+                return
+            plan["out"].append(src[j])
+            plan["legs_failed"] += 1
+            plan["notes"].append(
+                f"⚠️ 第 {j + 1} 张**未能超清**（{sid_or_why}）⇒ 该张按 "
+                f"**2k 原图**交付。")
+            plan["i"] = j + 1
+        self._upscale_finish(rec, plan)
+
+    def _upscale_settle(self, rec: TaskRecord, st: Any,
+                        plan: dict[str, Any]) -> None:
+        """**超清腿**落终态：成功收放大图；失败 / 空产物收 2k 原图。
+
+        🔴 用户口径（2026-10-12）：超分腿失败**不判任务失败** —— 2k 产物已经
+        到手，退回它并**响亮留痕**比整条任务失败有用（调用方至少拿到图）。
+        """
+        plan = dict(plan)
+        j = plan["i"]
+        src = plan["src"]
+        img = src[j] if 0 <= j < len(src) else {}
+        up: dict[str, Any] | None = None
+        if getattr(st, "finished", False) and not getattr(st, "failed", False):
+            up = next(({"url": im.url, "width": im.width, "height": im.height,
+                        "format": im.format, "note": im.note,
+                        "item_id": im.item_id, "vid": im.vid}
+                       for im in st.images), None)
+        if up is None:
+            why = (getattr(st, "failed_reason", "") or
+                   getattr(st, "status_name", "") or "无产物")
+            plan["legs_failed"] += 1
+            plan["notes"].append(
+                f"⚠️ 第 {j + 1} 张超清未成功（{why}）⇒ 该张按 **2k 原图**交付。")
+            up = img
+            OBS.warning(
+                "upscale leg failed", task_id=rec.task_id, model=rec.model,
+                capability=rec.cap_key, index=j,
+                upstream_submit_id=rec.upstream_submit_id,
+                upstream_status=getattr(st, "status_name", None),
+                failed_reason=why)
+        plan["out"].append(up)
+        plan["i"] = j + 1
+        self.store.patch(rec.task_id, extra_json=self._extra_with(rec, plan))
+        self._upscale_pump(rec, plan)
+
+    def _upscale_finish(self, rec: TaskRecord, plan: dict[str, Any]) -> None:
+        """队列走完 ⇒ 收尾（**这一步才判成功**）。
+
+        `rec.degradations` 在这里是**本轮读库的新鲜值**（含 `_upscale_begin`
+        写的那条），而本轮 `_upscale_settle` 追加的说明在 `plan["notes"]` 里
+        ⇒ 两者拼接即为完整留痕。
+        """
+        plan = dict(plan)
+        plan["stage"] = "done"
+        deg = list(rec.degradations) + list(plan["notes"])
+        if plan["legs_failed"]:
+            deg.append(
+                f"🔁 4k 改道收尾：{len(plan['out'])} 张中 **{plan['legs_failed']} 张"
+                f"未能超清**，按 2k 原图交付（已逐张留痕）。")
+        sizes = "、".join(f"{im.get('width')}x{im.get('height')}"
+                          for im in plan["out"] if im.get("width"))
+        deg.append(f"🔁 4k 改道完成：请求 {plan['requested_size']}，"
+                   f"实际交付 {sizes or '—'}（2k 生成 + 超清就地放大）。")
+        self._succeed(rec, images=[dict(im) for im in plan["out"]],
+                      credits=plan.get("credits"), deg=deg,
+                      upstream_history_id=plan.get("hist"),
+                      extra_json=self._extra_with(rec, plan))
+
+    def _succeed(self, rec: TaskRecord, *, images: list[dict[str, Any]],
+                 credits: int | None, deg: list[str],
+                 status_name: str | None = None,
+                 upstream_history_id: str | None = None,
+                 extra_json: str | None = None) -> None:
+        """任务**成功收尾**：落终态 + 两条观测（成功、扣分告警）。
+
+        🔴 抽出来的理由：4k 改道让"成功"有了**两个落点**（直出、超清队列收尾），
+        各写一份必然与这里漂移 —— 尤其是下面那条"扣了积分必须在 Logfire 上
+        看得见"，漏掉就等于把"改道后到底花没花钱"变成看不见的事。
+        """
+        now = int(time.time())
+        fields: dict[str, Any] = {
+            "status": "success", "images": images, "credits": credits,
+            "finished_at": now, "degradations": deg,
+            # 续生成的必需字段（回执里本来就有，此前只解析不持久化）
+            "upstream_history_id": upstream_history_id}
+        if extra_json is not None:
+            fields["extra_json"] = extra_json
+        self.store.patch(rec.task_id, **fields)
+        OBS.info("task succeeded", task_id=rec.task_id, model=rec.model,
+                 image_count=len(images), credits=credits,
+                 status_name=status_name,
+                 elapsed_s=round(now - rec.created_at, 1))
+
+        # 🔴 **扣了积分就必须在 Logfire 上看得见** —— 生成是这条链上唯一花钱的
+        # 动作，不能等翻账单才发现。落点选**任务翻终态这一刻**，不是读接口
+        # `view()`：后者有两个毛病 —— 没人轮询就不报警，而同一条被轮询多次
+        # 会**重复报**。
+        #
+        # ⚠️ 规则刻意**不是**「forecast > 0 就报」：t2i / hd 实测免费，但上游
+        # 回执照样报 44 / 9 —— 若那也告警，告警会次次都响，真扣费的那次反而
+        # 没人看了（狼来了）。按**实测价**判定：
+        #   · `credits_measured > 0` ⇒ 实测会扣 ⇒ **报**
+        #   · `credits_measured == 0` ⇒ 实测免费 ⇒ **不报**
+        #   · `credits_measured is None` ⇒ 未实测、无法排除扣费 ⇒ **报**
+        _cap = models.REGISTRY.get(rec.cap_key)
+        _measured = _cap.credits_measured if _cap else None
+        if _measured != 0:
+            OBS.warning(
+                "credits consumed", task_id=rec.task_id, model=rec.model,
+                images=len(images), n=rec.n, forecast_credits=credits,
+                measured_credits=_measured,
+                why=("该能力实测会扣分" if (_measured or 0) > 0
+                     else "该能力的实扣未实测，无法排除扣费"))
+
     def _advance(self, rec: TaskRecord, st: Any) -> None:
         """把一次查询结果落到任务上（终态收敛 / 未完成只刷时间）。"""
         if not st.finished:
@@ -1545,6 +1812,15 @@ class Service:
             # 也让 stale 扫描不会把正常轮询的任务误判成卡死）。
             # ⚠️ 它同时是 ③ 轮询间隔的判据，所以这一步不能省。
             self.store.patch(rec.task_id, updated_at=int(time.time()))
+            return
+
+        # 🔴 4k 改道：**超清腿**的终态走单独一条路 —— 它失败或空产物都
+        # **不判任务失败**，而是该张退回 2k 原图 + 留痕（用户口径 2026-10-12）。
+        # 🔴 位置必须在 `st.failed` 与"零产物 = 失败"两个判据**之前**：
+        # 放到后面，超清腿的一次失败就会把整条任务打挂，而那张 2k 图本可交付。
+        _plan = self._upscale_plan_of(rec)
+        if _plan is not None and _plan.get("stage") == "upscale":
+            self._upscale_settle(rec, st, _plan)
             return
 
         if st.failed:
@@ -1685,36 +1961,16 @@ class Service:
                 f"按口径**用成功的图补齐**到 {want} 个 url："
                 f"**其中 {want - uniq} 张是重复的**（url 与前 {uniq} 个相同，"
                 f"别当新图用）。")
-        now = int(time.time())
-        self.store.patch(
-            rec.task_id, status="success", images=images,
-            credits=st.cost, finished_at=now, degradations=deg,
-            # 续生成的必需字段（回执里本来就有，此前只解析不持久化）
-            upstream_history_id=getattr(st, "history_record_id", None))
-        OBS.info("task succeeded", task_id=rec.task_id, model=rec.model,
-                 image_count=len(images), credits=st.cost,
-                 status_name=st.status_name,
-                 elapsed_s=round(now - rec.created_at, 1))
+        # 🔴 4k 改道：2k 生成腿成功 ⇒ **先不判成功**，改接超清队列
+        # （第 1 张立刻提交，其余逐张推进；超清免费、实测固定 2×，见 §21）。
+        _plan = self._upscale_plan_of(rec)
+        if _plan is not None and _plan.get("stage") == "generate":
+            self._upscale_begin(rec, st, images, _plan, deg)
+            return
 
-        # 🔴 **扣了积分就必须在 Logfire 上看得见** —— 生成是这条链上唯一花钱的动作，
-        # 不能等翻账单才发现。落点选**任务翻终态这一刻**，不是读接口 `view()`：
-        # 后者有两个毛病 —— 没人轮询就不报警，而同一条被轮询多次会**重复报**。
-        #
-        # ⚠️ 规则刻意**不是**「forecast > 0 就报」：t2i / hd 在 Seedream 5.0 Lite 上
-        # **实测免费**（没有任何消耗记录），但上游回执照样报 44 / 9 —— 若那也告警，
-        # 告警会次次都响，真扣费的那次反而没人看了（狼来了）。按**实测价**判定：
-        #   · `credits_measured > 0` ⇒ 实测会扣 ⇒ **报**
-        #   · `credits_measured == 0` ⇒ 实测免费 ⇒ **不报**
-        #   · `credits_measured is None` ⇒ 未实测、无法排除扣费 ⇒ **报**
-        _cap = models.REGISTRY.get(rec.cap_key)
-        _measured = _cap.credits_measured if _cap else None
-        if _measured != 0:
-            OBS.warning(
-                "credits consumed", task_id=rec.task_id, model=rec.model,
-                images=len(images), n=rec.n,
-                forecast_credits=st.cost, measured_credits=_measured,
-                why=("该能力实测会扣分" if (_measured or 0) > 0
-                     else "该能力的实扣未实测，无法排除扣费"))
+        self._succeed(rec, images=images, credits=st.cost, deg=deg,
+                      status_name=st.status_name,
+                      upstream_history_id=getattr(st, "history_record_id", None))
 
     # ------------------------------------------------------------------ 内部
 
