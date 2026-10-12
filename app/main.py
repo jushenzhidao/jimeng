@@ -329,7 +329,11 @@ def _install_routes(app: FastAPI) -> None:
           · **内容审核拒绝** → **451**（`ContentPolicyError`，换 prompt/素材
             才有用，原样重试必再拒）。
         判据是落库的 `error.type`（`_fail` 存的就是 `to_error()["error"]`），
-        不做 message 字符串匹配。其余失败（风控/限流/额度/上游故障…）
+        不做 message 字符串匹配。错误体**只含** `message` / `type` / `code`：
+        不回显模型名、能力 key、上游状态码与计数、上游 id（2026-10-12 口径：
+        对客户端不暴露太多）—— 排查现场只进服务端日志，见
+        `service.empty_result_error()`。
+        其余失败（风控/限流/额度/上游故障…）
         保持 `view()` 的 200 + failure 体 —— 它们的语义是"任务完成了、
         结果是失败"，且部分带 Retry-After，转成裸 HTTP 码反而丢信息。
 

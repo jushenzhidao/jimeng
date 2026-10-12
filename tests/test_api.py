@@ -567,7 +567,8 @@ def test_sync_empty_result_raises_500(sync_client, fake_jimeng):
     from app.upstream.jimeng.client import TaskState
 
     empty = TaskState(submit_id="upstream-submit-id", status=50,
-                      status_name="success", finished=True, failed=False)
+                      status_name="success", finished=True, failed=False,
+                      total=4, finished_count=0)
     empty.images = []  # 不构造任何 GeneratedImage —— 就是零产物
     fake_jimeng.states = [submitted_state(), empty]
 
@@ -577,6 +578,15 @@ def test_sync_empty_result_raises_500(sync_client, fake_jimeng):
     err = r.json()["error"]
     assert err["type"] == "empty_result_error"
     assert "零产物" in err["message"]
+
+    # 🔴 2026-10-12 口径（用户）：抛错信息里**只带错误信息** ——
+    # 对客户端不暴露模型/能力标识、上游状态码与计数、上游 id。
+    # ⇒ 错误体**只有** message/type/code 三个键，连 `detail` 都不出现。
+    assert set(err) == {"message", "type", "code"}, err
+    assert "零产物" in err["message"]
+    for leaked in ("jimeng-t2i", "jimeng:", "status=", "submit_id",
+                   "capability", "model", "total"):
+        assert leaked not in err["message"], f"message 不该出现 {leaked!r}"
 
 
 def test_sync_content_policy_raises_451(sync_client, fake_jimeng):
@@ -601,6 +611,12 @@ def test_sync_content_policy_raises_451(sync_client, fake_jimeng):
     err = r.json()["error"]
     assert err["type"] == "content_policy_violation"
     assert err["message"]
+    # 🔴 2026-10-12 口径：错误体**只有** message/type/code；message 里只留人话，
+    # 不拼上游状态码 / `fail_code` / `fail_key`（内部枚举不进响应体）。
+    assert set(err) == {"message", "type", "code"}, err
+    for leaked in ("status=", "fail_code", "fail_key", "status_name",
+                   "web_fail2generate_copyright_block"):
+        assert leaked not in err["message"], f"message 不该出现 {leaked!r}"
 
 
 def test_sync_timeout_degrades_to_async_polling(client_factory):

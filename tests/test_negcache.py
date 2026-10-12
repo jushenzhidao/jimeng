@@ -65,7 +65,13 @@ def test_terminal_error_reads_fail_key_not_only_fail_code():
     )
     err = Service._terminal_error(st)
     assert isinstance(err, ContentPolicyError), type(err)
-    assert "fail_key=web_fail2generate_copyright_block" in err.message, err.message
+    # 🔴 2026-10-12：原断言 `"fail_key=…" in err.message` 已撤 —— 对外 message
+    # 不再带上游审核键（口径："抛错信息里只带错误信息，对客户端不暴露太多"）。
+    # ⚠️ **本意没减弱**：这里 `fail_code=None` 且 `status=30` 不在 `(10, 40)`，
+    # 判据只剩 `is_security_key(fail_key)` ⇒ 上面那条 `isinstance` **就是**
+    # "它确实读了 fail_key"的证据。上游键改由服务端 `terminal failure` 日志承载。
+    assert "fail_key" not in err.message and "web_fail2generate" not in err.message, \
+        err.message
     assert "每次都计费" in err.message.replace("**", ""), \
         "要写明重试代价，否则调用方会盲目重试"
 

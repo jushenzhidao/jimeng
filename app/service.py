@@ -278,6 +278,28 @@ def view(rec: TaskRecord) -> tuple[int, dict[str, Any]]:
     }
 
 
+def empty_result_error() -> EmptyResultError:
+    """「上游报成功却零产物」→ `EmptyResultError`。
+
+    🔴 对外**只给错误本身**（`message` / `type` / `code`），**一个 `detail`
+    字段都不给**（2026-10-12 口径：抛错信息里只带错误信息，
+    **对客户端不能暴露太多**）。刻意不出的三样：
+      · 模型 / 能力标识（`model`、`capability`）—— 我方内部路由标签；
+      · 上游状态码与计数（`status=50`、`total_image_count`）—— 上游实现细节，
+        客户端拿到也无从行动（message 里也**不拼**状态码，同理）；
+      · 上游 `submit_id` / `history_id` —— **绝不对外**（`store.TaskRecord`）。
+
+    ⚠️ 排查现场并没有丢，只是换了出口：`_advance` 那条 `empty result`
+    日志 —— 模型、能力、上游状态码/计数、派发与续生成次数、耗时、两个上游 id
+    全在里面；任务记录本身也在库。按 submit_id 去 `user_credit_history`
+    对账"到底扣没扣"正是靠它们。
+    **"现场往日志看"不是降级，是"对外最小暴露 + 对内全留痕"。**
+    """
+    return EmptyResultError(
+        "上游报成功但**零产物**：本服务不交付空成功，请重试或联系上游。",
+        upstream="jimeng")
+
+
 # ---------------------------------------------------------------------------
 # 服务
 # ---------------------------------------------------------------------------
@@ -1504,6 +1526,20 @@ class Service:
 
         if st.failed:
             err = self._terminal_error(st)
+            # 🔴 2026-10-12：上游的分类细节**只进服务端**（对外 message 与
+            # `error.detail` 都不带）。`_terminal_error` 因此只剩人话 ——
+            # "为什么这样归类"的现场全靠这一条：status/status_name 是上游状态机
+            # 取值，fail_code/fail_key 是审核判据，failed_reason 是二者原始拼接，
+            # submit_id 用来按 `user_credit_history` 对账实扣。
+            OBS.warning(
+                "terminal failure", task_id=rec.task_id, model=rec.model,
+                capability=rec.cap_key,
+                upstream_submit_id=rec.upstream_submit_id,
+                upstream_status=st.status, upstream_status_name=st.status_name,
+                fail_code=getattr(st, "fail_code", None),
+                fail_key=(getattr(st, "fail_key", "") or "") or None,
+                failed_reason=(getattr(st, "failed_reason", "") or "") or None,
+                err_type=err.err_type)
             # 🔴 审核类失败 ⇒ **记入负缓存**（只有内容审核才记：
             # 上游故障/限流是**可重试**的，缓存它们会把"临时故障"
             # 变成 24 小时的假禁固，那是比不缓存坏得多的错）。
@@ -1548,11 +1584,30 @@ class Service:
         # 同步端点要按 error.type 精确识别它并抛 HTTP 500
         # （用户口径 2026-10-10）—— 混在 upstream_error 里就得靠
         # 字符串匹配 message，那太脆。
+        # 🔴 2026-10-12：**对外只给错误本身**（message/type/code），不带 detail
+        # —— 客户端不该看到我方的模型标签、上游状态码与计数（口径：
+        # "抛错信息里只带错误信息，对客户端不能暴露太多"）。
+        # 排查现场一律走下面这条日志 + 库里的任务记录，见 `empty_result_error()`。
         if not st.images:
-            self._fail(rec, EmptyResultError(
-                f"上游报成功但**零产物**（status={st.status} {st.status_name}）。"
-                f"本服务不交付空成功，请重试或联系上游。",
-                upstream="jimeng", upstream_status=st.status_name))
+            now = int(time.time())
+            err = empty_result_error()
+            # 🔴 现场**全在服务端**：模型 / 能力 / 上游状态码与计数 / 派发与
+            # 续生成次数 / 耗时 / 两个上游 id。submit_id 绝不对外
+            # （见 `store.TaskRecord`），而按它去 `user_credit_history`
+            # 对账"这次到底扣没扣"，正是靠这一条。
+            OBS.warning(
+                "empty result", task_id=rec.task_id, model=rec.model,
+                capability=rec.cap_key,
+                upstream_submit_id=rec.upstream_submit_id,
+                upstream_history_id=st.history_record_id or rec.upstream_history_id,
+                upstream_status=st.status_name, upstream_status_code=st.status,
+                upstream_total=st.total, upstream_finished=st.finished_count,
+                n_requested=rec.n, attempts=rec.attempts,
+                continuations=rec.continuations,
+                elapsed_s=round(
+                    max(0.0, now - (rec.started_at or rec.created_at)), 1),
+                detected_at=now)
+            self._fail(rec, err)
             return
 
         images = [{"url": im.url, "width": im.width, "height": im.height,
@@ -2103,7 +2158,16 @@ class Service:
         只看 `status`（原先只判 `10/40`）会把它归成 `UpstreamUnavailableError`
         ⇒ 调用方以为"上游故障、可以重试"，而它**必然再被拒**（还可能每次都计费）。
         """
-        reason = st.failed_reason or st.status_name
+        # 🔴 2026-10-12：对外 message 用的是——且只是——`fail_message`（上游给
+        # 的**人话**）。刻意**不用** `failed_reason`：它拼着 `fail_starling_key`
+        # 这类内部枚举（`web_fail2generate_copyright_block`），客户端看到既不能
+        # 行动、也是"暴露太多"。真因判据留在服务端日志（见 `_advance`）。
+        human = (getattr(st, "fail_message", "") or "").strip()
+        reason = human or st.status_name
+        # 🔴 审核分支的兜底**刻意不拿 `status_name`**（上游枚举）：上游没给人话时
+        # 用我方文案 ⇒"审核类 message 永不含上游标识"是**结构性成立**的，
+        # 而不是"取决于上游这次给没给 message"。
+        policy_reason = human or "上游判定内容不合规"
         code = st.status
         fc = getattr(st, "fail_code", None)
         fk = (getattr(st, "fail_key", "") or "").strip()
@@ -2116,19 +2180,23 @@ class Service:
         # `UpstreamUnavailableError`（"上游故障·可重试"）——
         # 而它们**必然再被拒，且每次都计费**（实测 message 里就写着
         # "该任务已被上游计费"）。这不是文案问题，是**分类错误**。
+        # 🔴 2026-10-12：**响应体里不给上游状态码 / `fail_code` / `fail_key`**
+        # （原先拼成 `（status=30 generate_failed，fail_key=…）` 括注）——
+        # 口径："抛错信息里只带错误信息，对客户端不能暴露太多"。
+        # 上面判据（`code` / `fc` / `fk`）**照常用**，只是不再对外展示：
+        # "为什么这样归类"由 `_advance` 的 `terminal failure` 日志承载
+        # （带 status/status_name/fail_code/fail_key + 上游 id）。
+        # ⚠️ `reason` 必须留 —— 它是上游给的**人话**说明，正是调用方要的"为什么"。
         if code in (10, 40) or fc in CODES_SECURITY or is_security_key(fk):
-            detail = f"，fail_code={fc}" if fc else ""
-            if fk:
-                detail += f"，fail_key={fk}"
             return ContentPolicyError(
-                f"内容审核未通过（status={code} {st.status_name}{detail}）：{reason}。"
+                f"内容审核未通过：{policy_reason}。"
                 f"换个 prompt 或换张输入图重试 —— **原样重试没有意义**"
                 f"（必然再被拒，且**每次都计费**）。",
                 upstream="jimeng")
         return UpstreamUnavailableError(
-            f"上游生成失败（status={code} {st.status_name}）：{reason}。"
+            f"上游生成失败：{reason}。"
             f"⚠️ 该任务**已被上游计费**（详见积分消耗）。",
-            upstream="jimeng", upstream_status=st.status_name)
+            upstream="jimeng")
 
 
 def _build_gate(settings: Settings) -> UpstreamGate:
@@ -2148,7 +2216,7 @@ def _default_size() -> str:
 
 
 __all__ = [
-    "Service", "view", "to_adapter_error", "credential_id", "new_task_id",
-    "fingerprint_secret", "ACCEPTED_FIELDS", "KNOWN_UNSUPPORTED_FIELDS",
-    "DISPATCH_MAX_ATTEMPTS",
+    "Service", "view", "empty_result_error", "to_adapter_error",
+    "credential_id", "new_task_id", "fingerprint_secret", "ACCEPTED_FIELDS",
+    "KNOWN_UNSUPPORTED_FIELDS", "DISPATCH_MAX_ATTEMPTS",
 ]

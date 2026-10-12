@@ -100,7 +100,10 @@ POST /v1/images/generations          Authorization: Bearer <key>
 
 | 结局 | 状态码 | 响应体 |
 |---|---|---|
-| 预算内到终态 | `200` | 与异步查询的终态体**逐键一致**（成功/失败/取消，见 §2） |
+| 预算内到终态（成功） | `200` | 与异步查询的终态体**逐键一致**（见 §2） |
+| 预算内到终态（**空图**） | `500` | `error.code = "upstream_empty_result"`；错误体**只有** `message`/`type`/`code`，**无 `detail`**（现场只进服务端日志，见 §6） |
+| 预算内到终态（**内容审核拒绝**） | `451` | `error.code = "content_policy_violation"` —— 换 prompt / 换图才有用 |
+| 预算内到终态（其余失败） | `200` | 与异步一致：`{task_id, status:"failure", error}` |
 | 预算耗尽仍在跑 | `202` | `{task_id, status}` + `Location: /async/v1/images/generations/{id}` |
 | 没有推进者 | `503` | `error.code = "sync_unavailable"` |
 
@@ -595,11 +598,21 @@ Authorization: Bearer <key>
 | `upstream_rate_limited` | 429 | 上游限流，**可退避重试**（带 `Retry-After`） |
 | `upstream_quota_exhausted` | 429 | 积分/日额度耗尽，**重试无效** |
 | `risk_control_challenge` | 429 | 命中风控，**重试会延长标记**，服务已进入冷却 |
+| `upstream_empty_result` | 500 | 上游报成功却**零产物**（一张都没有）。本服务不交付空成功 ⇒ 同步端点直接 500（异步族仍是 200 + `status:"failure"`）。错误体**只有** `message` / `type` / `code` —— **不带 `detail`**，不回显模型名、能力 key、上游状态码与计数、上游 id |
 | `upstream_error` | 502 | 上游 5xx / 非 JSON / WAF 页 |
-| `upstream_not_configured` | 503 | 服务未配 `JIMENG_SESSIONID`（**部署问题**，不是你的错） |
+| `upstream_not_configured` | 503 | 没有可用的上游凭据（Bearer 未带即梦 sessionid，或它已失效）—— **部署/调用方凭据问题**，不是参数写错 |
+| `sync_unavailable` | 503 | 服务没有任务推进者（协调器未运行）⇒ 同步等待无法履行，请改用异步端点或开启协调器 |
 | `upstream_timeout` | 504 | 上游超时 |
 
 `Retry-After` **只在是真的才知道**的时候给 —— 编一个数字等于伪造事实。
+
+🔴 **错误体只描述"错在哪"，不描述"我们内部怎么实现的"**（2026-10-12 口径）：
+不带模型 / 能力标识（如 `jimeng-t2i`）、不带上游状态码与计数、不带上游 `submit_id`，
+**不带 `detail`**。`message` 同理——只给"错在哪 + 下一步"与上游的**人话**失败说明，
+不拼 `status=` / `fail_code` / `fail_key` 这类内部枚举（它们只进服务端日志）。
+唯一例外是 `degradations`（§5）—— 那里出现**上游模型名**是**计费留痕**的刻意选择
+（"请求了 A 实际做了 B"必须让调用方看得懂，否则就成了静默降级）；
+除此之外的排查现场一律只进服务端日志。
 
 ---
 

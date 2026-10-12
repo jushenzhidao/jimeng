@@ -509,6 +509,9 @@ def test_retryable_error_stops_after_max_attempts(client, client_state,
     rec = service.store.get(tid)
     assert rec.status == "failure"
     assert rec.error["code"] == "upstream_rate_limited"
+    # 🔴 2026-10-12：429 也走"只带错误本身"——不带 `detail`（闸门那条路径原会
+    # 塞 min_interval/per_minute/wait_so_far，属我方节流容量，已删）。
+    assert set(rec.error) == {"message", "type", "code"}, rec.error
 
 
 def test_quota_error_fails_immediately_and_does_not_retry(client, client_state,
@@ -992,6 +995,10 @@ def test_content_review_failure_is_reported_as_policy_error(
     failed = TaskState(
         submit_id="upstream-submit-id", status=30, status_name="generate_failed",
         finished=True, failed=True, fail_code=2038,
+        fail_key="web_text_violates_community_guidelines_toast",
+        # 🔴 2026-10-12：`parse_task` 现在把 `fail_starling_message`（**人话**）
+        # 与 `failed_reason`（key + message）**分开放** —— 对外只能用人话。
+        fail_message="你输入的文字不符合平台规则，请修改后重试",
         failed_reason="web_text_violates_community_guidelines_toast "
                       "你输入的文字不符合平台规则，请修改后重试")
     fake_jimeng.states = [submitted_state(), failed]
@@ -1003,7 +1010,57 @@ def test_content_review_failure_is_reported_as_policy_error(
     assert body["status"] == "failure", body
     assert body["error"]["type"] == ContentPolicyError.err_type, body["error"]
     assert "内容审核" in body["error"]["message"], body["error"]
-    assert "2038" in body["error"]["message"], "要把上游 fail_code 带上，方便排查"
+    assert "你输入的文字不符合平台规则" in body["error"]["message"], body["error"]
+    # 🔴 2026-10-12 口径变更：上游 `fail_code` / `fail_key` **不再进对外 message**
+    # （"抛错信息里只带错误信息，对客户端不能暴露太多"）。
+    # 旧断言是"要把上游 fail_code 带上，方便排查" —— **需求没删，只换了出口**：
+    # 判据改由服务端 `terminal failure` 日志承载，由下一条用例钉住。
+    for leaked in ("2038", "web_text_violates", "status=", "fail_code", "fail_key"):
+        assert leaked not in body["error"]["message"], body["error"]
+
+
+def test_terminal_failure_detail_is_logged_not_returned(
+        client, client_state, fake_jimeng, fake_uploader):
+    """🔴 2026-10-12：上游分类细节**只进服务端日志**，响应体里一个都不给。
+
+    这条**接替**上面那句被改掉的断言（"要把上游 fail_code 带上，方便排查"）：
+    需求没删、只换出口 —— 对外 `message` 只剩上游给的**人话**说明，
+    而 status / status_name / fail_code / fail_key / submit_id 全部落在
+    `terminal failure` 这条日志上（供按 `user_credit_history` 对账与分类复盘）。
+
+    ⚠️ 断言必须抓 `record`（不是 `record["message"]`）：本仓 `OBS` 把维度走
+    `logger.bind()` ⇒ 字段在 `extra` 里，`message` 只有模板名。
+    """
+    from loguru import logger
+
+    from app.upstream.jimeng.client import TaskState
+
+    failed = TaskState(
+        submit_id="upstream-submit-id", status=30, status_name="generate_failed",
+        finished=True, failed=True, fail_code=2038,
+        fail_key="web_text_violates_community_guidelines_toast",
+        fail_message="你输入的文字不符合平台规则，请修改后重试",
+        failed_reason="web_text_violates_community_guidelines_toast "
+                      "你输入的文字不符合平台规则，请修改后重试")
+    fake_jimeng.states = [submitted_state(), failed]
+    _create(client, model="jimeng-t2i", prompt="某段违规文本")
+
+    records: list[dict] = []
+    sink_id = logger.add(lambda m: records.append(m.record), level="WARNING")
+    try:
+        _tick_until_terminal(client_state)
+    finally:
+        logger.remove(sink_id)
+
+    line = next((r for r in records if r["message"] == "terminal failure"), None)
+    assert line is not None, [r["message"] for r in records]
+    extra = line["extra"]
+    assert extra["upstream_status"] == 30
+    assert extra["upstream_status_name"] == "generate_failed"
+    assert extra["fail_code"] == 2038
+    assert extra["fail_key"] == "web_text_violates_community_guidelines_toast"
+    assert extra["upstream_submit_id"], "按 submit_id 对账 user_credit_history 要用它"
+    assert extra["err_type"] == "content_policy_violation"
 
 
 def test_generic_generation_failure_is_not_mislabelled_as_policy(

@@ -610,6 +610,12 @@ class TaskState:
     #: 而 `fail_code` 在这两例里都是**空的** ⇒ 只看 `fail_code` 会**全漏判**成
     #: "上游故障"⇒ 调用方以为"可重试"，而它必然再被拒（**且每次都计费**）。
     fail_key: str = ""
+    #: 🔴 2026-10-12：上游 `fail_starling_message` —— **人话**失败说明
+    #: （如"你输入的文字不符合平台规则，请修改后重试"）。
+    #: 对外 `error.message` **只能用它**：`failed_reason` 里还拼着
+    #: `fail_starling_key`（`web_fail2generate_copyright_block` 这类**内部枚举**），
+    #: 那是分类判据、属于"对客户端不该暴露"的一侧 —— 只进服务端日志。
+    fail_message: str = ""
     images: list[GeneratedImage] = field(default_factory=list)
     total: int | None = None
     finished_count: int | None = None
@@ -653,6 +659,9 @@ def parse_task(submit_id: str, node: dict) -> TaskState:
         key = node.get("fail_starling_key") or ""
         msg = node.get("fail_starling_message") or ""
         st.fail_key = str(key).strip()
+        #: 人话与内部键**分开放**：`fail_message` 可对外，`failed_reason`
+        #: （key + message）只作内部判据与日志（见 `TaskState.fail_message`）。
+        st.fail_message = str(msg).strip()
         st.failed_reason = " ".join(x for x in (key, msg) if x) or st.status_name
         _fc = node.get("fail_code")
         st.fail_code = _fc if isinstance(_fc, int) else None

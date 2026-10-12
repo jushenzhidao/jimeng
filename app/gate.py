@@ -96,13 +96,15 @@ class UpstreamGate:
 
                 if waited + need > self.max_wait:
                     self._stats.rejected += 1
+                    # 🔴 2026-10-12：只带 `retry_after`（→ `Retry-After` 头），
+                    # **不带** `wait_so_far` / `min_interval` / `per_minute`
+                    # —— 那三个会进 `error.detail`，"每分钟放几个、窗口多大"
+                    # 是我方节流容量，属"对客户端不暴露太多"；
+                    # "还要等多久"已由 `Retry-After` 说清（且它是真值，不靠猜）。
                     raise UpstreamRateLimitError(
                         f"{self.name} 上游节奏已满，请稍后重试",
                         upstream=self.name,
                         retry_after=need,
-                        wait_so_far=round(waited, 1),
-                        min_interval=self.min_interval,
-                        per_minute=self.per_minute,
                     )
             step = min(need, 2.0)
             time.sleep(step)
