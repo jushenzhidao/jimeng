@@ -90,6 +90,26 @@ def test_empty_image_defaults_to_t2i(client):
             f"image={img!r} 省略 model 应推导为 t2i：{r2.text}"
 
 
+def test_empty_material_ref_is_treated_as_absent():
+    """`video` / `audio` 传空串 = 没传素材（与 `image` 同口径：空即缺省）。
+
+    `create` 里 `has_materials = bool(body.get("video") or ...)` 早就把 `""`
+    当 Falsy（无素材），校验层却报 400 —— 两处口径打架，这里对齐。
+    非空字符串仍是"把数组写成了标量"的 400。
+    """
+    from app.errors import InvalidParameterError
+
+    from app.service import Service
+
+    for raw in ("", "   ", None, []):
+        assert Service._validate_refs(raw, "video") == [], f"{raw!r}"
+        assert Service._validate_refs(raw, "audio") == [], f"{raw!r}"
+
+    with pytest.raises(InvalidParameterError) as e:
+        Service._validate_refs("https://x/v.mp4", "video")
+    assert e.value.param == "video", "非空字符串仍要明确 400 并指出字段"
+
+
 def test_multiple_input_images_are_never_silently_truncated(client):
     """核心纪律不变：**绝不许**"收下 N 张、却只用 1 张"。
 
@@ -319,6 +339,19 @@ def test_missing_bearer_is_still_401(client):
     assert client.post(BASE, json={"model": "jimeng-t2i", "prompt": "x"},
                        headers={"Authorization": ""}
                        ).status_code == 401
+
+
+def test_bare_bearer_scheme_without_token_is_401(client):
+    """🔴 `Authorization: Bearer`（**只有 scheme、没有 token**）必须 401。
+
+    回归：`_bearer` 的兜底分支 `return raw.strip()` 会把**字面量 `"Bearer"`**
+    当成一个 sessionid 凭证收下 —— 空 token 不该变成"合法凭证"
+    （`split(None, 1)` 会吃掉尾随空白，所以 `Bearer ` 也走同一条）。
+    """
+    for hdr in ("Bearer", "Bearer "):
+        r = client.post(BASE, json={"model": "jimeng-t2i", "prompt": "x"},
+                        headers={"Authorization": hdr})
+        assert r.status_code == 401, f"{hdr!r} 应 401：{r.text}"
 
 
 def test_any_bearer_is_accepted_as_sessionid(client):

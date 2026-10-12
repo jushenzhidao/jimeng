@@ -111,6 +111,14 @@ def _bearer(request: Request) -> str | None:
     parts = raw.split(None, 1)
     if len(parts) == 2 and parts[0].lower() == "bearer":
         return parts[1].strip() or None
+    if parts[0].lower() == "bearer":
+        # 🔴 `Authorization: Bearer`（**只有 scheme、没有 token**）落到这里：
+        # `split(None, 1)` 把尾随空白吃掉了 ⇒ 只剩 `["Bearer"]`。必须显式判掉，
+        # 否则会把**字面量 `"Bearer"`** 当成一个 sessionid 凭证收下
+        # （不是漏洞 —— 上游必然拒它 —— 但"空 token 变成合法凭证"明显反直觉，
+        # 且让排障时看到一堆以 `Bearer` 为凭据的失败任务）。
+        return None
+    # 另一种合法形态：直接把 sessionid 明文放进 `Authorization`（不带 Bearer 前缀）。
     return raw.strip() or None
 
 
@@ -146,7 +154,6 @@ def require_key(request: Request) -> str:
     # 计费与风控都归他自己（我们的服务不代付）。
     #保留 `API_KEYS` 配置项但不再用于校验—— 免得它变成"看起来在生效、
     # 其实没读"的假配置（比没有更坏）。
-    return request.app.state.service.credential_of(key)
     return request.app.state.service.credential_of(key)
 
 

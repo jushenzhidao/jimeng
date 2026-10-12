@@ -1133,8 +1133,15 @@ class Service:
         if raw is None:
             return []
         if isinstance(raw, str):
+            if not raw.strip():
+                # 空串 / 纯空白 = **没有素材**（与 `_validate_image` 同口径：空即缺省）。
+                # 顺带修掉一处内部矛盾：`create` 里的 `has_materials` 用的是
+                # `bool(body.get("video"))` —— `""` 在那里**已经是 Falsy（= 无素材）**，
+                # 校验层却报 400，两处口径打架。
+                return []
             raise InvalidParameterError(
-                f"{field} 必须是**数组**；单条请写 `{field}: [\"https://…\"]`。",
+                f"{field} 必须是**数组**；单条请写 `{field}: [\"https://…\"]`"
+                f"（收到的是字符串，不是数组）。",
                 param=field)
         if not isinstance(raw, list):
             raise InvalidParameterError(f"{field} 必须是数组", param=field)
