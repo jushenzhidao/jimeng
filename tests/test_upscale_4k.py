@@ -275,6 +275,73 @@ def test_direct_4k_when_capability_table_is_unreadable(
     assert "未能" in note and "4k" in note
 
 
+# ---------------------------------------------------------------------------
+# 🔴 回归：受理期**必须**从凭据 bundle 拿能力表（2026-10-12 线上事故）
+# ---------------------------------------------------------------------------
+
+
+def test_accept_reads_the_table_from_the_credential_bundle(
+        settings, store, fake_jimeng, fake_uploader, fake_vod):
+    """受理期的 cfg **必须**来自**凭据 bundle**，不能依赖 `self.cfg`。
+
+    事故现场：生产 `Service(settings)` 构造时**不带 cfg**（`main.py:191`），
+    而 `self.cfg` 只在**派发 / 轮询 / 预审**的作用域里被 `_push_cred` 换入
+    ⇒ **受理期间 `self.cfg` 恒为 None**（实测：3 条 4k 受理期间
+    `get_common_config` 调用数 = **0**）⇒ `_plan_upscale` 在
+    `if self.cfg is None` 上直接退出 ⇒ **4k 改道静默失效**。
+    更坏的是它**有时**又非 None（别的线程换入的 bundle 尚未换出）⇒
+    同一请求的成败取决于**别的线程的时序**，不可复现。
+
+    ⇒ 本用例刻意**不注入 `cfg=`**（与生产同构），只把假 cfg 放进凭据池。
+    """
+    svc = Service(settings, store=store, uploader=fake_uploader, vod=fake_vod)
+    assert svc.cfg is None, "前提：受理期 self.cfg 为空（与生产同构）"
+    #: 凭据池里那一份才是受理期**该用**的（生产由 `bundle_for()` 现建/取缓存）。
+    #: 这里预置成"缓存已命中"，与生产第二次起的行为一致，且**不发真网络**。
+    svc._cred_pool["sess-1"] = (fake_jimeng, fake_uploader, fake_vod,
+                                FakeConfigCache(rmap=V50_RMAP))
+
+    rec = svc.create({"model": "jimeng-t2i", "prompt": "x", "size": "4096x4096"},
+                     credential="cred-1", sessionid="sess-1")
+    assert rec.size == "2048x2048", "受理期必须从凭据 bundle 拿到能力表并改道"
+    assert rec.resolution_tier == "2k"
+    assert "已自动改走" in " ".join(rec.degradations)
+
+
+def test_no_sessionid_keeps_direct_4k_and_says_so(
+        settings, store, fake_jimeng, fake_uploader, fake_vod):
+    """没有任何凭据来源 ⇒ 读不到表 ⇒ **直出 4k + 响亮留痕**（不是静默）。
+
+    这是上面那条的**反面**：修好之后仍必须保留"读不到就照付 4k 的钱、
+    但绝不猜一个尺寸"的保守语义。
+    """
+    svc = Service(settings, store=store, uploader=fake_uploader, vod=fake_vod)
+    rec = svc.create({"model": "jimeng-t2i", "prompt": "x", "size": "4096x4096"},
+                     credential="cred-1")
+    assert rec.size == "4096x4096"
+    assert rec.resolution_tier is None
+    assert "本次**未能**改走" in " ".join(rec.degradations)
+
+
+def test_4k_suffix_on_a_model_without_4k_is_rejected_at_accept(
+        settings, store, fake_jimeng, fake_uploader, fake_vod):
+    """`-4k` 后缀 + 该模型服务端**没声明** 4k ⇒ 受理当场 400。
+
+    这条钉住 `_check_tier` **也**走凭据 bundle —— 它在受理期曾同样因
+    `self.cfg is None` 而**静默不校验**（读不到就当这回事不存在），
+    表现为"以为买了 4k、实际按上游行为走"。
+    """
+    only2k = {"2k": V50_RMAP["2k"], "1.5k": V50_RMAP["2k"]}
+    svc = Service(settings, store=store, uploader=fake_uploader, vod=fake_vod)
+    svc._cred_pool["sess-2"] = (fake_jimeng, fake_uploader, fake_vod,
+                                FakeConfigCache(rmap=only2k))
+
+    with pytest.raises(Exception) as ei:
+        svc.create({"model": "jimeng-t2i-4k", "prompt": "x"},
+                   credential="cred-1", sessionid="sess-2")
+    assert "4k" in str(ei.value) and "不被该模型支持" in str(ei.value)
+
+
 def test_switch_off_keeps_direct_4k(
         settings, store, fake_jimeng, fake_uploader, fake_vod):
     """`UPSCALE_4K_ENABLED=0` ⇒ 回到旧行为（直出 4k），但留痕仍然写明没改道。"""

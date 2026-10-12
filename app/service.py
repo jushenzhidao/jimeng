@@ -490,6 +490,39 @@ class Service:
                             pass               # 关闭失败不影响正确性
         return bundle
 
+    def accept_cfg(self, sessionid: str | None) -> Any | None:
+        """**受理路径**读能力表要用的 cfg（拿不到就 `None`，**不抛**）。
+
+        🔴 为什么受理期**不能**直接用 `self.cfg`（2026-10-12 实锤的真 bug）：
+
+        `self.cfg` 只由 `_push_cred` 在**派发 / 轮询 / 素材预审**三个作用域里
+        换入（`create()` 里没有 `_push_cred`），而生产的 `Service(settings)`
+        **构造时不带 cfg**（`main.py:191`）⇒ **受理期间 `self.cfg` 恒为 None**。
+        实测：连续 3 条 4k 受理期间 `get_common_config` 调用数 = **0**
+        （真读表必然留下这一条）。于是 `_plan_upscale` 的
+        `if self.cfg is None: return None` 那道判据**在受理期直接退出** ——
+        4k 改道**静默失效**，请求按 4k 原样提交。
+
+        更坏的是它**有时**又非 None：协调器/派发线程换入的**别的凭据**的 bundle
+        尚未换出时，`self.cfg` 恰好是那一份 ⇒ **同一请求的成败取决于别的线程的
+        时序**，不可复现（本次事故里 3 条 t2i 就是这么"碰巧"成功的）。
+
+        ⇒ 受理一律走 `bundle_for(sessionid)`：拿到的是**这个凭据自己的** cfg，
+        与派发/轮询**同一个 `_cred_pool` 缓存**（不存在两份表漂移）；
+        `sessionid` 为空时它返回 `self.cfg`（测试注入的假 cfg 走这条）。
+
+        ⚠️ **代价（知情接受）**：这是对 `create()` 那条"请求内零上游往返"
+        不变式的**唯一破例** —— `bundle_for` 首次会建连并读一次能力表
+        （有 TTL 缓存，每个凭据只读一次，且派发时本来就要读同一份）。
+        因此**只在真的需要读表的分支**调用（4k 改道 / `-4k` 后缀档位校验），
+        其余请求一次网络都不多发。
+        """
+        try:
+            return self.bundle_for(sessionid)[3]
+        except Exception as e:            # noqa: BLE001 —— 读不到就退化，别挡住受理
+            log.warning("受理期取能力表失败（改道/档位校验退化为不校验）: %s", e)
+            return None
+
     def _push_cred(self, client: Any, uploader: Any, vod: Any, cfg: Any,
                    rec: TaskRecord) -> None:
         """把某任务的凭据组件**临时**换到 `self.*` 上，下游代码不用逐个改参数。
@@ -603,6 +636,11 @@ class Service:
                ark_model: str | None = None) -> TaskRecord:
         """校验 + 落库，返回任务记录。**请求内零上游往返。**
 
+        ⚠️ **唯一例外**（2026-10-12）：请求落在 **4k 档**（或带 `-4k/-2k…`
+        档位后缀）时，需要读服务端能力表才能定档/改道 ⇒ 会经
+        `accept_cfg()` 取一次**该凭据的**能力表（TTL 缓存，每凭据只读一次）。
+        其余请求仍一次上游往返都不发。
+
         `video=True` 表示走**视频端点**：候选池切到视频族、额外放行
         `resolution` / `duration` / `aspect_ratio` / `source_task_id` /
         `target_fps`（图片端点见到它们 = 传错了地方，400 说清楚）。
@@ -715,7 +753,8 @@ class Service:
         if tier and not video:
             self._check_tier(tier=tier, raw=eff_model,
                              model_key=upstream_model or DEFAULT_MODEL,
-                             size=body.get("size"))
+                             size=body.get("size"),
+                             cfg=self.accept_cfg(sessionid))
         #: 🔴 **占位名兜底的留痕**（2026-10-02）。调用方显式写了一个我们没登记的
         #: 型号（`seedream-9-9-ultra` / `doubao-seedream-5-0-pro-260628` …），
         #: 按占位处理 ⇒ 兜底到默认档出图。**兜底本身是允许的**（免费档，不掏钱），
@@ -966,7 +1005,8 @@ class Service:
                 # 「2k 生成 + 超清就地放大」以降本，见 `docs/UPSTREAM.md` §21。
                 _plan = self._plan_upscale(
                     cap=cap, model_key=upstream_model or DEFAULT_MODEL,
-                    width=_w, height=_h)
+                    width=_w, height=_h,
+                    cfg=self.accept_cfg(sessionid))
                 if _plan is not None:
                     size = _plan["gen_size"]
                     tier = "2k"    # 🔴 落库 / 提交 / 负缓存键都用**实际**档位
@@ -1560,7 +1600,8 @@ class Service:
         return plan if isinstance(plan, dict) else None
 
     def _plan_upscale(self, *, cap: models.Capability, model_key: str,
-                      width: int, height: int) -> dict[str, Any] | None:
+                      width: int, height: int,
+                      cfg: Any | None = None) -> dict[str, Any] | None:
         """能不能把本次 4k 请求改走「2k 生成 + 超清就地放大」？能则返回计划。
 
         四道判据，**任一不满足就返回 None**（调用方退回"直出 4k"并照旧留痕）：
@@ -1575,10 +1616,14 @@ class Service:
             return None
         if cap.name not in ("t2i", "i2i"):
             return None
-        if self.cfg is None:
+        # 🔴 受理期**必须**由调用方传 cfg（`self.accept_cfg(sessionid)`）：
+        # `self.cfg` 在受理期间恒为 None（见 `accept_cfg` 的说明），
+        # 兜底用它只是为了兼容"已经在凭据作用域里"的调用方与老测试。
+        cfg = cfg or self.cfg
+        if cfg is None:
             return None
-        slot4 = self.cfg.slot_for_ratio(model_key, "4k", width, height)
-        slot2 = self.cfg.slot_for_ratio(model_key, "2k", width, height)
+        slot4 = cfg.slot_for_ratio(model_key, "4k", width, height)
+        slot2 = cfg.slot_for_ratio(model_key, "2k", width, height)
         if not slot4 or not slot2 or slot2 == slot4:
             return None
         return {
@@ -2080,7 +2125,7 @@ class Service:
         return uris
 
     def _check_tier(self, *, tier: str, raw: str | None, model_key: str,
-                    size: Any) -> None:
+                    size: Any, cfg: Any | None = None) -> None:
         """校验 `model` 后缀指定的分辨率档（2026-10-02 方案 B）。
 
         三道关，**任何一道不过就当场 400**，绝不静默调整：
@@ -2100,7 +2145,8 @@ class Service:
         )
 
         # ---- 2. 该模型支持这一档吗（只认服务端声明）----
-        rmap = self.cfg.resolution_map(model_key) if self.cfg else None
+        cfg = cfg or self.cfg        # 受理期由 `accept_cfg()` 传进来
+        rmap = cfg.resolution_map(model_key) if cfg else None
         if rmap:
             tiers = {str(t).lower() for t in rmap}
             if tier not in tiers:
@@ -2110,7 +2156,7 @@ class Service:
                     f"请改用其中之一，或去掉后缀用 size 表达。"
                     f"⚠️ 不会静默退回其它档 —— 那会按错的档计费。",
                     param="model")
-        elif self.cfg is not None and self.cfg.snapshot() is not None:
+        elif cfg is not None and cfg.snapshot() is not None:
             # 能力表读到了、但这个模型不在表里 ⇒ 无法证明它支持该档
             raise InvalidParameterError(
                 f"无法确认模型 {model_key} 是否支持 **{tier}** 档"
