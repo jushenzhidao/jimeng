@@ -644,6 +644,30 @@ def test_gate_raises_risk_control_error_when_cooling(service):
     assert e.value.retryable is False, "风控不可重试（重试会延长标记）"
 
 
+def test_risk_hit_also_silences_that_credential(service, client, client_state):
+    """🔴 2026-10-14：派发命中风控时，**除**全局冷却外还要按凭据静默。
+
+    只有全局冷却时，冷却一到期协调器取出的队首恒是"被罚账号"的任务
+    ⇒ 立刻再命中 ⇒ 再全局冷却 —— 队首垄断，队列后面的账号永远轮不到
+    （线上实测：1 小时零成功、47 条任务积压）。
+    """
+    tid = _create(client)
+    rec = service.store.get(tid)
+    service._on_dispatch_error(
+        rec, RiskControlError("jimeng 拒绝请求：ret=1018（punish_limit_aigenerate）"))
+
+    st = service.gate.stats()
+    assert st["cooling_for"] > 0, "全局冷却照旧（口径不变）"
+    sid = rec.upstream_sessionid
+    assert sid, "夹具要带上 sessionid 才有意义"
+    assert sid in service.gate.risk_silent_keys(), \
+        "被罚凭据必须额外进静默，否则它会一直霸占队首"
+    #: 🔴 **不变量**：静默窗口必须**严格长于**全局冷却。相等 ⇒ 两层同时到期
+    #: ⇒ 冷却一解除立刻又轮到被罚账号 ⇒ 循环照旧（等于没修）。
+    assert service.gate.risk_cooling_for(sid) > st["cooling_for"], \
+        "静默必须比全局冷却长，否则打破不了队首垄断"
+
+
 # ---------------------------------------------------------------------------
 # 超时看门狗
 # ---------------------------------------------------------------------------

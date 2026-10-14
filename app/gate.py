@@ -40,6 +40,10 @@ class GateStats:
     quota_silent: int = 0
     #: 这些额度静默里最长的剩余秒数
     quota_cooling_max: float = 0.0
+    #: 🔴 处于**风控静默**的凭据数（按凭据，见 `mark_risk_silent`）。
+    #: 与全局 `cooling_for` 是**两层**：全局冷却到期后，这一层继续把
+    #: "刚被上游惩罚的那个账号"挡在派发之外 —— 否则队首恒是它，会被垄断。
+    risk_silent: int = 0
 
     def as_dict(self) -> dict:
         return {
@@ -52,6 +56,7 @@ class GateStats:
             "cooling_for": round(self.cooling_for, 1),
             "quota_silent": self.quota_silent,
             "quota_cooling_max": round(self.quota_cooling_max, 1),
+            "risk_silent": self.risk_silent,
         }
 
 
@@ -74,6 +79,8 @@ class UpstreamGate:
         self._cooldown_until = 0.0
         #: 额度静默（**按凭据**，见 `mark_quota_exhausted`）
         self._quota_until: dict[str | None, float] = {}
+        #: 风控静默（**按凭据**，见 `mark_risk_silent`）—— 与全局冷却并存
+        self._risk_silent: dict[str, float] = {}
         self._stats = GateStats()
 
     # ---------------------------------------------------------------- 内部
@@ -190,6 +197,44 @@ class UpstreamGate:
                 self._quota_until.pop(k, None)
             return set(self._quota_until)
 
+    def mark_risk_silent(self, seconds: float, *,
+                         key: str | None = None) -> None:
+        """风控命中 → **该凭据**额外进入静默期（**不替代**全局冷却）。
+
+        🔴 2026-10-14（线上实测）：只有全局冷却时会发生**队首垄断** ——
+        上游 `ret=1018`（`account punish limit ai generate`，**账号级**）命中后
+        全局冷却 600s；冷却一到期，协调器按 `order="oldest"` 取出的队首恰好是
+        被罚账号那条任务 ⇒ 立刻再命中 ⇒ 再全局冷却 600s……实测 14:09 起
+        每 10 分钟一轮，全站零成功、47 条任务积压，而队列里**别的账号**
+        （从未命中过风控）一条都发不出去。
+
+        这一层用来打破循环：全局冷却照旧，只是冷却到期后**不拿同一个账号
+        反复去撞墙**。对上游的总请求量因此**只减不增** —— 是收紧不是放宽。
+        """
+        if seconds <= 0 or not key:
+            return
+        with self._lock:
+            self._risk_silent[key] = max(self._risk_silent.get(key, 0.0),
+                                         time.time() + seconds)
+
+    def risk_cooling_for(self, key: str) -> float:
+        """该凭据的**风控静默**剩余秒数（0 = 不在静默期）。"""
+        now = time.time()
+        with self._lock:
+            until = self._risk_silent.get(key, 0.0)
+            if until <= now:
+                self._risk_silent.pop(key, None)
+                return 0.0
+            return until - now
+
+    def risk_silent_keys(self) -> set:
+        """当前处于风控静默的**凭据集合**（顺手清掉过期的）。"""
+        now = time.time()
+        with self._lock:
+            for k in [k for k, v in self._risk_silent.items() if v <= now]:
+                self._risk_silent.pop(k, None)
+            return set(self._risk_silent)
+
     def reset_cooldown(self) -> None:
         with self._lock:
             self._cooldown_until = 0.0
@@ -209,6 +254,12 @@ class UpstreamGate:
             self._stats.quota_silent = len(quiet)
             self._stats.quota_cooling_max = max(
                 (v - now for v in quiet.values()), default=0.0)
+            quiet_risk = {k: v for k, v in self._risk_silent.items() if v > now}
+            if len(quiet_risk) != len(self._risk_silent):
+                # 与额度静默同理：键是调用方给的，不扫就无界增长
+                self._risk_silent.clear()
+                self._risk_silent.update(quiet_risk)
+            self._stats.risk_silent = len(quiet_risk)
             return {"name": self.name,
                     "min_interval": self.min_interval,
                     "per_minute": self.per_minute,

@@ -77,6 +77,8 @@ class Coordinator:
         self.dispatch_cooling = 0     # 因"上游冷却中"而跳过派发的轮次
         #: 因"**该凭据**额度静默中"而跳过的任务数（按凭据，不是全站）
         self.dispatch_quota_silent = 0
+        #: 因"**该凭据**风控静默中"而跳过的任务数（按凭据，不是全站）
+        self.dispatch_risk_silent = 0
         self.dispatched = 0           # 真正派发出去的任务数
 
     # ------------------------------------------------------------------ 线程
@@ -210,11 +212,18 @@ class Coordinator:
         # 与别的调用方毫无关系 ⇒ 只跳过该凭据的任务。2026-10-12 前这里是靠
         # `cooling_for` 做的**全站**停摆，一个号没额度就把所有人拖死。
         silent = self.service.gate.quota_silent_keys()
+        #: 🔴 2026-10-14：风控静默（按凭据）与额度静默**分开计数**。
+        #: 两者的处置办法不同（风控要过一次验证 / 等标记衰减，额度要充值），
+        #: 合并进 `quota_silent` 会让 /stats 骗人。
+        risk_silent = self.service.gate.risk_silent_keys()
         sent = 0
         for rec in store.list_by_status("queued", limit=_DISPATCH_SCAN,
                                         order="oldest"):
             if rec.upstream_sessionid in silent:
                 self.dispatch_quota_silent += 1
+                continue
+            if rec.upstream_sessionid in risk_silent:
+                self.dispatch_risk_silent += 1
                 continue
             self.service.dispatch(rec)
             self.dispatched += 1
@@ -259,6 +268,7 @@ class Coordinator:
                 "dispatch_full": self.dispatch_full,
                 "dispatch_cooling": self.dispatch_cooling,
                 "dispatch_quota_silent": self.dispatch_quota_silent,
+                "dispatch_risk_silent": self.dispatch_risk_silent,
                 "running": self.running}
 
 

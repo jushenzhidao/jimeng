@@ -2530,6 +2530,18 @@ class Service:
         """建任务失败的处理。**分两种**：可重试的回队列，其余判死。"""
         if isinstance(err, RiskControlError):
             self.gate.mark_risk_hit()
+            #: 🔴 2026-10-14（线上实测的队首垄断）：**同时按凭据静默**。
+            #: 只有全局冷却时，冷却到期后协调器取出的队首恒是"被上游惩罚的
+            #: 那个账号"的任务 ⇒ 立刻再命中 ⇒ 再全局冷却 —— 实测 14:09 起
+            #: 每 10 分钟一轮，全站零成功。全局冷却**保留不动**（口径仍是
+            #: 宁严勿松）；这一层只保证"不让同一个账号垄断队首"。
+            #: 🔴 时长**必须严格长于**全局冷却 —— 两者相等就会**同时到期**，
+            #: 冷却一解除立刻又轮到被罚账号，循环照旧（本改动自测抓到的真缺陷：
+            #: 先写成 `jm_cooldown`，`test_risk_silence_outlives_the_global_cooldown`
+            #: 当场红）。取 2× cooldown，与额度静默同量级、同样**有界**。
+            self.gate.mark_risk_silent(
+                min(self.settings.jm_cooldown * 2, 3600.0),
+                key=rec.upstream_sessionid)
         elif isinstance(err, UpstreamQuotaError):
             # 额度耗尽：进静默期。**不做"锁到明天"** —— 上游重置时刻未必是本地零点，
             # 静默期到点自然重试，能自愈。
