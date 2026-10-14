@@ -74,17 +74,17 @@ def test_unknown_model_is_rejected_with_hint():
 
 @pytest.mark.parametrize("placeholder", ["", "auto", "default", "dall-e-3",
                                          "gpt-image-1",
-                                         "doubao-seedream-4-5-251128"])
+                                         "doubao-seedream-4-6-260101"])
 def test_placeholders_count_as_unspecified(placeholder):
     """第三方 SDK 硬编码的占位名**不代表调用意图** ⇒ 走默认推导而不是报"未知模型"。
 
     ⚠️ `seedream-4-0` **已从这里移出**：它同时是即梦 web 面板上的正式模型名
     （Seedream 4.0），2026-09-23 起登记为**精确别名**。
-    带厂商前缀 + 日期后缀但**未登记**的 `doubao-seedream-4-5-251128` 仍算占位。
+    ⚠️ `doubao-seedream-4-5-251128` 也**已移出**（2026-10-14 用户点名补登）。
+    样本换成仍未登记的 `doubao-seedream-4-6-260101`，保护机制本身一条不少。
 
     🔴 2026-10-02：样本原为 `doubao-seedream-5-0-pro-260628`，现已由用户
     **明确指定**为 `high_aes_general_v50p_large`（Pro）的方舟名 ⇒ 它不再是占位名。
-    换成4.5 那条**仍未登记**的名字，保护机制本身一条不少。
     """
     from app.models import DEFAULT_UPSTREAM_MODEL
 
@@ -218,10 +218,15 @@ def test_unregistered_ark_names_stay_placeholders_instead_of_silently_upgrading(
 
     🔴 2026-10-02：`doubao-seedream-5-0-pro-260628` 已由用户**明确指定**为
     Pro 的方舟名 ⇒ 移出样本。**保护机制本身一条没少**，只是换了样本。
+
+    🔴 2026-10-14：`doubao-seedream-4-5-251128` 同样被用户点名补登为
+    `high_aes_general_v40l`（4.5）⇒ 一并移出样本。⚠️ 注意这条**不是降级**：
+    补登后它指向的是 4.5 自己那条链路，不是默认 Lite；本用例要防的是
+    "**未登记**的名字被悄悄映射到某个收费档"，所以样本必须保持是**真未登记**的。
     """
     from app.models import DEFAULT_UPSTREAM_MODEL
 
-    for unregistered in ("doubao-seedream-4-5-251128",
+    for unregistered in ("doubao-seedream-4-6-260101",
                          "doubao-seedream-9-9-999999",
                          "doubao-seedream-5-5-pro-260101"):
         assert is_placeholder(unregistered), unregistered

@@ -107,6 +107,9 @@ def _norm_model_name(raw: str) -> str:
 #: 认一个没对账过的名字 = 替调用方悄悄切到另一条计费链路（Pro 是 8 积分/张）。
 #: 缺哪个档位要显式加进本表，并在 `UPSTREAM_MODEL_CREDITS` 补实测价。
 #:
+#: 2026-10-14 再补一条 4.5（`doubao-seedream-4-5-251128`）：调用方带输入图
+#: 传方舟名时报"未指定 model" —— 见下方 `UPSTREAM_ARK_NAMES` 内联说明。
+#:
 #: 2026-10-02 用户点名补登Pro 与 Lite 两条（此前只有 Flash）：
 #: ⚠️ `doubao-seedream-5-0-pro-260628` 此前是"**刻意不认**"的反例
 #: （见 `test_unregistered_ark_names_stay_placeholders_...` 的原注释）——
@@ -119,6 +122,17 @@ UPSTREAM_ARK_NAMES: dict[str, str] = {
     "high_aes_general_v50p_large": "doubao-seedream-5-0-pro-260628",
     "high_aes_general_v50_flash": "doubao-seedream-5-0-flash-260915",
     "high_aes_general_v50": "doubao-seedream-5-0-260128",
+    # 2026-10-14（用户点名补登）：4.5 的方舟名。
+    # 现场：调用方**带输入图**传 `doubao-seedream-4-5-251128`，收到
+    # "未指定 model，且带输入图时本服务有多个能力可选" —— 因为这个名字
+    # 不在本表、也不在面板名别名里 ⇒ 被 `doubao-seedream` 前缀判成**占位名**
+    # ⇒ 等价于"没写 model"；无图时能兜底到 Lite，**有图时无唯一默认 ⇒ 400**。
+    # 🔴 档位映射**取自服务端能力表**（面板名 `Seedream 4.5` / `4-5` /
+    # `图片-4-5` → `high_aes_general_v40l`，见 `UPSTREAM_MODEL_ALIASES`），
+    # 不是按命名习惯猜的；日期后缀由方舟侧决定，逐字登记。
+    # ⚠️ `high_aes_general_v40l` 单价**未实测**（`UPSTREAM_MODEL_CREDITS=None`）
+    # ⇒ `/v1/models` 不给它报价（与 4.0 / 4.1 / 4.6 / 4.7 同一状态）。
+    "high_aes_general_v40l": "doubao-seedream-4-5-251128",
 }
 
 
