@@ -428,6 +428,46 @@ def test_i2i_accepts_upstream_model_and_t2i_does_not_swallow_it():
     assert (cap2.api_id, model2) == ("jimeng-t2i", MJ)
 
 
+def test_parse_size_accepts_resolution_tier_shorthand():
+    """🔴 2026-10-14（用户口径）：`size` 也接受**分辨率档位**写法。
+
+    此前 `parse_size("2k")` 抛 `JimengParamError`（"无法解析 size='2k'"）⇒
+    调用方拿 400，而 OpenAI 风格客户端常把 `size` 填成档位串。
+    档位**表达不了比例** ⇒ 一律按 **1:1** 展开。
+
+    ⚠️ 判据必须**正推/反推同源**：档位展开出的像素要能吸附回**同一个**档
+    （`_TIER_BASE` 从 `_RESOLUTION_BASE` 派生，不许另抄一张表）。
+    """
+    import pytest as _pytest
+
+    from app.upstream.jimeng import JimengParamError, parse_size
+    from app.upstream.jimeng.client import resolution_type_for_size
+
+    # 档位写法 → 1:1 基准像素（大小写/首尾空白都可容忍）
+    assert parse_size("2k") == (2048, 2048)
+    assert parse_size("1K") == (1024, 1024)
+    assert parse_size(" 4k ") == (4096, 4096)
+    assert parse_size("1.5k") == (1536, 1536)
+
+    # 正推 ⇒ 反推必须回到同一档
+    for tier, base in (("1k", 1024), ("1.5k", 1536), ("2k", 2048), ("4k", 4096)):
+        w, h = parse_size(tier)
+        assert (w, h) == (base, base), tier
+        assert resolution_type_for_size(w, h) == tier, \
+            f"{tier} 展开成 {w}x{h} 后吸附到了别的档 —— 两张表分叉了"
+
+    # 像素写法不受影响
+    assert parse_size("1664x2496") == (1664, 2496)
+    assert parse_size("2048*2048") == (2048, 2048)
+    assert parse_size("2048×2048") == (2048, 2048)
+
+    # 真正的垃圾输入仍然拒（`0x0` 不在此列：`parse_size` 只做形态解析，
+    # 数值合法性由 `ratio_for_size` 判 —— 那是既有分层，别在这里重复判）
+    for bad in ("abc", "2kk", "x", "2k2k"):
+        with _pytest.raises(JimengParamError):
+            parse_size(bad)
+
+
 def test_resolution_type_follows_size_instead_of_hardcoded_2k():
     """🔴 `resolution_type` 必须**跟随 size**，不能硬编码 2k。
 

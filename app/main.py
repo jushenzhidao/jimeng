@@ -84,9 +84,14 @@ class GenerationRequest(BaseModel):
 
     model: str | None = Field(default=None, description="能力/模型名，如 jimeng-t2i（留空则按有无输入图推导）")
     prompt: str | None = Field(default=None, description="提示词")
-    image: Any = Field(default=None,
-                       description="输入图**数组**；文生图可留空（或传 []）")
-    size: str | None = Field(default=None, description="如 2048x2048")
+    image: Any = Field(
+        default=None,
+        description="输入图：单张可传字符串（\"https://…\"），多张传数组"
+                    "（[\"https://…\"]）；文生图可留空（或传 []）")
+    size: str | None = Field(
+        default=None,
+        description="如 2048x2048（宽x高，像素）；也接受档位写法 "
+                    "1k/1.5k/2k/4k（按 1:1 展开）")
     n: int | None = Field(default=None, description="出图张数（会吸附到该模型声明的合法取值）")
     seed: int | None = None
     negative_prompt: str | None = None

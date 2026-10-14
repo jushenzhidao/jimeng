@@ -60,13 +60,35 @@ def test_placeholder_model_falls_back_to_t2i(client):
 # ---------------------------------------------------------------------------
 
 
-def test_image_must_be_an_array_with_actionable_message(client):
+def test_image_string_is_accepted_as_a_single_image(client):
+    """🔴 2026-10-14（用户口径）：`image` **字符串与数组都收**。
+
+    非空字符串 = **单张图**，与 `["…"]` 完全等价 —— 此前这里报 400
+    （"请写成数组"），把 OpenAI 风格客户端最常见的单图写法挡在门外。
+    """
+    r = client.post(BASE, json={"model": "jimeng-i2i", "prompt": "x",
+                                "image": "https://a/b.png"}, headers=AUTH)
+    assert r.status_code == 202, f"字符串形态应被当作单张图：{r.text}"
+
+
+def test_image_string_still_passes_capability_shape_check(client):
+    """⚠️ 放宽的是**形态**，不是**能力校验**。
+
+    `jimeng-t2i`（文生图）不吃输入图 —— 传了非空字符串照样拒。
+    那是"能力与形态不符"，与"写成标量还是数组"无关。
+    """
     r = client.post(BASE, json={"model": "jimeng-t2i", "prompt": "x",
                                 "image": "https://a/b.png"}, headers=AUTH)
-    assert r.status_code == 400
-    msg = r.json()["error"]["message"]
-    assert "必须是**数组**" in msg or "必须是数组" in msg
-    assert "[]" in msg, "报错要给出正确写法，而不是只说「错了」"
+    assert r.status_code == 400, r.text
+    assert r.json()["error"]["message"], "要给出可执行的原因"
+
+
+def test_image_of_other_types_is_still_rejected(client):
+    """字符串/数组之外的形态仍明确 400 —— 别把写错的类型当"无图"吞掉。"""
+    r = client.post(BASE, json={"model": "jimeng-t2i", "prompt": "x",
+                                "image": 123}, headers=AUTH)
+    assert r.status_code == 400, r.text
+    assert "image" in r.json()["error"]["message"]
 
 
 def test_empty_image_defaults_to_t2i(client):
@@ -138,11 +160,35 @@ def test_multiple_input_images_are_never_silently_truncated(client):
     assert "不会静默忽略" in msg, "报错要说清为什么拒绝"
 
 
-def test_unknown_field_is_rejected(client):
+def test_unknown_field_is_ignored_and_traced_instead_of_rejected(
+        client, client_state):
+    """🔴 2026-10-14（用户口径）：**不认识的字段忽略即可，不影响生图**。
+
+    此前 `foo` / `output_format` 这类字段直接 400（"未知字段 […]"）——
+    调用方拿到的是一条**与生成无关**的格式纠正，而不是一次生成。
+    现在与 `KNOWN_UNSUPPORTED_FIELDS`（watermark 等）**同待遇**：
+    进 `degradations`（看得见），但不阻塞。
+    """
     r = client.post(BASE, json={"model": "jimeng-t2i", "prompt": "x", "foo": 1},
                     headers=AUTH)
-    assert r.status_code == 400
-    assert "未知字段" in r.json()["error"]["message"]
+    assert r.status_code == 202, f"未知字段不该挡死生成：{r.text}"
+    tid = r.json()["task_id"]
+    got = client.get(f"{BASE}/{tid}", headers=AUTH).json()
+    assert got["status"] == "queued"
+    assert any("foo" in d for d in got["degradations"]), \
+        f"被忽略的字段要留痕，实得 {got.get('degradations')}"
+
+
+def test_size_accepts_resolution_tier_shorthand(client):
+    """🔴 2026-10-14（用户口径）：`size` 接受 `"2k"` 这类档位写法。
+
+    此前一律 400（"无法解析 size='2k'"）。档位表达不了比例 ⇒ 按 **1:1** 展开
+    （`2k` ⇒ `2048x2048`）；要别的比例请直接写像素。
+    """
+    for s in ("2k", "1k", "1.5k"):
+        r = client.post(BASE, json={"model": "jimeng-t2i", "prompt": "x",
+                                    "size": s}, headers=AUTH)
+        assert r.status_code == 202, f"size={s!r} 应被接受：{r.text}"
 
 
 def test_known_but_unsupported_field_becomes_a_degradation(client, client_state):
@@ -731,12 +777,16 @@ def test_sync_requires_bearer(sync_client):
 
 
 def test_sync_validates_like_the_async_endpoint(sync_client):
-    """参数校验复用同一套（同一个 `Service.create`）—— 报错逐字一致。"""
+    """参数校验复用同一套（同一个 `Service.create`）—— 报错逐字一致。
+
+    ⚠️ 2026-10-14 起 `image` 传字符串**不再是错误**（= 单张图），
+    所以换一个**两端口径都必须拒**的请求来钉"同一套校验"：
+    文生图（t2i）却带了输入图。
+    """
     r = sync_client.post(SYNC, json={"model": "jimeng-t2i", "prompt": "x",
                                      "image": "https://a/b.png"}, headers=AUTH)
-    assert r.status_code == 400
-    assert "必须是**数组**" in r.json()["error"]["message"] or \
-        "必须是数组" in r.json()["error"]["message"]
+    assert r.status_code == 400, r.text
+    assert r.json()["error"]["message"], "报错必须带可执行原因"
 
 
 _ = (pytest, KEY_B)

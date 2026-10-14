@@ -662,16 +662,16 @@ class Service:
         # 未提供的可选字段填成 None，所以这一步是必需的，不是可选优化。）
         body = {k: v for k, v in body.items() if v is not None}
 
+        #: 🔴 2026-10-14（用户口径）：**不认识的字段一律忽略，不报错**。
+        #: 原先是"未知字段 ⇒ 400"，把 OpenAI 风格客户端的新字段
+        #: （`output_format` / 各家 SDK 的自定义字段…）整条挡死 ——
+        #: 调用方拿到的是一条**与生成无关**的格式纠正，而不是一次生成。
+        #: 现在与 `KNOWN_UNSUPPORTED_FIELDS` 同待遇：进 `degradations`（看得见），
+        #: 但**不阻塞**。处理在下方 `degradations` 初始化之后统一做。
+        #: ⚠️ 唯一仍然 400 的是**端点错位**（图片接口收到视频族字段）——
+        #: 那是"走错门了"，忽略它会让调用方以为分辨率/时长生效了。
         unknown = set(body) - ACCEPTED_FIELDS - KNOWN_UNSUPPORTED_FIELDS \
             - (VIDEO_FIELDS if video else frozenset())
-        if unknown:
-            raise InvalidParameterError(
-                f"未知字段 {sorted(unknown)}；本接口接受 "
-                f"{sorted(ACCEPTED_FIELDS | (VIDEO_FIELDS if video else frozenset()))}"
-                f"（其中 "
-                f"{sorted(KNOWN_UNSUPPORTED_FIELDS)} 是**认得但本服务做不到**的字段，"
-                f"传了会进 `degradations` 而不是报错）",
-                param=sorted(unknown)[0])
         if video:
             # 视频端点**不收**图片族字段：size（视频用 resolution 档位）、
             # negative_prompt（视频草稿没有该字段，实抓确认）。
@@ -697,6 +697,12 @@ class Service:
                 degradations.append(
                     f"参数 {k}={body[k]!r} 本服务不支持（即梦这条链路没有对应能力），已忽略；"
                     f"不要按它的语义预期结果。")
+        #: 🔴 2026-10-14：**不认识**的字段同样只留痕、不报错（见上方 `unknown`）。
+        for k in sorted(unknown):
+            degradations.append(
+                f"字段 {k}={body.get(k)!r} 本服务不认识 ⇒ **已忽略，不影响本次生成**。"
+                f"本接口的字段见 GET /v1/models；若该字段是必要的，"
+                f"请换用等价的已支持字段。")
 
         # 🔴 2026-10-08：原先这里有一道 `if not upstream_configured: raise
         # capability_unavailable`（"本服务未配置上游即梦凭据（JIMENG_SESSIONID）"），
@@ -1218,22 +1224,30 @@ class Service:
 
         🔴 **空 / 未传 / `[]` / `""` 一律视为"没有输入图"（= 文生图）**
         （用户口径 2026-10-12：`image` 为空或没传**默认就是文生图**）——
-        不该因为调用方传了个空串就报 400。只有**非空字符串**才是真写错了
-        （把数组形态写成了标量），此时给明确 400 讲清正确写法。
+        不该因为调用方传了个空串就报 400。
+
+        🔴 **形态同时接受字符串与数组**（用户口径 2026-10-14）：
+        非空字符串 = **单张图**，`"https://…"` 与 `["https://…"]` 完全等价。
+        此前"非空字符串 ⇒ 400"把 OpenAI 风格客户端最常见的单图写法挡在门外。
+        ⚠️ 放宽的只是**形态**，不是**能力校验**：单张字符串进列表后照样过
+        `_check_shape` —— `t2i`（文生图）收到图仍会被拒，那是"能力与形态不符"，
+        与"写成标量还是数组"无关。
         """
         if raw is None:
             return []
         if isinstance(raw, str):
-            if not raw.strip():
+            s = raw.strip()
+            if not s:
                 # 空串 / 纯空白 = 没有输入图 ⇒ 文生图（不报错）。
                 return []
-            raise InvalidParameterError(
-                "image 必须是**数组**；文生图可留空（或传 `[]`）。"
-                "若要传单张图请写 `\"image\": [\"https://…\"]`"
-                "（收到的是字符串，不是数组）。",
-                param="image")
+            # 单张图：字符串形态 ≡ 只含一项的数组（走同一条下游链路）。
+            return [s]
         if not isinstance(raw, list):
-            raise InvalidParameterError("image 必须是数组", param="image")
+            raise InvalidParameterError(
+                f"image 只接受**字符串**（单张图）或**数组**（多张垫图），"
+                f"收到的是 {type(raw).__name__}；"
+                f"文生图可留空（不传 / `[]` / `\"\"`）。",
+                param="image")
         out: list[str] = []
         for i, item in enumerate(raw):
             if not isinstance(item, str) or not item.strip():

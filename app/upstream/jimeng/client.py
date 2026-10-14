@@ -338,7 +338,16 @@ def classify_reject(code: int | None) -> tuple[str, bool]:
 # ---------------------------------------------------------------------------
 
 def parse_size(size: str) -> tuple[int, int]:
-    """`"2048x2048"` / `"2048*2048"` / `"2048×2048"` → (w, h)。"""
+    """`"2048x2048"` / `"2048*2048"` / `"2048×2048"` → (w, h)。
+
+    🔴 2026-10-14（用户口径）：**还接受分辨率档位的写法**
+    （`"1k"` / `"1.5k"` / `"2k"` / `"4k"`）—— 此前一律 400
+    （"无法解析 size='2k'"），而 OpenAI 风格客户端常把 `size` 填成档位串。
+    档位**表达不了比例** ⇒ 一律按 **1:1** 展开（`2k` ⇒ `2048x2048`）；
+    要别的比例请直接写像素（如 `1664x2496`）。
+    ⚠️ 档位表与"从像素反推档位"的 `_RESOLUTION_BASE` **同源** ——
+    两张名单一旦分叉，`size="2k"` 展开出的像素又会吸附回别的档。
+    """
     raw = (size or "").strip().lower()
     for sep in ("x", "*", "×"):
         if sep in raw:
@@ -347,8 +356,12 @@ def parse_size(size: str) -> tuple[int, int]:
                 return int(a.strip()), int(b.strip())
             except ValueError:
                 break
+    base = _TIER_BASE.get(raw)
+    if base is not None:
+        return base, base
     raise JimengParamError(
-        f"无法解析 size={size!r}，期望形如 '2048x2048'（宽x高，像素）", code=1001)
+        f"无法解析 size={size!r}，期望形如 '2048x2048'（宽x高，像素），"
+        f"或分辨率档位 {'/'.join(sorted(_TIER_BASE))}", code=1001)
 
 
 def ratio_for_size(width: int, height: int) -> int:
@@ -373,6 +386,11 @@ def ratio_for_size(width: int, height: int) -> int:
 _RESOLUTION_BASE: tuple[tuple[str, int], ...] = (
     ("4k", 4096), ("2k", 2048), ("1.5k", 1536), ("1k", 1024),
 )
+
+#: 档位写法 → 该档基准边长（`parse_size` 的档位展开用，2026-10-14 用户口径）。
+#: **从 `_RESOLUTION_BASE` 派生**，不另抄一份名单：正推（`"2k"` → 2048）与
+#: 反推（2048 → `"2k"`）一旦分叉，`size="2k"` 展开出的像素会吸附回别的档。
+_TIER_BASE: dict[str, int] = dict(_RESOLUTION_BASE)
 
 
 def resolution_type_for_size(width: int, height: int) -> str:
