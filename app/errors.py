@@ -106,6 +106,22 @@ class UpstreamRateLimitError(AdapterError):
     retryable = True
 
 
+class QueueOverloadedError(AdapterError):
+    """**本服务**的队列过载 —— 该凭据排队的任务已达上限。
+
+    ⚠️ 与 `UpstreamRateLimitError`（**上游**限流）刻意分开：这个错跟即梦无关，
+    是我们在**入队口**做的背压（2026-10-14 "队列堵死"的根治）。
+    两者同为 429 且都可退避重试，但排查方向完全不同：
+      · `queue_overloaded` ⇒ 等自己的任务跑完（或提并发），**上游是好的**；
+      · `upstream_rate_limited` ⇒ 上游说慢点，**别加人**。
+    """
+
+    status_code = 429
+    err_type = "rate_limit_error"
+    err_code = "queue_overloaded"
+    retryable = True
+
+
 class UpstreamQuotaError(AdapterError):
     """积分/日额度耗尽 —— 与限流同为 429，但**重试无效**。"""
 

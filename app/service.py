@@ -42,6 +42,7 @@ from .errors import (
     ContentPolicyError,
     EmptyResultError,
     InvalidParameterError,
+    QueueOverloadedError,
     RiskControlError,
     TaskNotFoundError,
     UpstreamQuotaError,
@@ -630,6 +631,10 @@ class Service:
             "concurrency": self.settings.jm_concurrency,
             "tasks": {"active": self.store.count_active(),
                       "total": self.store.count()},
+            #: 🔴 2026-10-14："队列堵死"的**唯一先行指标**（此前没有任何出口）。
+            #: `oldest_wait_s` 一涨到几百秒，同步端点（预算 300s）就开始必然降级；
+            #: `by_credential` 一眼看出"是谁在灌"（凭据只留前 12 位）。
+            "queue": self.store.queue_snapshot(),
             "gate": self.gate.stats(),
             #: 🔴 2026-10-09（负缓存"看起来没生效"排查）：把计数暴露进 `/stats`。
             #: `records` 涨 = 审核拒绝真的写进来了；`hits` 涨 = 受理时真的拦住了。
@@ -672,6 +677,26 @@ class Service:
         """
         if not isinstance(body, dict):
             raise InvalidParameterError("请求体必须是 JSON 对象")
+
+        #: 🔴 2026-10-14（"队列堵死"根治）：**入队背压**。
+        #: 队列此前**没有任何上限** ⇒ 一个调用方灌一批（实测 181 条）就把并发位
+        #: 吃到"只剩它的任务在跑"，别人的提交排到几小时后（用户原话
+        #: "这么长，没看到请求打到 web"）。现在按**凭据**封顶：超了立刻 429
+        #: （带 `Retry-After`）—— 早拒绝比"先收下再让人干等"便宜得多，
+        #: 也更诚实（调用方立刻知道该等，而不是以为服务坏了）。
+        #: `MAX_QUEUED_PER_CREDENTIAL=0` = 关闭（默认，既有行为不变）。
+        cap_q = self.settings.max_queued_per_credential
+        if cap_q > 0:
+            waiting = self.store.count_queued_by_session(sessionid)
+            if waiting >= cap_q:
+                #: 粗估等待时间：排队长 × 单条实测耗时(≈60s) / 并发位。
+                #: 刻意给**粗**值 —— 编一个精确数字就是伪造事实（同 `Retry-After` 纪律）。
+                est = max(1, int(waiting * 60 / max(1, self.settings.jm_concurrency)))
+                raise QueueOverloadedError(
+                    f"该凭据的排队任务已达上限 {cap_q} 条（当前 {waiting} 条）—— "
+                    f"本服务按 FIFO + 公平轮转派发，一次灌太多只会让**所有人**"
+                    f"（包括你自己）等更久。请等前面的跑完再提交。",
+                    retry_after=float(est))
 
         # 🔴 **显式 `null` 等价于"没给"**，用默认值。
         # 否则调用方写 `"n": null` / `"prompt": null` 会被判成参数错误，

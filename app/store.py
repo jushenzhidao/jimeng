@@ -490,6 +490,53 @@ class TaskStore:
         with Session(self.engine) as s:
             return int(s.exec(stmt).one())
 
+    def count_queued_by_session(self, sessionid: str | None) -> int:
+        """该凭据当前**排队**（queued）的任务数 —— 入队背压用。
+
+        🔴 2026-10-14（"队列堵死"）：背压必须按**凭据**算，不能全站一刀切 ——
+        一个调用方灌 181 条，不该把别人的正常提交也一起拒掉。
+        """
+        stmt = select(func.count()).select_from(TaskRecord).where(
+            TaskRecord.status == "queued",
+            TaskRecord.upstream_sessionid == sessionid)
+        with Session(self.engine) as s:
+            return int(s.exec(stmt).one())
+
+    def queue_snapshot(self, *, top: int = 5) -> dict:
+        """队列水位快照：排队数 / 最老等待秒数 / 按凭据的 top N。
+
+        🔴 2026-10-14（"队列堵死"排查）：这几个数此前**没有任何出口**，
+        "到底堵没堵"只能翻库（用户当时只能说"这么长，没看到请求打到 web"）。
+        `oldest_wait_s` 是最有用的先行指标 —— 它一涨到几百秒，
+        同步端点（预算 `SYNC_MAX_WAIT`）就开始**必然降级**了。
+
+        ⚠️ 凭据在这里**只留前 12 位**：`/stats` 虽然要 Bearer，但没必要
+        把完整 sessionid 摆进一个运维响应里。
+        """
+        def _sid(v: Any) -> str:
+            return (str(v)[:12] + "…") if v else "<default>"
+
+        with Session(self.engine) as s:
+            queued = int(s.exec(
+                select(func.count()).select_from(TaskRecord).where(
+                    TaskRecord.status == "queued")).one())
+            oldest = s.exec(
+                select(func.min(TaskRecord.created_at)).where(
+                    TaskRecord.status == "queued")).one()
+            rows = s.exec(
+                select(TaskRecord.upstream_sessionid, func.count().label("n"))
+                .where(TaskRecord.status == "queued")
+                .group_by(TaskRecord.upstream_sessionid)
+                .order_by(func.count().desc())
+                .limit(top)).all()
+        return {
+            "queued": queued,
+            "oldest_wait_s": (max(0, int(time.time()) - int(oldest))
+                              if oldest else 0),
+            "by_credential": [{"credential": _sid(k), "queued": int(n)}
+                              for k, n in rows],
+        }
+
     def list_recent(self, *, credential_id: str | None = None,
                     limit: int = 50) -> list[TaskRecord]:
         stmt = select(TaskRecord)

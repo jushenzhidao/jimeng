@@ -104,6 +104,14 @@ class Settings:
     #: 留 0.2s 只是为了别在提交返回的同一毫秒里去打（徒增一次空转）。
     poll_grace: float = 0.2
     task_timeout: float = 1800.0
+    #: 🔴 2026-10-14（"队列堵死"根治）：**单凭据**允许排队的任务数上限。
+    #: `0` = 不限（默认，保持既有行为不变）。
+    #: 为什么要它：队列原先**没有任何背压** —— 实测一个调用方灌 181 条就把并发位
+    #: 吃到"只有它的任务在跑"，别人的提交全排在后面等几小时（用户原话：
+    #: "这么长，没看到请求打到 web"）。到达上限后新提交直接
+    #: `429 queue_overloaded`（带 `Retry-After`）—— 把"排队几小时"
+    #: 变成"立刻知道该等一会儿"，而不是先收下再让人干等。
+    max_queued_per_credential: int = 0
 
     # ------------------------------------------------------------ 协调器
     coordinator_enabled: bool = True
@@ -288,6 +296,7 @@ class Settings:
             jimeng_poll_interval=_f("JIMENG_POLL_INTERVAL", 10.0),
             poll_grace=_f("POLL_GRACE", 0.2),
             task_timeout=_f("TASK_TIMEOUT", 1800.0),
+            max_queued_per_credential=_i("MAX_QUEUED_PER_CREDENTIAL", 0),
             coordinator_enabled=_b("COORDINATOR_ENABLED", True),
             continue_enabled=_b("CONTINUE_ENABLED", False),
             upscale_4k_enabled=_b("UPSCALE_4K_ENABLED", True),
@@ -332,6 +341,8 @@ class Settings:
             raise ConfigError("JM_CONCURRENCY 必须 >= 1")
         if self.task_timeout <= 0:
             raise ConfigError("TASK_TIMEOUT 必须 > 0")
+        if self.max_queued_per_credential < 0:
+            raise ConfigError("MAX_QUEUED_PER_CREDENTIAL 必须 >= 0（0 = 不限）")
         if self.jimeng_poll_interval <= 0:
             raise ConfigError("JIMENG_POLL_INTERVAL 必须 > 0")
         if self.task_retention_days < 1:
