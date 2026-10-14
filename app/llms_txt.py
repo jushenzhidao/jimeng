@@ -97,7 +97,7 @@ def render(settings: Settings) -> str:
     add("| 图片（同步） | `POST /v1/images/generations` |")
     add("| 图片（异步） | `POST /async/v1/images/generations` → `GET /async/v1/images/generations/{task_id}` |")
     add("| 视频（方舟契约） | `POST /api/v3/contents/generations/tasks` → `GET /api/v3/contents/generations/tasks/{task_id}` |")
-    add("| 对话（**兼容占位**） | `POST /v1/chat/completions` —— 只为满足 OpenAI 客户端的连通性探针，**不生成任何任务** |")
+    add("| 图片 chat | `POST /v1/chat/completions` —— 借 chat 协议出图，产物以 **Markdown 图片**回；🔴 **真生成、真计费**（`stream:true` 回 SSE） |")
     add("")
     add("## 鉴权")
     add("")

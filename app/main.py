@@ -29,11 +29,17 @@ import json
 import time
 import uuid
 from contextlib import asynccontextmanager
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 import uvicorn
 from fastapi import Depends, FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import (
+    HTMLResponse,
+    JSONResponse,
+    PlainTextResponse,
+    Response,
+    StreamingResponse,
+)
 from loguru import logger
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -59,6 +65,7 @@ from .observability import (
     should_log_path,
 )
 from .service import Service, view
+from .store import TaskRecord
 
 # ---------------------------------------------------------------------------
 # 请求体
@@ -288,6 +295,139 @@ def _install_request_logging(app: FastAPI) -> None:
         return response
 
 
+def _chat_sse(cid: str, model: str, created: int,
+              produce: Callable[[], str]) -> Iterator[str]:
+    """**图片 chat** 的流式出口：把一次生成的文本按 `chat.completion.chunk` 吐出。
+
+    🔴 形态必须逐字对齐 OpenAI SSE（`data: {json}\\n\\n` + 结尾 `data: [DONE]`）：
+    客户端（new-api / LobeChat / NextChat…）是**按行扫 `data: ` 前缀**解析的，
+    给它一坨普通 JSON，它会扫完全文、一个 chunk 都取不到 ⇒ 显示"空回复"。
+    这正是 2026-10-14 线上那条"用 seedream 名测 chat 得到空回复"的直接成因。
+
+    🔴 **先吐 role 帧、再去生成**：生成要几十秒，客户端在等首字节 —— 先发一帧
+    证明"连接活着、正在生成"，避免客户端读超时提前断开。`produce` 是**阻塞**的
+    （内部会跑完整个同步链路），由 Starlette 在线程池里迭代本生成器，不卡事件循环。
+
+    ⚠️ 流式下响应头一旦发出就**改不动状态码** ⇒ 生成失败只能把错误**当正文**
+    吐出去（客户端至少看得到原因，而不是一片空白）；非流式路径则照常抛 HTTP 错误。
+    """
+    def _ev(payload: dict[str, Any]) -> str:
+        return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+    base: dict[str, Any] = {"id": cid, "object": "chat.completion.chunk",
+                            "created": created, "model": model}
+    yield _ev({**base, "choices": [{"index": 0,
+                                    "delta": {"role": "assistant", "content": ""},
+                                    "finish_reason": None}]})
+    try:
+        text = produce()
+    except AdapterError as e:
+        text = f"生成失败：{e.to_error()['error']['message']}"
+    except Exception as e:  # noqa: BLE001
+        text = f"生成失败：{type(e).__name__}: {e}"
+    yield _ev({**base, "choices": [{"index": 0, "delta": {"content": text},
+                                    "finish_reason": None}]})
+    yield _ev({**base, "choices": [{"index": 0, "delta": {},
+                                    "finish_reason": "stop"}]})
+    yield "data: [DONE]\n\n"
+
+
+def _chat_text(rec: TaskRecord) -> str:
+    """把一次生成的结果渲染成 chat 的 `content`（**Markdown 图片**）。
+
+    走 chat 协议的图片模型，产物就是 `![](url)` —— 客户端（LobeChat/NextChat 等）
+    会在对话流里直接渲染成图。多张就多行。
+    """
+    if rec.status != "success":
+        err = (rec.error or {}).get("message") or "任务未成功结束"
+        return f"生成失败：{err}"
+    urls = [i.get("url") for i in (rec.images or []) if i.get("url")]
+    if not urls:
+        return "生成失败：上游没有返回任何图片（空产物）。"
+    return "\n".join(f"![image]({u})" for u in urls)
+
+
+def _extract_chat_inputs(body: dict[str, Any]) -> tuple[str, list[str]]:
+    """从 OpenAI `messages` 里取出**最后一条 user 的文本**与**全部输入图**。
+
+    图片 chat 的两种入口都在这里收敛：
+      · 纯文本 messages（`content: "画一只猫"`）⇒ prompt，无输入图 ⇒ 文生图；
+      · 多模态 messages（`content: [{"type":"text",…},{"type":"image_url",…}]`）
+        ⇒ 文本进 prompt、图片进垫图列表 ⇒ 图生图。
+
+    图片只认 OpenAI 的 `image_url` 形态（`{"url": …}` 或裸字符串）；
+    `data:` URL 也照收 —— 下游 `media.load_one` 本来就吃 data URI。
+    """
+    msgs = body.get("messages")
+    if not isinstance(msgs, list):
+        return "", []
+    prompt = ""
+    images: list[str] = []
+    for m in msgs:
+        if not isinstance(m, dict) or m.get("role") != "user":
+            continue
+        content = m.get("content")
+        parts = content if isinstance(content, list) else [content]
+        texts: list[str] = []
+        for part in parts:
+            if isinstance(part, dict):
+                if part.get("type") == "image_url" or "image_url" in part:
+                    iu = part.get("image_url")
+                    url = iu.get("url") if isinstance(iu, dict) else iu
+                    if isinstance(url, str) and url.strip():
+                        images.append(url.strip())
+                elif part.get("text") is not None:
+                    texts.append(str(part.get("text")))
+            elif isinstance(part, str):
+                texts.append(part)
+        joined = "\n".join(t.strip() for t in texts if t and t.strip()).strip()
+        if joined:
+            prompt = joined          # 取**最后一条**有文本的 user 消息
+    return prompt, images
+
+
+def _sync_generate(svc: Service, coordinator: Any, settings: Settings,
+                   body: dict[str, Any], *, credential: str,
+                   sessionid: str | None) -> TaskRecord:
+    """**同步**跑完一次生成：受理 → 叫醒推进 → 等到终态。返回 `TaskRecord`。
+
+    多个门面共用这一个核心（`/v1/images/generations` 同步出图、图片 chat）——
+    语义只有一处定义，避免"某个门面少判了一种失败"这类分叉。
+
+    ⚠️ **阻塞**：会等到终态或 `SYNC_MAX_WAIT`（默认 300s）。调用它的 HTTP 端点
+    必须是同步 `def`，或在线程池里跑（见各调用处）。
+
+    终态失败里两种直接转抛 HTTP 错误（2026-10-10 用户口径，判据是**落库的**
+    `error.type`，不做 message 字符串匹配）：
+      · **内容审核拒绝** → 451 `ContentPolicyError`；
+      · **空图**（上游报成功却零产物）→ 451 `EmptyResultError`。
+    其余失败保持"任务完成了、结果是失败"的语义，返回 rec 由调用方渲染。
+    """
+    if not coordinator.running:
+        # 配置只说明意图，线程活着才算数（与 Coordinator.running 同口径）：
+        # 没有推进者就快速 503，别让调用方白等一整个预算。
+        raise SyncUnavailableError(
+            "后台协调器未在运行（COORDINATOR_ENABLED=0？）—— 没有任务推进者，"
+            "同步等待无法履行。请改用异步端点 POST /async/v1/images/generations，"
+            "或开启协调器后重试。")
+    rec = svc.create(body, credential=credential, sessionid=sessionid)
+    coordinator.wake()
+    rec = svc.wait_terminal(rec.task_id, credential,
+                            max_wait=settings.sync_max_wait)
+    if rec.status == "failure":
+        stored = rec.error or {}
+        etype = stored.get("type")
+        if etype == ContentPolicyError.err_type:
+            raise ContentPolicyError(
+                stored.get("message") or "内容审核未通过",
+                **(stored.get("detail") or {}))
+        if etype == EmptyResultError.err_type:
+            raise EmptyResultError(
+                stored.get("message") or "上游报成功但零产物",
+                **(stored.get("detail") or {}))
+    return rec
+
+
 def _install_routes(app: FastAPI) -> None:
     # ------------------------------------------------------------- 受理
     @app.post("/async/v1/images/generations", status_code=202)
@@ -354,38 +494,11 @@ def _install_routes(app: FastAPI) -> None:
         内部链路与异步受理完全一致：落库 → 叫醒协调器 → 等库里的状态变化。
         等待期间**不发任何上游请求**（推进是协调器线程的职责，这里只读库）。
         """
-        settings: Settings = request.app.state.settings
-        coordinator = request.app.state.coordinator
-        if not coordinator.running:
-            # 配置只说明意图，线程活着才算数（与 Coordinator.running 同口径）：
-            # 没有推进者就快速 503，别让调用方白等一整个预算。
-            raise SyncUnavailableError(
-                "后台协调器未在运行（COORDINATOR_ENABLED=0？）—— 没有任务推进者，"
-                "同步等待无法履行。请改用异步端点 POST /async/v1/images/generations，"
-                "或开启协调器后重试。")
-
-        svc: Service = request.app.state.service
-        rec = svc.create(body.model_dump(), credential=credential,
-                         sessionid=_bearer(request))
-        coordinator.wake()
-        rec = svc.wait_terminal(rec.task_id, credential,
-                                max_wait=settings.sync_max_wait)
-
-        # 🔴 2026-10-10 用户口径：终态失败按类型转 HTTP 错误（空图 500 /
-        # 审核 451），判据是落库 error 里的 `type` —— `_fail` 存的就是
-        # `to_error()["error"]`，type 与错误类一一对应，重建即可。
-        # detail 原样带回（fail_key、upstream_status 等排查上下文不丢）。
-        if rec.status == "failure":
-            stored = rec.error or {}
-            etype = stored.get("type")
-            if etype == ContentPolicyError.err_type:
-                raise ContentPolicyError(
-                    stored.get("message") or "内容审核未通过",
-                    **(stored.get("detail") or {}))
-            if etype == EmptyResultError.err_type:
-                raise EmptyResultError(
-                    stored.get("message") or "上游报成功但零产物",
-                    **(stored.get("detail") or {}))
+        rec = _sync_generate(request.app.state.service,
+                             request.app.state.coordinator,
+                             request.app.state.settings,
+                             body.model_dump(), credential=credential,
+                             sessionid=_bearer(request))
 
         status_code, payload = view(rec)
         headers: dict[str, str] = {}
@@ -550,53 +663,92 @@ h2{{color:#7cb0ff}}a{{color:#7cb0ff}}td,th{{border-color:#1e2836}}}}</style></he
         """
         return {"object": "list", "data": models.catalog()}
 
-    # ------------------------------------------- 兼容面：OpenAI 对话端点（占位）
+    # ------------------------------------- 兼容面：OpenAI 对话端点（**图片 chat**）
     @app.post("/v1/chat/completions")
     async def chat_completions(
         request: Request,
         credential: str = Depends(require_key),
-    ) -> JSONResponse:
-        """OpenAI **对话端点**的兼容占位（2026-10-14 用户要求）。
+    ) -> Response:
+        """OpenAI **对话端点** —— 本服务用它承载**图片 chat**（2026-10-14 用户口径）。
 
-        为什么需要它：OpenAI 风格客户端/网关（new-api 等）把本服务当渠道接入时，
-        默认用 `POST /v1/chat/completions` 做**连通性测试** —— 404 会被判成
-        "渠道不可用"，于是渠道根本加不上（线上日志里这类探针占相当比例）。
+        为什么有这个端点：OpenAI 风格客户端/网关（new-api、LobeChat、NextChat…）
+        只认 `/v1/chat/completions`。"图片 chat" = 借 chat 协议拿生成结果，
+        客户端才能把产物**直接渲染在对话流里**。
 
-        🔴 **刻意不真生图**：探针请求带的是测试 prompt，若这里真触发生成，
-        每点一次"测试"都会建一条**计费任务**。所以本端点**只回一个形状合法的
-        说明**，并把真正出图的端点写进正文 —— 既不误报"不可用"，也不偷偷花钱。
-        出图请用 `POST /v1/images/generations`（同步）或
-        `POST /async/v1/images/generations`（异步）。
+        🔴 **真出图、真计费**（2026-10-14 口径变更，此前是"只回说明、不建任务"
+        的占位）：本端点**真的发起生成** —— 走与 `/v1/images/generations`
+        **同一套**同步链路（`_sync_generate`：受理 → 推进 → 等终态），把产物以
+        **Markdown 图片**（`![image](url)`）写进 `message.content`。
+        ⚠️ **建任务即计费**：拿渠道"测试/连通性"按钮打本端点也会真的花钱。
+        要零成本探活请用 `GET /healthz`。
 
-        ⚠️ 归属：它是**同步语义**端点（一问一答、立即返回），与 `/v1/models`、
-        `POST /v1/images/generations` 同族 ⇒ 允许挂在 `/v1`；白名单见
-        `tests/test_api.py::_V1_SYNC_ENDPOINTS`。
+        输入怎么来（两种 messages 形态都支持）：
+          · 纯文本 `content: "画一只橘猫"` ⇒ `prompt`，无输入图 ⇒ 文生图；
+          · 多模态 `content: [{type:text},{type:image_url}]` ⇒ 图片转**垫图**
+            ⇒ 图生图（OpenAI 的 `image_url` 形态，`data:` URL 也收）。
+        `model` 缺省时：带图 ⇒ `jimeng-i2i`，不带图 ⇒ `jimeng-t2i`
+        —— chat 请求本来就不带出图族的那些参数，缺省时必须替它定一个，
+        否则会撞上"未指定 model 且有多个能力可选"的 400。
+
+        `stream`：`true` ⇒ 回标准 SSE（**先发 role 帧占位**，生成完成再发 content
+        帧，`data: [DONE]` 收尾）；否则回整包 `chat.completion`。
+        ⚠️ 流式下响应头一旦发出就改不动状态码 ⇒ 生成失败只能把错误**当正文**
+        吐出去；非流式则照常抛 HTTP 错误（451/429/502…，与出图端点逐字一致）。
+
+        ⚠️ 归属：它是**同步语义**端点（一问一答、返回前等到结果），与
+        `/v1/models`、`POST /v1/images/generations` 同族 ⇒ 允许挂在 `/v1`；
+        白名单见 `tests/test_api.py::_V1_SYNC_ENDPOINTS`。
         """
         body: Any = {}
         try:
             body = await request.json()
         except Exception:      # noqa: BLE001 —— 空体/非 JSON 也要应答（探针常发空体）
             body = {}
-        model = str((body or {}).get("model") or "jimeng-service")
-        text = (
-            "本服务是**即梦图片/视频生成出口**，不提供对话能力 —— "
-            "此响应仅用于满足 OpenAI 客户端的连通性探针，**未产生任何生成任务**。\n\n"
-            "出图请用：\n"
-            "· 同步 POST /v1/images/generations"
-            "  {\"model\":\"jimeng-t2i\",\"prompt\":\"一只橘猫\"}\n"
-            "· 异步 POST /async/v1/images/generations"
-            " → GET /async/v1/images/generations/{task_id}\n"
-            "· 视频（方舟契约）POST /api/v3/contents/generations/tasks\n"
-            "能力/计费清单：GET /v1/models · /llms.txt"
-        )
+        if not isinstance(body, dict):
+            body = {}
+
+        model = str(body.get("model") or "").strip()
+        prompt, images = _extract_chat_inputs(body)
+        if not model:
+            # 带图 ⇒ 图生图；不带图 ⇒ 文生图。各只有一个自然落点，
+            # 不必让调用方为了"能跑通"塞一个它不关心的 model 名。
+            model = "jimeng-i2i" if images else "jimeng-t2i"
+
+        cid = f"chatcmpl-jimeng-{uuid.uuid4().hex[:24]}"
+        created = int(time.time())
+        our_body: dict[str, Any] = {"model": model, "prompt": prompt,
+                                    "image": images}
+        args = (request.app.state.service, request.app.state.coordinator,
+                request.app.state.settings, our_body)
+        kwargs = {"credential": credential, "sessionid": _bearer(request)}
+
+        if body.get("stream"):
+            # StreamingResponse 在线程池里迭代这个**同步**生成器 ⇒ `_sync_generate`
+            # 的阻塞（最长 SYNC_MAX_WAIT）不卡事件循环（同 `def` 端点的道理）。
+            def _produce() -> str:
+                return _chat_text(_sync_generate(*args, **kwargs))
+
+            return StreamingResponse(
+                _chat_sse(cid, model, created, _produce),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache",
+                         # 中间若过 nginx，别让它把这一小段 SSE 缓冲到请求结束
+                         # 才吐（症状同样是"客户端收不到 chunk、显示空白"）。
+                         "X-Accel-Buffering": "no"})
+
+        # 非流式：阻塞跑在**线程池**里 —— 直接在 `async def` 里 await 一个阻塞调用
+        # 会卡死整个事件循环，同 worker 的其它请求全部排队。
+        from starlette.concurrency import run_in_threadpool  # noqa: PLC0415
+
+        rec = await run_in_threadpool(_sync_generate, *args, **kwargs)
         return JSONResponse(status_code=200, content={
-            "id": f"chatcmpl-jimeng-{uuid.uuid4().hex[:24]}",
+            "id": cid,
             "object": "chat.completion",
-            "created": int(time.time()),
+            "created": created,
             "model": model,
             "choices": [{
                 "index": 0,
-                "message": {"role": "assistant", "content": text},
+                "message": {"role": "assistant", "content": _chat_text(rec)},
                 "finish_reason": "stop",
             }],
             "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},

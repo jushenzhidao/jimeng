@@ -1453,8 +1453,9 @@ def test_dispatch_starvation_is_counted_not_silent(settings):
     from app.coordinator import Coordinator
 
     class _Store:
-        def __init__(self, running: int) -> None:
+        def __init__(self, running: int, sessionid: str | None = None) -> None:
             self.running = running
+            self.sessionid = sessionid
             self.list_calls = 0
 
         def count_by_status(self, _status: str) -> int:
@@ -1463,11 +1464,12 @@ def test_dispatch_starvation_is_counted_not_silent(settings):
         def list_by_status(self, *a, **k):
             self.list_calls += 1
             # 有一条待派发（要能读出 `upstream_sessionid` —— 派发侧按它判静默）
-            return [SimpleNamespace(upstream_sessionid=None)]
+            return [SimpleNamespace(upstream_sessionid=self.sessionid)]
 
     class _Gate:
-        def __init__(self, cooling: float) -> None:
+        def __init__(self, cooling: float, risk: set | None = None) -> None:
             self.cooling = cooling
+            self.risk = set(risk or ())
 
         def stats(self) -> dict:
             return {"cooling_for": self.cooling}
@@ -1475,10 +1477,18 @@ def test_dispatch_starvation_is_counted_not_silent(settings):
         def quota_silent_keys(self) -> set:
             return set()
 
+        def risk_silent_keys(self) -> set:
+            # 🔴 生产侧 `Coordinator._dispatch_queued` 会调它（按凭据的**风控静默**，
+            # 2026-10-14 引入）—— 桩必须同步，否则派发一进来就 AttributeError，
+            # 而报错信息完全指不到"桩缺方法"这个真因。
+            return set(self.risk)
+
     class _Svc:
-        def __init__(self, running: int, cooling: float = 0.0) -> None:
-            self.store = _Store(running)
-            self.gate = _Gate(cooling)
+        def __init__(self, running: int, cooling: float = 0.0,
+                     risk: set | None = None,
+                     sessionid: str | None = None) -> None:
+            self.store = _Store(running, sessionid)
+            self.gate = _Gate(cooling, risk)
             self.sent: list = []
 
         def dispatch(self, rec) -> None:
@@ -1507,3 +1517,14 @@ def test_dispatch_starvation_is_counted_not_silent(settings):
     assert len(free.sent) == 1 and co3.dispatched == 1
     assert co3.dispatch_full == 0 and co3.dispatch_cooling == 0
     assert co3.dispatch_quota_silent == 0
+
+    # ④ 风控静默（按凭据）⇒ 跳过**该凭据**的任务，且与额度静默**分开计数**
+    #    （2026-10-14：风控要过一次验证 / 等标记衰减，额度要充值 —— 处置办法不同，
+    #    并进一个计数会让 /stats 骗人）
+    risky = _Svc(running=0, risk={"sid-risk"}, sessionid="sid-risk")
+    co4 = Coordinator(service=risky, settings=settings, owner="x")  # type: ignore[arg-type]
+    co4._dispatch_queued()
+    assert risky.sent == [] and co4.dispatched == 0
+    assert co4.dispatch_risk_silent == 1
+    assert co4.dispatch_quota_silent == 0, "风控与额度不能并成一个计数"
+    assert co4.stats()["dispatch_risk_silent"] == 1, "运维要能在 /stats 里看到它"

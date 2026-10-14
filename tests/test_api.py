@@ -7,6 +7,8 @@
 """
 from __future__ import annotations
 
+import base64
+import json
 from typing import Any
 
 import pytest
@@ -15,6 +17,13 @@ from tests.conftest import (AUTH, AUTH_B, KEY_B, failed_state, ok_state,
                             submitted_state)
 
 BASE = "/async/v1/images/generations"
+
+#: 一份**够用**的最小 PNG：`media.sniff` 按 magic bytes 判定类型，所以 8 字节头
+#: 加上填充就足以走通"输入图"链路。刻意**不用外链 URL** —— 那会让后台执行期
+#: 真的去发 HTTP（违反"测试零网络"纪律）；data URI 在 `media.load_one` 里
+#: 直接内存解码，一个字节都不出网。
+PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
+PNG_DATA_URI = "data:image/png;base64," + base64.b64encode(PNG_BYTES).decode()
 
 
 # ---------------------------------------------------------------------------
@@ -434,8 +443,9 @@ def test_models_endpoint_lists_only_verified_capabilities(client):
 #: （创建+轮询合并），它同样属于"同步、无 `202 + task_id` 轮询语义"的正牌成员。
 #: **异步**族（受理/查询/删除）必须留在 `/async/v1`（护栏拦的是"异步语义挂 /v1"）。
 #: 🔴 `/v1` 下的白名单 —— 只放**同步语义**端点（一问一答/立即返回）。
-#: 2026-10-14 新增 `/v1/chat/completions`：它是 OpenAI 客户端的**连通性探针**
-#: 端点，同步语义 ⇒ 同族。注意它**不建任何任务**（见对应用例）。
+#: 2026-10-14 新增 `/v1/chat/completions`：它是**图片 chat**（借 chat 协议出图，
+#: 返回前等到生成结果），同步语义 ⇒ 同族。
+#: ⚠️ 与"连通性占位"时期不同：它**真的建任务并计费**（见对应用例）。
 _V1_SYNC_ENDPOINTS = frozenset({"/v1/models", "/v1/images/generations",
                                 "/v1/chat/completions"})
 
@@ -474,35 +484,106 @@ def test_models_endpoint_lives_only_under_v1(client):
         f"/v1 下只允许同步语义端点（白名单）：{sorted(leaked)}"
 
 
-def test_chat_completions_is_probe_compatible_and_never_builds_a_task(
-        client, client_state):
-    """🔴 2026-10-14（用户要求）：`POST /v1/chat/completions` 不再 404。
+def test_chat_completions_generates_an_image_as_markdown(sync_client, fake_jimeng):
+    """🔴 2026-10-14（用户口径）：chat 端点承载**图片 chat** —— 真出图，
+    产物以 **Markdown 图片**回给调用方（客户端才能在对话流里直接渲染）。
 
-    OpenAI 风格客户端/网关（new-api 等）把本服务当渠道接入时，默认拿它做
-    **连通性测试**；404 会被判成"渠道不可用"，于是渠道加不上。
-
-    同时钉住另一头：**绝不建任务**。探针带的是测试 prompt，若这里触发生成，
-    每点一次"测试"都会产生一条**计费任务**。
+    与旧行为**相反**：此前它是"只回说明、绝不建任务"的连通性占位；
+    现在**真的建任务**（因此也真的计费）。这条用例同时钉住两个方向 ——
+    既要有产物，也要确实建了任务。
     """
-    before = client.get(BASE, headers=AUTH).json()["total"]
-    r = client.post("/v1/chat/completions",
-                    json={"model": "jimeng-t2i",
-                          "messages": [{"role": "user", "content": "ping"}]},
-                    headers=AUTH)
+    before = sync_client.get(BASE, headers=AUTH).json()["total"]
+    fake_jimeng.states = [ok_state(["https://cdn/cat.png"])]
+
+    r = sync_client.post("/v1/chat/completions", json={
+        "model": "doubao-seedream-5-0-pro-260628",
+        "messages": [{"role": "user", "content": "画一只橘猫"}],
+    }, headers=AUTH)
+
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["object"] == "chat.completion"
-    assert body["choices"][0]["message"]["role"] == "assistant"
-    assert "images/generations" in body["choices"][0]["message"]["content"], \
-        "要把调用方引到真正出图的端点"
-    after = client.get(BASE, headers=AUTH).json()["total"]
-    assert after == before, "探针**绝不能**建任务 —— 否则每次连通性测试都花钱"
+    assert body["model"] == "doubao-seedream-5-0-pro-260628"
+    content = body["choices"][0]["message"]["content"]
+    assert "![image](https://cdn/cat.png)" in content, content
+
+    after = sync_client.get(BASE, headers=AUTH).json()["total"]
+    assert after == before + 1, "图片 chat 必须真的建任务（这是与旧占位的分水岭）"
 
 
-def test_chat_completions_tolerates_an_empty_body(client):
-    """探针常发空体/非 JSON ⇒ 不能因此 500。"""
-    r = client.post("/v1/chat/completions", content=b"", headers=AUTH)
+def test_chat_completions_multimodal_image_becomes_an_i2i_input(
+        sync_client, fake_jimeng):
+    """多模态 messages 里的 `image_url` 转**垫图** ⇒ 图生图。
+
+    `model` 缺省时也得有这个默认 —— chat 请求不带出图族的参数，
+    缺省若撞上"多个能力可选"的 400，客户端就永远调不通。
+    输入图用 data URI（**不出网**，见文件头 `PNG_DATA_URI`）。
+    """
+    fake_jimeng.states = [ok_state(["https://cdn/out.png"])]
+
+    r = sync_client.post("/v1/chat/completions", json={
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "把它变成水彩画"},
+            {"type": "image_url", "image_url": {"url": PNG_DATA_URI}},
+        ]}],
+    }, headers=AUTH)
+
     assert r.status_code == 200, r.text
+    content = r.json()["choices"][0]["message"]["content"]
+    assert "![image](https://cdn/out.png)" in content, content
+    # 有垫图 ⇒ 走 i2i（blend）；文生图不会调 blend
+    assert "blend" in fake_jimeng.kinds(), fake_jimeng.kinds()
+
+
+def test_chat_completions_streams_sse_with_the_image(sync_client, fake_jimeng):
+    """🔴 `stream: true` 必须回**标准 SSE** —— 这正是"chat 空回复"的修复点。
+
+    客户端（new-api / LobeChat…）按行扫 `data: ` 前缀解析；给它整包 JSON
+    会一个 chunk 都取不到，用户看到的就是"HTTP 200 但回复空白"。
+    """
+    fake_jimeng.states = [ok_state(["https://cdn/cat.png"])]
+
+    r = sync_client.post("/v1/chat/completions", json={
+        "model": "jimeng-t2i",
+        "messages": [{"role": "user", "content": "画一只猫"}],
+        "stream": True,
+    }, headers=AUTH)
+
+    assert r.status_code == 200, r.text
+    assert r.headers["content-type"].startswith("text/event-stream"), r.headers
+    assert r.text.rstrip().endswith("data: [DONE]"), r.text[-120:]
+
+    chunks: list[dict] = []
+    for line in r.text.splitlines():
+        if not line.startswith("data: "):
+            continue
+        payload = line[len("data: "):]
+        if payload.strip() == "[DONE]":
+            continue
+        chunks.append(json.loads(payload))
+
+    assert chunks, "SSE 里至少要有一个 data: 分片"
+    assert all(c["object"] == "chat.completion.chunk" for c in chunks)
+    merged = "".join(
+        (c.get("choices") or [{}])[0].get("delta", {}).get("content") or ""
+        for c in chunks)
+    assert "![image](https://cdn/cat.png)" in merged, merged
+
+
+def test_chat_completions_without_a_prompt_is_a_clear_400(sync_client):
+    """空体/无 prompt ⇒ **400 且 `param` 指向 `prompt`**（不再无脑 200）。
+
+    旧行为是"探针友好地回一段说明"；图片 chat 之后没有 prompt 根本没法出图，
+    与其回一句废话，不如明确说清缺什么。⚠️ **零建任务** —— 400 发生在受理之前。
+    """
+    before = sync_client.get(BASE, headers=AUTH).json()["total"]
+
+    r = sync_client.post("/v1/chat/completions", content=b"", headers=AUTH)
+
+    assert r.status_code == 400, r.text
+    assert r.json()["error"]["param"] == "prompt"
+    after = sync_client.get(BASE, headers=AUTH).json()["total"]
+    assert after == before, "参数校验失败不该建任务"
 
 
 def test_chat_completions_requires_a_bearer(client):

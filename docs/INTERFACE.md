@@ -13,7 +13,7 @@
 | `GET` | `/async/v1/images/generations/{task_id}` | 🔒 | `202`/`200` | 非终态回排队态；终态回结果 |
 | `POST` | `/v1/images/generations` | 🔒 | `200`/`202`/`503` | **同步**出图：创建+轮询合并（≤300s），见 §0.5 |
 | `GET` | `/v1/models` | 🔓 | `200` | 能力清单（OpenAI 形态）；**只此一条路径**、**免鉴权** |
-| `POST` | `/v1/chat/completions` | 🔒 | `200` | **兼容占位**（2026-10-14）：满足 OpenAI 客户端/网关的连通性探针，**不建任何任务**；正文引导到图片/视频端点 |
+| `POST` | `/v1/chat/completions` | 🔒 | `200`/`400`/`451`/`503` | **图片 chat**（2026-10-14）：借 chat 协议出图，产物以 Markdown 图片回（`stream:true` ⇒ SSE）；🔴 **真生成、真计费**，见 §0.6 |
 | `DELETE` | `/async/v1/images/generations/{task_id}` | 🔒 | `200`/`400` | 删除**已终态**的任务 |
 | `GET` | `/async/v1/images/generations` | 🔒 | `200` | 本 Key 的任务列表 |
 | `POST` | `/api/v3/contents/generations/tasks` | 🔒 | `200` | **视频唯一入口**：火山方舟契约（创建）。按方舟模型名分流档位；带素材走全能参考 |
@@ -129,6 +129,34 @@ POST /v1/images/generations          Authorization: Bearer <key>
 
 ⚠️ **什么时候别用它**：长排队/长生成（视频族、高并发下的后位任务）用异步族更合适 ——
 同步接口会占住一条 HTTP 连接等到底。它适合"交互式、要一步到位"的场景。
+
+### 0.6 图片 chat：`POST /v1/chat/completions`（2026-10-14）
+
+OpenAI 风格客户端/网关（new-api、LobeChat、NextChat…）只认 chat 协议
+⇒ 本服务用这个端点承载**出图**（"图片 chat"）：
+
+```
+POST /v1/chat/completions          Authorization: Bearer <key>
+{"model": "doubao-seedream-5-0-pro-260628",
+ "messages": [{"role": "user", "content": "画一只橘猫"}]}
+```
+
+* **成功** ⇒ `choices[0].message.content` 是 **Markdown 图片**
+  （`![image](url)`；多张则多行），客户端在对话流里直接渲染成图；
+* **`messages` 里的图片**（OpenAI `image_url` 多模态形态，`data:` URL 也收）
+  ⇒ 转**垫图** ⇒ 图生图；纯文本 ⇒ 文生图；
+* **`model` 可省**：带图 ⇒ `jimeng-i2i`，不带图 ⇒ `jimeng-t2i`。
+  （chat 请求不带出图族的那些参数，缺省时必须替它定一个，否则会撞上
+  "未指定 model 且多个能力可选"的 400 —— 客户端就永远调不通。）
+* **`stream: true`** ⇒ 回**标准 SSE**：先发 role 帧占位（生成要几十秒，
+  先证明连接活着，免得客户端读超时断开）→ 生成完成 → content 帧 → `data: [DONE]`。
+  ⚠️ 流式下响应头一旦发出就**改不动状态码** ⇒ 生成失败只能把错误**当正文**吐出去；
+  **非流式**则照常抛 HTTP 错误（`451`/`429`/`502`…，与 §0.5 逐字一致）。
+* 🔴 **真的建任务、真的计费**（2026-10-14 口径变更；此前是"只回说明、绝不建任务"
+  的连通性占位）：本端点走与 §0.5 **同一套**同步链路（`_sync_generate`）。
+  ⇒ **渠道的"测试 / 连通性"按钮打这个端点也会真的花钱**。要零成本探活请用
+  `GET /healthz`（见 §0.3 的免鉴权例外）。
+* 无 prompt 的空体 ⇒ `400` 且 `param="prompt"`（**零建任务**，校验发生在受理前）。
 
 ### 0.2 火山方舟（Ark）契约门面（2026-09-20 起）
 
