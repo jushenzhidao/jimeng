@@ -586,6 +586,36 @@ def test_chat_completions_without_a_prompt_is_a_clear_400(sync_client):
     assert after == before, "参数校验失败不该建任务"
 
 
+def test_chat_completions_degrades_to_202_when_the_budget_runs_out(client_factory):
+    """🔴 预算耗尽但仍在生成 ⇒ **202 + task_id + Location**，绝不是"生成失败"。
+
+    线上实测（2026-10-14）：原先这条路径回 `200` + `content="生成失败：任务未成功结束"`
+    —— 把"还在排队/生成"谎报成永久失败，调用方也拿不到 `task_id`，无法转异步轮询。
+    （触发场景很常见：队列被上游卡住的任务占满时，同步预算必然不够。）
+    """
+    c = client_factory(sync_max_wait=0.05)
+    st = c.app.state
+    # advances=0 ⇒ wake() 不推进 ⇒ 任务停在 queued，预算一到就降级
+    st.coordinator = _InlineCoordinator(st.coordinator, advances=0)
+
+    r = c.post("/v1/chat/completions",
+               json={"model": "jimeng-t2i",
+                     "messages": [{"role": "user", "content": "画一只猫"}]},
+               headers=AUTH)
+
+    assert r.status_code == 202, r.text
+    body = r.json()
+    tid = body["task_id"]
+    assert tid.startswith("jimeng_")
+    assert r.headers["location"] == f"/async/v1/images/generations/{tid}"
+    assert "仍在生成" in body["choices"][0]["message"]["content"], body
+
+    # 拿到的必须是**真** task_id（能被异步端点查到），不是占位串
+    got = c.get(f"/async/v1/images/generations/{tid}", headers=AUTH)
+    assert got.status_code == 202, got.text
+    assert got.json()["task_id"] == tid
+
+
 # ---------------------------------------------------------------------------
 # 兼容面：OpenAI 图片编辑端点 `POST /v1/images/edits`（multipart）
 #

@@ -340,6 +340,14 @@ def _chat_text(rec: TaskRecord) -> str:
     走 chat 协议的图片模型，产物就是 `![](url)` —— 客户端（LobeChat/NextChat 等）
     会在对话流里直接渲染成图。多张就多行。
     """
+    if rec.status not in ("success", "failure"):
+        # 🔴 预算内没等到终态（还在排队/生成）—— 这**不是失败**，是"还没好"。
+        # 线上实测（2026-10-14）：原先把这条路径写成"生成失败：任务未成功结束"，
+        # 调用方完全看不出"任务其实活着、只是慢"（一条队列堵住的请求会得到
+        # 一句像是永久失败的文案）。与 `/v1/images/generations` 同口径：
+        # 把 **task_id 与去哪继续查** 说清楚。
+        return ("图片仍在生成中（未在预算内完成）。请轮询 "
+                f"GET /async/v1/images/generations/{rec.task_id} 取结果。")
     if rec.status != "success":
         err = (rec.error or {}).get("message") or "任务未成功结束"
         return f"生成失败：{err}"
@@ -854,7 +862,7 @@ h2{{color:#7cb0ff}}a{{color:#7cb0ff}}td,th{{border-color:#1e2836}}}}</style></he
         from starlette.concurrency import run_in_threadpool  # noqa: PLC0415
 
         rec = await run_in_threadpool(_sync_generate, *args, **kwargs)
-        return JSONResponse(status_code=200, content={
+        payload: dict[str, Any] = {
             "id": cid,
             "object": "chat.completion",
             "created": created,
@@ -865,7 +873,18 @@ h2{{color:#7cb0ff}}a{{color:#7cb0ff}}td,th{{border-color:#1e2836}}}}</style></he
                 "finish_reason": "stop",
             }],
             "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-        })
+        }
+        if rec.status not in ("success", "failure"):
+            #: 与 `/v1/images/generations` 同口径：**202 + task_id + Location**。
+            #: 任务没丢、也没被取消 —— 调用方拿 task_id 去异步端点继续轮询。
+            #: （此前这里无视非终态直接回 200，正文还是"生成失败"，
+            #: 等于把"还在跑"谎报成"失败了"。）
+            payload["task_id"] = rec.task_id
+            return JSONResponse(
+                status_code=202, content=payload,
+                headers={"Location":
+                         f"/async/v1/images/generations/{rec.task_id}"})
+        return JSONResponse(status_code=200, content=payload)
 
     # ------------------------------------------------------------- 运维
     @app.get("/healthz")
