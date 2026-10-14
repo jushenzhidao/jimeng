@@ -37,6 +37,7 @@ import uuid
 from .config import Settings
 from .observability import OBS
 from .service import Service
+from .store import TaskRecord
 
 log = logging.getLogger(__name__)
 
@@ -47,6 +48,38 @@ _POLL_BATCH = 32
 _DISPATCH_SCAN = 64
 #: 多久做一次维护（清理过期终态任务）
 _MAINTENANCE_EVERY = 300.0
+
+
+def _fair_batch(recs: list[TaskRecord], budget: int) -> list[TaskRecord]:
+    """把候选任务按**凭据轮转**重排，取前 `budget` 条（公平派发）。
+
+    🔴 2026-10-14（线上实测的"队列堵死"）：原实现是拿 `order="oldest"` 的
+    全局前 N 条直接派发 —— 于是**一个调用方灌一批**（实测 181 条）就把并发位
+    **全部吃掉**：后面所有调用方（哪怕只发 1 条）都排在它后面，队列从外面看
+    就是"完全不动"。用户原话："这么长，**没看到请求打到 web**"。
+
+    改成轮转：第 0 轮每个凭据各拿**一条**，第 1 轮再各拿一条……于是
+    "有 N 个活跃凭据"时，每个都能在最前面的 N 条里拿到位子。
+    ⚠️ **单凭据独占时行为与原来完全一致**（仍按传入顺序 = oldest），
+    不为公平牺牲独享时的吞吐。
+    """
+    buckets: dict[str | None, list[TaskRecord]] = {}
+    for rec in recs:
+        buckets.setdefault(rec.upstream_sessionid, []).append(rec)
+    out: list[TaskRecord] = []
+    depth = 0
+    while len(out) < budget:
+        progressed = False
+        for items in buckets.values():
+            if depth < len(items):
+                out.append(items[depth])
+                progressed = True
+                if len(out) >= budget:
+                    break
+        if not progressed:            # 所有桶都取空了
+            break
+        depth += 1
+    return out
 
 
 class Coordinator:
@@ -216,7 +249,10 @@ class Coordinator:
         #: 两者的处置办法不同（风控要过一次验证 / 等标记衰减，额度要充值），
         #: 合并进 `quota_silent` 会让 /stats 骗人。
         risk_silent = self.service.gate.risk_silent_keys()
-        sent = 0
+        #: 先按 `oldest` 取一批候选，**再按凭据轮转**挑出这一轮该派发的
+        #: —— 单凭据不得垄断并发位（见 `_fair_batch`；两处分工：过滤负责
+        #: "谁不该派"，轮转负责"该派的怎么排序"）。
+        cands: list[TaskRecord] = []
         for rec in store.list_by_status("queued", limit=_DISPATCH_SCAN,
                                         order="oldest"):
             if rec.upstream_sessionid in silent:
@@ -225,11 +261,11 @@ class Coordinator:
             if rec.upstream_sessionid in risk_silent:
                 self.dispatch_risk_silent += 1
                 continue
+            cands.append(rec)
+
+        for rec in _fair_batch(cands, budget):
             self.service.dispatch(rec)
             self.dispatched += 1
-            sent += 1
-            if sent >= budget:
-                break
 
     def _poll_running(self) -> None:
         """推进所有在途任务 —— **上游查询合并成一次**（见 `Service.poll_many`）。

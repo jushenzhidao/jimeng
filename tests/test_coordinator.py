@@ -1532,3 +1532,101 @@ def test_dispatch_starvation_is_counted_not_silent(settings):
     assert co4.dispatch_risk_silent == 1
     assert co4.dispatch_quota_silent == 0, "风控与额度不能并成一个计数"
     assert co4.stats()["dispatch_risk_silent"] == 1, "运维要能在 /stats 里看到它"
+
+
+# ---------------------------------------------------------------------------
+# 🔴 2026-10-14：**公平派发** —— 单凭据不得垄断并发位（"队列堵死"的机制根因）
+#
+# 线上实测：一个调用方排队 **181 条** ⇒ 原实现按 `created_at` 全局取前 N 条
+# ⇒ 后面所有调用方（哪怕只发 1 条）**一条都派不出去**，队列从外面看
+# 就是"完全不动"。用户原话："这么长，**没看到请求打到 web**"。
+# ---------------------------------------------------------------------------
+
+
+def _tr(sid: str, i: int):
+    """造一条最小的 TaskRecord（只填调度用得到的字段）。"""
+    from app.store import TaskRecord
+
+    return TaskRecord(task_id=f"jimeng_{sid}_{i}", credential_id=f"cred-{sid}",
+                      model="jimeng-t2i", cap_key="jimeng:t2i",
+                      upstream_sessionid=sid, status="queued")
+
+
+def test_fair_batch_gives_every_credential_a_slot():
+    """灌 100 条的凭据不能把位子全吃掉 —— 只有 1 条的凭据也要能排上。"""
+    from app.coordinator import _fair_batch
+
+    recs = [_tr("A", i) for i in range(100)] + [_tr("B", 0)]
+    got = _fair_batch(recs, 4)
+    assert len(got) == 4
+    assert any(r.upstream_sessionid == "B" for r in got), \
+        "B 只有一条也该在本轮拿到位子 —— 否则单凭据能饿死所有其他调用方"
+
+
+def test_fair_batch_balances_two_credentials():
+    """两个凭据、budget=4 ⇒ 各拿 2 条（轮转，不是"谁老谁全拿"）。"""
+    from app.coordinator import _fair_batch
+
+    recs = [_tr("A", i) for i in range(10)] + [_tr("B", i) for i in range(10)]
+    got = _fair_batch(recs, 4)
+    assert [r.upstream_sessionid for r in got] == ["A", "B", "A", "B"]
+
+
+def test_fair_batch_is_unchanged_when_only_one_credential():
+    """单凭据独占 ⇒ 行为与改前**完全一致**（仍按传入顺序 = oldest）。
+
+    公平化不能牺牲"独占时的吞吐" —— 那会把最常见的单用户情形拖慢。
+    """
+    from app.coordinator import _fair_batch
+
+    recs = [_tr("A", i) for i in range(10)]
+    got = _fair_batch(recs, 3)
+    assert [r.task_id for r in got] == ["jimeng_A_0", "jimeng_A_1", "jimeng_A_2"]
+
+
+def test_dispatch_actually_uses_the_fair_order(settings):
+    """**接线门禁**：`_dispatch_queued` 必须真的走公平顺序。
+
+    只测纯函数不够 —— "实现了排序" ≠ "派发时用了它"（本仓踩过同类）。
+    这里造一个"队首 50 条全是 A、队尾才有一条 B"的队列，断言 B 被派出去。
+    """
+    from app.coordinator import Coordinator
+
+    class _Store:
+        def __init__(self) -> None:
+            self.rows = ([SimpleNamespace(upstream_sessionid="A")] * 50
+                         + [SimpleNamespace(upstream_sessionid="B")])
+
+        def count_by_status(self, _status: str) -> int:
+            return 0                      # 并发位全空
+
+        def list_by_status(self, *a, **k):
+            return list(self.rows)
+
+    class _Gate:
+        def stats(self):
+            return {"cooling_for": 0.0}
+
+        def quota_silent_keys(self):
+            return set()
+
+        def risk_silent_keys(self):
+            return set()
+
+    class _Svc:
+        def __init__(self) -> None:
+            self.store = _Store()
+            self.gate = _Gate()
+            self.sent: list = []
+
+        def dispatch(self, rec) -> None:
+            self.sent.append(rec.upstream_sessionid)
+
+    svc = _Svc()
+    # 并发位必须 ≥2 才谈得上"轮转"（conftest 默认 1）
+    st = settings.replace(jm_concurrency=2)
+    co = Coordinator(service=svc, settings=st, owner="x")  # type: ignore[arg-type]
+    co._dispatch_queued()
+
+    assert "B" in svc.sent, \
+        f"队尾那条别的凭据必须被派出去（公平轮转没接线？），实得 {svc.sent}"
