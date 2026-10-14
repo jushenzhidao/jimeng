@@ -8,7 +8,8 @@
 #
 # 首次运行：
 #   cp .env.example .env     # 填 JIMENG_SESSIONID 与 POSTGRES_PASSWORD
-#   docker compose up -d --build
+#   线上（**用 CI 制品**）：docker compose pull && docker compose up -d
+#   本地开发（自构建）    ：docker compose up -d --build
 #
 # ⚠️ 四条不要做的事：
 #   1. 不要用 `deploy.replicas` / `docker compose up --scale` 扩容。
@@ -55,9 +56,18 @@ services:
       start_period: 10s
 
   jimeng-service:
+    # 🔴 **镜像来源 = CI 制品**（`.github/workflows/release.yml`：push main
+    #    → bump 版本 → 跑测试 → build → 推 `ghcr.io/rsfree/jimeng`〔版本 / latest
+    #    / sha-xxxxxxx 三个 tag〕→ 打 git tag + 建 Release）。
+    #    线上部署 = `docker compose pull jimeng-service && docker compose up -d`
+    #    —— **不要**在机器上 build：那样出来的镜像没有版本号 bump、也没有
+    #    tag/Release 溯源，等于绕过整条发版流程（2026-10-14 踩过）。
+    #    钉版本：线上 `.env` 设 `JIMENG_VERSION=0.1.27`（默认 `latest` 会漂移，
+    #    漂移后同一个 compose 文件在不同时刻拉到不同代码）。
+    #    `build:` 段**保留**，只服务本地开发（`docker compose up -d --build`）。
+    image: ghcr.io/rsfree/jimeng:${JIMENG_VERSION:-latest}
     build:
       context: .
-    image: jimeng-service:0.1.0
     container_name: jimeng-service
     restart: unless-stopped
     depends_on:
