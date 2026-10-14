@@ -50,36 +50,48 @@ _DISPATCH_SCAN = 64
 _MAINTENANCE_EVERY = 300.0
 
 
-def _fair_batch(recs: list[TaskRecord], budget: int) -> list[TaskRecord]:
-    """把候选任务按**凭据轮转**重排，取前 `budget` 条（公平派发）。
+def _fair_batch(recs: list[TaskRecord], budget: int,
+                cursor: int = 0) -> tuple[list[TaskRecord], int]:
+    """按凭据轮转取 `budget` 条；返回 `(选中, 新 cursor)`。
 
-    🔴 2026-10-14（线上实测的"队列堵死"）：原实现是拿 `order="oldest"` 的
-    全局前 N 条直接派发 —— 于是**一个调用方灌一批**（实测 181 条）就把并发位
-    **全部吃掉**：后面所有调用方（哪怕只发 1 条）都排在它后面，队列从外面看
-    就是"完全不动"。用户原话："这么长，**没看到请求打到 web**"。
+    🔴 **v1 的缺陷**（2026-10-14 线上抓到，`v0.1.32`）：
+    原先只在**单次调用内**轮转 —— 第 0 轮取"桶里的**第一个**凭据"。
+    而生产常态是 `budget=1`（4 个并发位只空出 1 个）⇒ **永远取同一个凭据**，
+    另一个凭据在**队首干等**：实测 `ticks=589 / dispatched=75`（89% 的 tick
+    因并发满跳过），在途 4 位长期被同一账号占着，另一个凭据的任务等了 18 分钟
+    一次都没被派发。用户的观察正是"我的任务在队首却不动"。
 
-    改成轮转：第 0 轮每个凭据各拿**一条**，第 1 轮再各拿一条……于是
-    "有 N 个活跃凭据"时，每个都能在最前面的 N 条里拿到位子。
-    ⚠️ **单凭据独占时行为与原来完全一致**（仍按传入顺序 = oldest），
-    不为公平牺牲独享时的吞吐。
+    **修法**：轮转**跨 tick 记忆**（`cursor` 在凭据序列上推进），于是
+    `budget=1` 时也严格 A→B→A→B 交替。cursor 是**进程内状态**，重启归零
+    —— 只影响"从谁开始"，不影响正确性（无公平性回归）。
+
+    ⚠️ **单凭据独占时行为仍与原来一致**（只有一个桶，取出来就是 oldest 顺序）。
     """
     buckets: dict[str | None, list[TaskRecord]] = {}
     for rec in recs:
         buckets.setdefault(rec.upstream_sessionid, []).append(rec)
+    keys = list(buckets)
+    if not keys:
+        return [], cursor
+
     out: list[TaskRecord] = []
     depth = 0
+    n = len(keys)
     while len(out) < budget:
         progressed = False
-        for items in buckets.values():
+        for step in range(n):
+            pos = (cursor + step) % n
+            items = buckets[keys[pos]]
             if depth < len(items):
                 out.append(items[depth])
                 progressed = True
                 if len(out) >= budget:
-                    break
+                    #: 下一次从这里继续 —— 让"上一次派给了谁"影响"这次轮到谁"
+                    return out, (pos + 1) % n
         if not progressed:            # 所有桶都取空了
             break
         depth += 1
-    return out
+    return out, cursor
 
 
 class Coordinator:
@@ -102,6 +114,10 @@ class Coordinator:
         #: 累计统计（运维观测）
         self.ticks = 0
         self.skipped_lease = 0
+        #: 公平轮转的"上一次派给了谁"游标（见 `_fair_batch`）。
+        #: ⚠️ 没有它，`budget=1`（并发位只剩 1 个 —— 生产常态）时会**永远**
+        #: 派给同一个凭据，另一个凭据饿死（`v0.1.32` 实测的缺陷）。
+        self._rr_cursor = 0
         #: 🔴 **派发饥饿计数器**（2026-09-23 补）。运维症状是"任务一直排队、什么都不动"，
         #: 而此前 `stats()` 只能看到 ticks / skipped_lease —— 于是"并发额度被在途任务
         #: 占满"这条最常见的原因**完全不可见**（实测：一个在途任务 + 默认并发 1
@@ -263,7 +279,9 @@ class Coordinator:
                 continue
             cands.append(rec)
 
-        for rec in _fair_batch(cands, budget):
+        #: 按凭据轮转（**跨 tick 记忆游标** —— 否则 `budget=1` 时永远同一个凭据）。
+        picked, self._rr_cursor = _fair_batch(cands, budget, self._rr_cursor)
+        for rec in picked:
             self.service.dispatch(rec)
             self.dispatched += 1
 

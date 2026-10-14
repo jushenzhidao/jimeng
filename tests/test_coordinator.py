@@ -1557,7 +1557,7 @@ def test_fair_batch_gives_every_credential_a_slot():
     from app.coordinator import _fair_batch
 
     recs = [_tr("A", i) for i in range(100)] + [_tr("B", 0)]
-    got = _fair_batch(recs, 4)
+    got, _cursor = _fair_batch(recs, 4)
     assert len(got) == 4
     assert any(r.upstream_sessionid == "B" for r in got), \
         "B 只有一条也该在本轮拿到位子 —— 否则单凭据能饿死所有其他调用方"
@@ -1568,7 +1568,7 @@ def test_fair_batch_balances_two_credentials():
     from app.coordinator import _fair_batch
 
     recs = [_tr("A", i) for i in range(10)] + [_tr("B", i) for i in range(10)]
-    got = _fair_batch(recs, 4)
+    got, _cursor = _fair_batch(recs, 4)
     assert [r.upstream_sessionid for r in got] == ["A", "B", "A", "B"]
 
 
@@ -1580,8 +1580,32 @@ def test_fair_batch_is_unchanged_when_only_one_credential():
     from app.coordinator import _fair_batch
 
     recs = [_tr("A", i) for i in range(10)]
-    got = _fair_batch(recs, 3)
+    got, _cursor = _fair_batch(recs, 3)
     assert [r.task_id for r in got] == ["jimeng_A_0", "jimeng_A_1", "jimeng_A_2"]
+
+
+def test_fair_batch_alternates_even_when_budget_is_one():
+    """🔴 **`budget=1` 也必须跨 tick 交替**（这条精确复现线上缺陷）。
+
+    `v0.1.32` 的轮转只在**单次调用内**做 ⇒ `budget=1`（并发位只剩 1 个，
+    这是生产常态）时永远取"桶里的**第一个**凭据"。线上实测：
+    `ticks=589 / dispatched=75`、在途 4 位长期是同一个账号，
+    **另一个凭据的任务在队首干等 18 分钟一次都没被派发**
+    （用户的观察："我的任务怎么还不动"）。
+    """
+    from app.coordinator import _fair_batch
+
+    recs = [_tr("A", i) for i in range(10)] + [_tr("B", i) for i in range(10)]
+
+    cursor = 0
+    order: list = []
+    for _ in range(4):
+        got, cursor = _fair_batch(recs, 1, cursor)
+        order.append(got[0].upstream_sessionid)
+
+    assert order == ["A", "B", "A", "B"], (
+        f"budget=1 时必须跨 tick 严格交替，实得 {order} "
+        f"⇒ 后一个凭据会被饿死（这正是线上 18 分钟不动的成因）")
 
 
 def test_dispatch_actually_uses_the_fair_order(settings):
