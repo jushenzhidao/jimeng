@@ -25,12 +25,13 @@ GET    /v1/models                           模型清单（OpenAI 形态）—�
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import time
 import uuid
 from contextlib import asynccontextmanager
-from typing import Any, Callable, Iterator
+from typing import Any, AsyncIterator, Awaitable, Callable, Iterator
 
 import uvicorn
 from fastapi import Depends, FastAPI, File, Form, Request, UploadFile
@@ -43,6 +44,7 @@ from fastapi.responses import (
 )
 from loguru import logger
 from pydantic import BaseModel, ConfigDict, Field
+from starlette.concurrency import run_in_threadpool
 
 from . import models
 from .ark import ark_task_view as ark_view
@@ -66,7 +68,7 @@ from .observability import (
     setup_logging,
     should_log_path,
 )
-from .service import Service, view
+from .service import SYNC_WAIT_POLL_INTERVAL, Service, view
 from .store import TaskRecord
 
 # ---------------------------------------------------------------------------
@@ -297,8 +299,8 @@ def _install_request_logging(app: FastAPI) -> None:
         return response
 
 
-def _chat_sse(cid: str, model: str, created: int,
-              produce: Callable[[], str]) -> Iterator[str]:
+async def _chat_sse(cid: str, model: str, created: int,
+                    produce: Callable[[], Awaitable[str]]) -> AsyncIterator[str]:
     """**图片 chat** 的流式出口：把一次生成的文本按 `chat.completion.chunk` 吐出。
 
     🔴 形态必须逐字对齐 OpenAI SSE（`data: {json}\\n\\n` + 结尾 `data: [DONE]`）：
@@ -307,8 +309,8 @@ def _chat_sse(cid: str, model: str, created: int,
     这正是 2026-10-14 线上那条"用 seedream 名测 chat 得到空回复"的直接成因。
 
     🔴 **先吐 role 帧、再去生成**：生成要几十秒，客户端在等首字节 —— 先发一帧
-    证明"连接活着、正在生成"，避免客户端读超时提前断开。`produce` 是**阻塞**的
-    （内部会跑完整个同步链路），由 Starlette 在线程池里迭代本生成器，不卡事件循环。
+    证明"连接活着、正在生成"，避免客户端读超时提前断开。`produce` 现在是
+    **async**（内部 `await` 整条同步链路）⇒ 等待只占一个定时器、**不占线程**。
 
     ⚠️ 流式下响应头一旦发出就**改不动状态码** ⇒ 生成失败只能把错误**当正文**
     吐出去（客户端至少看得到原因，而不是一片空白）；非流式路径则照常抛 HTTP 错误。
@@ -322,7 +324,7 @@ def _chat_sse(cid: str, model: str, created: int,
                                     "delta": {"role": "assistant", "content": ""},
                                     "finish_reason": None}]})
     try:
-        text = produce()
+        text = await produce()
     except AdapterError as e:
         text = f"生成失败：{e.to_error()['error']['message']}"
     except Exception as e:  # noqa: BLE001
@@ -422,17 +424,48 @@ def _upload_to_data_uri(uf: UploadFile, settings: Settings) -> str:
     return f"data:{mime};base64," + base64.b64encode(data).decode()
 
 
-def _sync_generate(svc: Service, coordinator: Any, settings: Settings,
-                   body: dict[str, Any], *, credential: str,
-                   sessionid: str | None,
-                   preset_degradations: list[str] | None = None) -> TaskRecord:
-    """**同步**跑完一次生成：受理 → 叫醒推进 → 等到终态。返回 `TaskRecord`。
+async def _wait_terminal_async(svc: Service, task_id: str, credential: str,
+                               max_wait: float) -> TaskRecord:
+    """等任务到终态（或预算耗尽）—— **等待期间不占线程**。
 
-    多个门面共用这一个核心（`/v1/images/generations` 同步出图、图片 chat）——
-    语义只有一处定义，避免"某个门面少判了一种失败"这类分叉。
+    与 `Service.wait_terminal` 的语义**逐条一致**（超预算返回当时的记录、
+    不抛错、只读本地库、不驱动上游），唯一区别是 `await asyncio.sleep()`
+    而不是 `time.sleep()` —— 前者只占事件循环里一个定时器。
 
-    ⚠️ **阻塞**：会等到终态或 `SYNC_MAX_WAIT`（默认 300s）。调用它的 HTTP 端点
-    必须是同步 `def`，或在线程池里跑（见各调用处）。
+    ⚠️ 读库仍走线程池，但那是**毫秒级**短操作；长期占住的只有定时器。
+    这正是"40 个同步请求就能堵死线程池"的解药。
+    """
+    deadline = time.monotonic() + max_wait
+    while True:
+        rec = await run_in_threadpool(svc.get_for_credential, task_id,
+                                      credential)
+        remaining = deadline - time.monotonic()
+        if rec.terminal or remaining <= 0:
+            return rec
+        await asyncio.sleep(min(SYNC_WAIT_POLL_INTERVAL, remaining))
+
+
+async def _sync_generate(svc: Service, coordinator: Any, settings: Settings,
+                         body: dict[str, Any], *, credential: str,
+                         sessionid: str | None,
+                         preset_degradations: list[str] | None = None,
+                         ) -> TaskRecord:
+    """**同步语义**的一次生成：受理 → 叫醒推进 → 等到终态。返回 `TaskRecord`。
+
+    🔴 **async 而非阻塞**（2026-10-14 用户追问"多个同步任务不会阻塞？"）：
+    原先是同步函数 + `time.sleep` ⇒ FastAPI 把每个这样的请求丢进**线程池**
+    （Starlette/AnyIO 默认 **40** 个线程），而同步请求会卡在轮询里最多
+    `SYNC_MAX_WAIT`（300s）⇒ 40 个慢请求就能把线程池占满，
+    **后续所有同步请求（chat / images / edits 三个端点）全部排队等线程** ——
+    单 worker 的同步吞吐天花板其实只有 40/300s ≈ 0.13 req/s。
+    改成 async 之后，等待只占一个 `asyncio.sleep` 定时器（**不占线程**），
+    单 worker 能同时挂住成百上千个同步请求；真正会阻塞的只有"建任务/读库"
+    这两个**毫秒级短操作**，它们仍走 `run_in_threadpool`。
+
+    多个门面共用这一个核心（`/v1/images/generations`、`/v1/images/edits`、
+    图片 chat）—— 语义只有一处定义，避免"某个门面少判了一种失败"这类分叉。
+
+    ⚠️ 仍会等到终态或 `SYNC_MAX_WAIT`（默认 300s）。
 
     终态失败里两种直接转抛 HTTP 错误（2026-10-10 用户口径，判据是**落库的**
     `error.type`，不做 message 字符串匹配）：
@@ -447,11 +480,12 @@ def _sync_generate(svc: Service, coordinator: Any, settings: Settings,
             "后台协调器未在运行（COORDINATOR_ENABLED=0？）—— 没有任务推进者，"
             "同步等待无法履行。请改用异步端点 POST /async/v1/images/generations，"
             "或开启协调器后重试。")
-    rec = svc.create(body, credential=credential, sessionid=sessionid,
-                     preset_degradations=preset_degradations)
+    rec = await run_in_threadpool(
+        svc.create, body, credential=credential, sessionid=sessionid,
+        preset_degradations=preset_degradations)
     coordinator.wake()
-    rec = svc.wait_terminal(rec.task_id, credential,
-                            max_wait=settings.sync_max_wait)
+    rec = await _wait_terminal_async(svc, rec.task_id, credential,
+                                     settings.sync_max_wait)
     if rec.status == "failure":
         stored = rec.error or {}
         etype = stored.get("type")
@@ -495,17 +529,20 @@ def _install_routes(app: FastAPI) -> None:
 
     # ------------------------------------------------- 同步生成（创建+轮询合并）
     @app.post("/v1/images/generations")
-    def create_generation_sync(
+    async def create_generation_sync(
         request: Request,
         body: GenerationRequest,
         credential: str = Depends(require_key),
     ) -> JSONResponse:
         """**同步**出图：创建 + 轮询合并进一个请求，预算内直接给最终结果。
 
-        ⚠️ 刻意用 `def` 而**不是** `async def`：本函数会阻塞等待至多
-        `SYNC_MAX_WAIT` 秒（默认 300）—— 在 `async def` 里这样等会卡死整个
-        事件循环（同 worker 的其它请求全部排队）。FastAPI 会把同步端点丢进
-        线程池执行，阻塞因而只影响这一个请求。**改动签名前先想清这一点。**
+        🔴 `async def` **是刻意的**（2026-10-14 改）。
+        此前是同步 `def` + `time.sleep` 等待 ⇒ FastAPI 把它丢进**线程池**
+        （Starlette/AnyIO 默认 40 个线程），而每个请求最长占线程
+        `SYNC_MAX_WAIT`（300s）⇒ **40 个慢请求就能堵住后续所有同步请求**
+        （chat / images / edits 会一起排队）。现在等的是 `asyncio.sleep`，
+        只占一个定时器。**不要**改回 `def`，也别在函数体里直接 `time.sleep`
+        或做同步 I/O —— 那才会真的卡死事件循环。
 
         语义（与异步族共用同一判定，`view()` 仍是唯一出口）：
           · 预算内到终态 → 直接回终态体（成功 200；失败 200 + `status: failure`）；
@@ -532,11 +569,11 @@ def _install_routes(app: FastAPI) -> None:
         内部链路与异步受理完全一致：落库 → 叫醒协调器 → 等库里的状态变化。
         等待期间**不发任何上游请求**（推进是协调器线程的职责，这里只读库）。
         """
-        rec = _sync_generate(request.app.state.service,
-                             request.app.state.coordinator,
-                             request.app.state.settings,
-                             body.model_dump(), credential=credential,
-                             sessionid=_bearer(request))
+        rec = await _sync_generate(request.app.state.service,
+                                   request.app.state.coordinator,
+                                   request.app.state.settings,
+                                   body.model_dump(), credential=credential,
+                                   sessionid=_bearer(request))
 
         status_code, payload = view(rec)
         headers: dict[str, str] = {}
@@ -549,7 +586,7 @@ def _install_routes(app: FastAPI) -> None:
 
     # ------------------------------------ 兼容面：OpenAI 图片编辑端点（edits）
     @app.post("/v1/images/edits")
-    def edit_image_sync(
+    async def edit_image_sync(
         request: Request,
         image: list[UploadFile] = File(default=[]),
         image_brackets: list[UploadFile] = File(default=[], alias="image[]"),
@@ -619,10 +656,11 @@ def _install_routes(app: FastAPI) -> None:
                 "未指定 model：edits 端点按「带输入图编辑」语义默认用 `jimeng-i2i`"
                 "（图生图 + Lite，实测 0 积分）。要指定别的能力请显式传 model。")
 
-        rec = _sync_generate(request.app.state.service,
-                             request.app.state.coordinator, settings, body,
-                             credential=credential, sessionid=_bearer(request),
-                             preset_degradations=degradations)
+        rec = await _sync_generate(request.app.state.service,
+                                   request.app.state.coordinator, settings,
+                                   body, credential=credential,
+                                   sessionid=_bearer(request),
+                                   preset_degradations=degradations)
         status_code, payload = view(rec)
         headers2: dict[str, str] = {}
         if status_code == 202:
@@ -844,10 +882,10 @@ h2{{color:#7cb0ff}}a{{color:#7cb0ff}}td,th{{border-color:#1e2836}}}}</style></he
         kwargs = {"credential": credential, "sessionid": _bearer(request)}
 
         if body.get("stream"):
-            # StreamingResponse 在线程池里迭代这个**同步**生成器 ⇒ `_sync_generate`
-            # 的阻塞（最长 SYNC_MAX_WAIT）不卡事件循环（同 `def` 端点的道理）。
-            def _produce() -> str:
-                return _chat_text(_sync_generate(*args, **kwargs))
+            # `_chat_sse` 现在是 **async 生成器**（`produce` 也是 async）⇒
+            # 等待只占一个定时器，不再有"同步生成器被丢进线程池"那回事。
+            async def _produce() -> str:
+                return _chat_text(await _sync_generate(*args, **kwargs))
 
             return StreamingResponse(
                 _chat_sse(cid, model, created, _produce),
@@ -857,11 +895,8 @@ h2{{color:#7cb0ff}}a{{color:#7cb0ff}}td,th{{border-color:#1e2836}}}}</style></he
                          # 才吐（症状同样是"客户端收不到 chunk、显示空白"）。
                          "X-Accel-Buffering": "no"})
 
-        # 非流式：阻塞跑在**线程池**里 —— 直接在 `async def` 里 await 一个阻塞调用
-        # 会卡死整个事件循环，同 worker 的其它请求全部排队。
-        from starlette.concurrency import run_in_threadpool  # noqa: PLC0415
-
-        rec = await run_in_threadpool(_sync_generate, *args, **kwargs)
+        # 非流式：直接 `await`（等待只占定时器，不再借线程池）。
+        rec = await _sync_generate(*args, **kwargs)
         payload: dict[str, Any] = {
             "id": cid,
             "object": "chat.completion",

@@ -725,6 +725,40 @@ def test_edits_requires_a_bearer(client):
     assert r.status_code == 401
 
 
+@pytest.mark.asyncio
+async def test_sync_wait_yields_the_loop_instead_of_blocking(service):
+    """🔴 同步等待必须**让出事件循环**（`await asyncio.sleep`），不能死等。
+
+    2026-10-14（用户追问"多个同步任务不会阻塞？"）：原先同步端点用
+    `def` + `time.sleep` ⇒ FastAPI 把每个请求丢进**线程池**
+    （Starlette/AnyIO 默认 **40** 个线程），而每个请求最长占线程
+    `SYNC_MAX_WAIT`（300s）⇒ **40 个慢请求就把 chat / images / edits
+    三个端点的同步请求一起堵死**。
+
+    这条用例用"两个 0.4s 的等待并发跑"来钉住它：
+      · 让出事件循环 ⇒ 总耗时 ≈ 0.4s；
+      · 若是 `time.sleep` 式的死等 ⇒ ≈ 0.8s（用例会红）。
+    """
+    import asyncio
+    import time as _time
+
+    from app.main import _wait_terminal_async
+
+    rec = service.create({"model": "jimeng-t2i", "prompt": "x"},
+                         credential="cred-a", sessionid="sid-a")
+
+    t0 = _time.monotonic()
+    await asyncio.gather(
+        _wait_terminal_async(service, rec.task_id, "cred-a", 0.4),
+        _wait_terminal_async(service, rec.task_id, "cred-a", 0.4),
+    )
+    elapsed = _time.monotonic() - t0
+
+    assert elapsed < 0.7, (
+        f"两个 0.4s 的等待应当**并发**完成（≈0.4s），实耗 {elapsed:.2f}s "
+        f"⇒ 等待没让出事件循环（是不是又被改回 time.sleep / 同步 def 了？）")
+
+
 def test_chat_completions_requires_a_bearer(client):
     """门禁口径统一：业务端点一律要 Bearer。"""
     r = client.post("/v1/chat/completions", json={"messages": []})
