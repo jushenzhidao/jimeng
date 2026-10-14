@@ -95,6 +95,7 @@ def render(settings: Settings) -> str:
     add("| 形态 | 端点 |")
     add("|---|---|")
     add("| 图片（同步） | `POST /v1/images/generations` |")
+    add("| 图片编辑（同步·**multipart**） | `POST /v1/images/edits` —— OpenAI 图片编辑形态；`model` 可省（默认 `jimeng-i2i`） |")
     add("| 图片（异步） | `POST /async/v1/images/generations` → `GET /async/v1/images/generations/{task_id}` |")
     add("| 视频（方舟契约） | `POST /api/v3/contents/generations/tasks` → `GET /api/v3/contents/generations/tasks/{task_id}` |")
     add("| 图片 chat | `POST /v1/chat/completions` —— 借 chat 协议出图，产物以 **Markdown 图片**回；🔴 **真生成、真计费**（`stream:true` 回 SSE） |")

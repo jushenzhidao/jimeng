@@ -118,11 +118,22 @@ VIDEO_FIELDS = frozenset({"resolution", "duration", "aspect_ratio",
 KNOWN_UNSUPPORTED_FIELDS = frozenset({
     "watermark", "response_format", "quality", "style", "stream", "user",
     "sequential_image_generation", "max_images",
+    #: OpenAI 图片编辑端点的**局部重绘遮罩**。即梦这条链路没有遮罩重绘
+    #: ⇒ 认得、留痕、不挡人（与 `watermark` 同待遇）。
+    #: ⚠️ `/v1/images/edits` 的 multipart `mask` 在**路由层**另有一份留痕
+    #: —— 它是**文件**，塞不进 JSON body。
+    "mask",
 })
 
 #: 建任务失败后最多重投几次（只对**可重试**错误计数）。
 #: 3 是刻意小的数：重试一个付费动作的成本是非线性的。
 DISPATCH_MAX_ATTEMPTS = 3
+
+#: 上游"**账号级**处罚限流"的 ret 码（`punish_limit_aigenerate`）。
+#: 🔴 它只该罚**那个账号** —— 见 `Service._on_dispatch_error` 的分流：
+#: 命中它时只按凭据静默，**不打全局冷却**（2026-10-14 用户口径：web 端正常、
+#: 账号没被封，却被别人的 1018 拖停了 10 分钟）。
+ACCOUNT_PUNISH_CODE = 1018
 
 
 # ---------------------------------------------------------------------------
@@ -202,9 +213,15 @@ def to_adapter_error(exc: BaseException) -> AdapterError:
             f"{exc}；即梦积分/日额度已耗尽，**重试无效**，需充值或等额度按日重置。",
             upstream="jimeng")
     if isinstance(exc, JimengRiskError):
-        return RiskControlError(
+        err = RiskControlError(
             f"{exc}；命中即梦风控，重试会延长标记，本服务已进入冷却期。",
             upstream="jimeng")
+        #: 🔴 把**上游原始码**带到错误对象上 —— 派发层据此分流冷却作用域
+        #: （`1018 account punish limit` 是**账号级** ⇒ 只静默该凭据；
+        #: 其余风控码维持全局冷却，宁严勿松）。不放进 `detail` 是刻意的：
+        #: 那会连对外错误体一起带上内部枚举。
+        err.upstream_code = exc.code
+        return err
     if isinstance(exc, JimengContentError):
         return ContentPolicyError(str(exc), upstream="jimeng")
     if isinstance(exc, JimengParamError):
@@ -2529,6 +2546,19 @@ class Service:
     def _on_dispatch_error(self, rec: TaskRecord, err: AdapterError) -> None:
         """建任务失败的处理。**分两种**：可重试的回队列，其余判死。"""
         if isinstance(err, RiskControlError):
+            #: 🔴 2026-10-14（用户口径：web 端测着正常、账号没被封 ⇒ 质疑
+            #: "是不是实现有问题"）：**按上游码分流冷却作用域**。
+            #: `1018`（`account punish limit ai generate`）上游自述是**账号级** ——
+            #: 把它当全局冷却的实测后果是"**一个号被罚、所有调用方一起停 10 分钟**"
+            #: （线上 `dispatch_cooling=603/635`、198 条积压；新号明明已经出过
+            #: 82 张图，却被这段全局冷却整片挡住）。账号级的错误只该罚那个账号。
+            #: ⚠️ 其余风控码（`1019/1021/2035/2038/2039`）**维持全局冷却**：
+            #: 它们可能是 IP/设备级的，宁严勿松（2026-10-12 定论不动）。
+            if getattr(err, "upstream_code", None) == ACCOUNT_PUNISH_CODE:
+                self.gate.mark_risk_silent(
+                    min(self.settings.jm_cooldown * 2, 3600.0),
+                    key=rec.upstream_sessionid)
+                return
             self.gate.mark_risk_hit()
             #: 🔴 2026-10-14（线上实测的队首垄断）：**同时按凭据静默**。
             #: 只有全局冷却时，冷却到期后协调器取出的队首恒是"被上游惩罚的
@@ -2642,5 +2672,5 @@ def _default_size() -> str:
 __all__ = [
     "Service", "view", "empty_result_error", "to_adapter_error",
     "credential_id", "new_task_id", "fingerprint_secret", "ACCEPTED_FIELDS",
-    "KNOWN_UNSUPPORTED_FIELDS", "DISPATCH_MAX_ATTEMPTS",
+    "KNOWN_UNSUPPORTED_FIELDS", "DISPATCH_MAX_ATTEMPTS", "ACCOUNT_PUNISH_CODE",
 ]

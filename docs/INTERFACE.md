@@ -12,6 +12,7 @@
 | `POST` | `/async/v1/images/generations` | 🔒 | `202` | 受理，**只回一个 `task_id`** |
 | `GET` | `/async/v1/images/generations/{task_id}` | 🔒 | `202`/`200` | 非终态回排队态；终态回结果 |
 | `POST` | `/v1/images/generations` | 🔒 | `200`/`202`/`503` | **同步**出图：创建+轮询合并（≤300s），见 §0.5 |
+| `POST` | `/v1/images/edits` | 🔒 | `200`/`202`/`400`/`451`/`503` | **图片编辑**（2026-10-14）：OpenAI 的 **multipart** 形态（上传图片文件 + prompt）；`model` 可省，见 §0.7 |
 | `GET` | `/v1/models` | 🔓 | `200` | 能力清单（OpenAI 形态）；**只此一条路径**、**免鉴权** |
 | `POST` | `/v1/chat/completions` | 🔒 | `200`/`400`/`451`/`503` | **图片 chat**（2026-10-14）：借 chat 协议出图，产物以 Markdown 图片回（`stream:true` ⇒ SSE）；🔴 **真生成、真计费**，见 §0.6 |
 | `DELETE` | `/async/v1/images/generations/{task_id}` | 🔒 | `200`/`400` | 删除**已终态**的任务 |
@@ -157,6 +158,30 @@ POST /v1/chat/completions          Authorization: Bearer <key>
   ⇒ **渠道的"测试 / 连通性"按钮打这个端点也会真的花钱**。要零成本探活请用
   `GET /healthz`（见 §0.3 的免鉴权例外）。
 * 无 prompt 的空体 ⇒ `400` 且 `param="prompt"`（**零建任务**，校验发生在受理前）。
+
+### 0.7 图片编辑：`POST /v1/images/edits`（2026-10-14）
+
+OpenAI 的图片编辑端点是 **multipart/form-data**（上传文件，而不是在 JSON 里给 URL）——
+只支持 JSON 的话这类客户端/网关接不上。本端点与 §0.5 **共用同一套**下游与同步语义。
+
+```
+curl -sS http://<host>/v1/images/edits \
+  -H "Authorization: Bearer $JIMENG_API_KEY" \
+  -F 'image=@cat.png' -F 'prompt=把它变成水彩画'
+```
+
+* 字段：`image`（**文件**，多张就重复该字段；字段名 `image[]` 也收）、`prompt`、
+  `model`、`n`、`size`、`seed`、`negative_prompt`、`mask`、`response_format`。
+  上传的字节转 `data:` URI 后就是一张普通输入图 —— 归一化 / 上传 / 计费 /
+  素材预审**一条都不少**（不新增第二条图片入口）；
+* **`model` 可省** ⇒ 默认 `jimeng-i2i`（图生图 + Lite，实测 0 积分），并在
+  `degradations` 留痕。不给默认会撞上"未指定 model 且多个能力可选"的 400，
+  客户端就永远调不通；
+* **`mask`（局部重绘遮罩）忽略 + 留痕**：即梦这条链路没有遮罩重绘，
+  整图按 prompt 重绘。**刻意不静默** —— 否则调用方会以为"只有遮罩区在变"；
+* **`response_format` 忽略 + 留痕**：产物本来就是上游预签名 URL（同 §0.5 的 `data[].url`）；
+* 没带 `image`、或上传的不是图片（按 magic bytes 判）⇒ `400` 且 **零建任务**；
+* 状态码与失败语义与 §0.5 **逐字一致**（451 空图/审核、202 超预算降级、503 无推进者）。
 
 ### 0.2 火山方舟（Ark）契约门面（2026-09-20 起）
 

@@ -90,6 +90,12 @@ class RiskControlError(AdapterError):
     status_code = 429
     err_type = "risk_control_error"
     err_code = "risk_control_challenge"
+
+    #: 上游原始 ret 码（如 `1018`）。**仅供服务内部判定冷却作用域**。
+    #: 🔴 刻意**不做成 `detail`**：对外错误体不带内部枚举（2026-10-12 口径，
+    #: 见 `docs/INTERFACE.md` §6）。派发层要按码分流（账号级 vs IP/设备级），
+    #: 但调用方不需要知道上游的码。
+    upstream_code: int | None = None
     retryable = False
 
 

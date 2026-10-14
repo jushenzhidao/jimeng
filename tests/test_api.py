@@ -447,7 +447,7 @@ def test_models_endpoint_lists_only_verified_capabilities(client):
 #: 返回前等到生成结果），同步语义 ⇒ 同族。
 #: ⚠️ 与"连通性占位"时期不同：它**真的建任务并计费**（见对应用例）。
 _V1_SYNC_ENDPOINTS = frozenset({"/v1/models", "/v1/images/generations",
-                                "/v1/chat/completions"})
+                                "/v1/images/edits", "/v1/chat/completions"})
 
 
 def test_models_endpoint_lives_only_under_v1(client):
@@ -584,6 +584,115 @@ def test_chat_completions_without_a_prompt_is_a_clear_400(sync_client):
     assert r.json()["error"]["param"] == "prompt"
     after = sync_client.get(BASE, headers=AUTH).json()["total"]
     assert after == before, "参数校验失败不该建任务"
+
+
+# ---------------------------------------------------------------------------
+# 兼容面：OpenAI 图片编辑端点 `POST /v1/images/edits`（multipart）
+#
+# 2026-10-14 新增。与 `/v1/images/generations` 共用 `_sync_generate`，
+# 唯一区别是**入参形态**（文件上传 vs JSON 里的 URL）—— 所以这里重点钉
+# "上传字节能不能变成一张正常的输入图"，以及三个端点级口径。
+# ---------------------------------------------------------------------------
+
+EDITS = "/v1/images/edits"
+
+
+def _png_upload(name: str = "in.png") -> tuple[str, bytes, str]:
+    """`(字段名之外的表单形态)` → TestClient 的 files 元素。"""
+    return (name, PNG_BYTES, "image/png")
+
+
+def test_edits_uploads_a_file_and_returns_the_image(sync_client, fake_jimeng):
+    """🔴 上传的字节 → `data:` URI → 复用整条下游；产物照常回 `{status,data,…}`。"""
+    before = sync_client.get(BASE, headers=AUTH).json()["total"]
+    fake_jimeng.states = [ok_state(["https://cdn/edited.png"])]
+
+    r = sync_client.post(EDITS, files=[("image", _png_upload())],
+                         data={"prompt": "把它变成水彩画"}, headers=AUTH)
+
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["status"] == "success"
+    assert [d["url"] for d in body["data"]] == ["https://cdn/edited.png"]
+    after = sync_client.get(BASE, headers=AUTH).json()["total"]
+    assert after == before + 1, "edits 应当真的建了一条任务"
+
+
+def test_edits_accepts_the_image_bracket_field_name(sync_client, fake_jimeng):
+    """`image[]` 这个字段名也认（OpenAI SDK 两种写法都有）。"""
+    fake_jimeng.states = [ok_state(["https://cdn/b.png"])]
+
+    r = sync_client.post(EDITS, files=[("image[]", _png_upload())],
+                         data={"prompt": "x"}, headers=AUTH)
+
+    assert r.status_code == 200, r.text
+
+
+def test_edits_defaults_to_i2i_when_model_is_missing(sync_client, fake_jimeng):
+    """未传 `model` ⇒ 默认 `jimeng-i2i`（图生图），并且**留痕**说明这个默认。
+
+    chat 请求那种"不给默认就撞 400"的坑，在 edits 这里必须堵死。
+    """
+    fake_jimeng.states = [ok_state(["https://cdn/x.png"])]
+
+    r = sync_client.post(EDITS, files=[("image", _png_upload())],
+                         data={"prompt": "补个帽子"}, headers=AUTH)
+
+    assert r.status_code == 200, r.text
+    assert "blend" in fake_jimeng.kinds(), \
+        f"应走图生图（blend），实得 {fake_jimeng.kinds()}"
+    deg = " ".join(r.json().get("degradations") or [])
+    assert "jimeng-i2i" in deg, f"默认档必须留痕，实得 {deg!r}"
+
+
+def test_edits_mask_is_accepted_but_ignored_with_a_note(sync_client, fake_jimeng):
+    """`mask`（局部重绘遮罩）收下但**不生效** —— 必须响亮留痕。
+
+    即梦这条链路没有遮罩重绘。静默忽略会让人以为"只有遮罩区在变"，
+    而那正是**另一个**产品能力。
+    """
+    fake_jimeng.states = [ok_state(["https://cdn/y.png"])]
+
+    r = sync_client.post(EDITS,
+                         files=[("image", _png_upload()),
+                                ("mask", ("m.png", PNG_BYTES, "image/png"))],
+                         data={"prompt": "只改天空"}, headers=AUTH)
+
+    assert r.status_code == 200, r.text
+    deg = " ".join(r.json().get("degradations") or [])
+    assert "mask" in deg and "忽略" in deg, f"mask 必须响亮留痕，实得 {deg!r}"
+
+
+def test_edits_without_any_image_is_a_clear_400(sync_client):
+    """没有输入图 ⇒ 400（`param="image"`），且**零建任务**。"""
+    before = sync_client.get(BASE, headers=AUTH).json()["total"]
+
+    r = sync_client.post(EDITS, data={"prompt": "x"}, headers=AUTH)
+
+    assert r.status_code == 400, r.text
+    assert r.json()["error"]["param"] == "image"
+    after = sync_client.get(BASE, headers=AUTH).json()["total"]
+    assert after == before, "校验失败不该建任务"
+
+
+def test_edits_rejects_a_non_image_upload(sync_client):
+    """上传非图片（按 magic bytes 判）⇒ 400，且**零建任务**。"""
+    before = sync_client.get(BASE, headers=AUTH).json()["total"]
+
+    r = sync_client.post(
+        EDITS,
+        files=[("image", ("a.txt", b"definitely not an image", "text/plain"))],
+        data={"prompt": "x"}, headers=AUTH)
+
+    assert r.status_code == 400, r.text
+    after = sync_client.get(BASE, headers=AUTH).json()["total"]
+    assert after == before
+
+
+def test_edits_requires_a_bearer(client):
+    """门禁口径统一：业务端点一律要 Bearer。"""
+    r = client.post(EDITS, files=[("image", _png_upload())], data={"prompt": "x"})
+    assert r.status_code == 401
 
 
 def test_chat_completions_requires_a_bearer(client):

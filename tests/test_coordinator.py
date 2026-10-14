@@ -566,7 +566,11 @@ def test_quota_exhaustion_silences_only_that_credential(
 def test_risk_error_enters_cooldown_and_fails(client, client_state, fake_jimeng,
                                              service, settings):
     """风控命中 ⇒ 失败 + 进入冷却；冷却期内**不再打上游**（持续施压会延长标记）。"""
-    fake_jimeng.fail_submit = JimengRiskError("punish", code=1018)
+    #: 🔴 用**非账号级**的风控码（`2038 InputTextRisk`）。`1018`
+    #: （`account punish limit`）自 2026-10-14 起**只静默该凭据、不打全局冷却**
+    #: （账号级错误不该罚全站，见 `test_gate_quota_scope.py`），
+    #: 拿它测不出"全局冷却挡住后续派发"这件事。
+    fake_jimeng.fail_submit = JimengRiskError("punish", code=2038)
     tid = _create(client)
     client_state.coordinator.tick()
     assert service.store.get(tid).status == "failure"

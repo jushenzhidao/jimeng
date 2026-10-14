@@ -8,6 +8,10 @@
 但上游 `ret=1006`（"积分不足**或**没有相关权益"）本来就是**账号属性**。
 
 风控（`mark_risk_hit`）**保持全局** —— 它可能是 IP/设备级的，宁严勿松。
+🔴 2026-10-14 的**唯一例外**：`ret=1018`（`punish_limit_aigenerate`，上游自述
+`account punish limit ai generate` = **账号级**）不再打全局冷却，只静默该凭据
+—— 见文件末尾 `test_account_level_punish_*`。依据是线上实测：把账号级的 1018
+也当全局冷却，等于"一个号被罚、所有调用方一起停 10 分钟"。
 
 🔴 2026-10-14 补第二层（`mark_risk_silent`，**按凭据**）：全局冷却单独存在时
 会发生**队首垄断** —— 上游 `ret=1018`（`account punish limit ai generate`，
@@ -202,3 +206,63 @@ def test_risk_silence_repeated_marks_take_the_longer_window(gate, clock):
     assert gate.risk_silent_keys() == {"sess-A"}, "被短窗口提前放出来了"
     clock.t += 200.0                               # t = +1260 > +1200
     assert gate.risk_silent_keys() == set()
+
+
+# ---------------------------------------------------------------------------
+# 🔴 2026-10-14：**按上游码分流冷却作用域**（账号级 1018 vs 其余风控）
+#
+# 线上实测（用户口径"我 web 测试正常，没有被封"）：
+#   · 上游 errmsg = `account punish limit ai generate` ⇒ **账号级**；
+#   · 但实现里所有风控码一律 `mark_risk_hit()`（全局 600s）⇒
+#     `dispatch_cooling=603/635`、198 条积压；某个新号明明已出过 **82 张图**，
+#     却被别人的 1018 整片挡住。账号级的错误只该罚那个账号。
+# 这三条用例把"分流"钉死（否则下次有人"顺手统一一下"就退回去了）。
+# ---------------------------------------------------------------------------
+
+
+def _make_rec(service, sessionid: str):
+    """建一条真任务当 rec —— `_on_dispatch_error` 要读它的 `upstream_sessionid`。"""
+    return service.create({"model": "jimeng-t2i", "prompt": "x"},
+                          credential="cred-" + sessionid, sessionid=sessionid)
+
+
+def test_account_level_punish_only_silences_that_account(service):
+    """`ret=1018`（账号级）⇒ **只静默该凭据**，全局冷却**不动**。
+
+    这样别的账号照常发车 —— 正是用户"新号不该被旧号拖停"的诉求。
+    """
+    from app.service import ACCOUNT_PUNISH_CODE
+
+    rec = _make_rec(service, "sid-punished")
+    err = RiskControlError("上游拒绝", upstream="jimeng")
+    err.upstream_code = ACCOUNT_PUNISH_CODE
+
+    service._on_dispatch_error(rec, err)
+
+    assert service.gate.stats()["cooling_for"] == 0, \
+        "账号级 1018 不该打全局冷却 —— 那会让所有调用方陪跑 10 分钟"
+    assert "sid-punished" in service.gate.risk_silent_keys(), \
+        "该凭据必须被静默，否则冷却到期后它会立刻再撞同一面墙"
+
+
+def test_other_risk_codes_still_cool_the_whole_fleet(service):
+    """其余风控码**维持全局冷却** —— 可能是 IP/设备级的，宁严勿松（2026-10-12 定论）。"""
+    rec = _make_rec(service, "sid-other")
+    err = RiskControlError("上游拒绝", upstream="jimeng")
+    err.upstream_code = 2038          # InputTextRisk：输入级，不是账号级
+
+    service._on_dispatch_error(rec, err)
+
+    assert service.gate.stats()["cooling_for"] > 0, "非账号级风控仍要全局冷却"
+
+
+def test_risk_without_an_upstream_code_falls_back_to_global(service):
+    """拿不到上游码 ⇒ 保守走**全局冷却**。
+
+    缺失信息**不能**被当成"账号级" —— 那会把一次真正的 IP 级风控放成全站裸奔。
+    """
+    rec = _make_rec(service, "sid-nocode")
+
+    service._on_dispatch_error(rec, RiskControlError("上游拒绝", upstream="jimeng"))
+
+    assert service.gate.stats()["cooling_for"] > 0, "无码 ⇒ 保守兜底走全局冷却"

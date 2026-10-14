@@ -10,6 +10,11 @@ uvicorn-worker>=0.3
 httpx>=0.27
 pydantic>=2.7
 
+# `POST /v1/images/edits` 收 **multipart/form-data**（OpenAI 图片编辑端点）——
+# FastAPI 的 `File`/`Form` 参数解析**硬依赖**这个包。不装的话不是"调用时 500"，
+# 而是**装配期**就抛 `RuntimeError: Form data requires "python-multipart"`。
+python-multipart>=0.0.9
+
 # ORM：SQLModel = Pydantic + SQLAlchemy。
 # 表结构就是类型定义，读写共用一份 —— 从前"建表 SQL"与"取行映射"两份定义，
 # 改一处忘另一处就会静默丢字段。

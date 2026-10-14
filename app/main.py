@@ -25,6 +25,7 @@ GET    /v1/models                           模型清单（OpenAI 形态）—�
 """
 from __future__ import annotations
 
+import base64
 import json
 import time
 import uuid
@@ -32,7 +33,7 @@ from contextlib import asynccontextmanager
 from typing import Any, Callable, Iterator
 
 import uvicorn
-from fastapi import Depends, FastAPI, Request
+from fastapi import Depends, FastAPI, File, Form, Request, UploadFile
 from fastapi.responses import (
     HTMLResponse,
     JSONResponse,
@@ -48,6 +49,7 @@ from .ark import ark_task_view as ark_view
 from .ark import translate_ark_create as ark_translate
 from .config import Settings
 from .llms_txt import render as render_llms_txt
+from .media import sniff
 from .coordinator import Coordinator
 from .errors import (
     AdapterError,
@@ -386,9 +388,36 @@ def _extract_chat_inputs(body: dict[str, Any]) -> tuple[str, list[str]]:
     return prompt, images
 
 
+def _upload_to_data_uri(uf: UploadFile, settings: Settings) -> str:
+    """把 multipart 上传的文件读成 `data:<mime>;base64,…`。
+
+    🔴 为什么绕成 data URI、而不是给 `Service` 加一个"直接收字节"的口子：
+    `media.load_one` 本来就认**三种载体**（http(s) URL / data URI / 裸 base64），
+    data URI 正是其中之一 ⇒ 走它等于**零改动复用**整条下游
+    （拉取 / 归一化 / 上传 / 计费 / 素材预审），不新增第二条图片入口。
+
+    ⚠️ 体积卡在**原始字节**上：base64 会膨胀约 1/3，按编码后判会误杀正常图。
+    """
+    data = uf.file.read()
+    if not data:
+        raise InvalidParameterError(
+            f"上传的图片 {uf.filename!r} 是空文件", param="image")
+    if len(data) > settings.max_input_bytes:
+        raise InvalidParameterError(
+            f"上传的图片超过上限 {settings.max_input_bytes} 字节"
+            f"（收到 {len(data)}）", param="image")
+    mime, _ext = sniff(data)
+    if mime == "application/octet-stream":
+        raise InvalidParameterError(
+            f"上传的 {uf.filename!r} 不是可识别的图片格式（按 magic bytes 判定）",
+            param="image")
+    return f"data:{mime};base64," + base64.b64encode(data).decode()
+
+
 def _sync_generate(svc: Service, coordinator: Any, settings: Settings,
                    body: dict[str, Any], *, credential: str,
-                   sessionid: str | None) -> TaskRecord:
+                   sessionid: str | None,
+                   preset_degradations: list[str] | None = None) -> TaskRecord:
     """**同步**跑完一次生成：受理 → 叫醒推进 → 等到终态。返回 `TaskRecord`。
 
     多个门面共用这一个核心（`/v1/images/generations` 同步出图、图片 chat）——
@@ -410,7 +439,8 @@ def _sync_generate(svc: Service, coordinator: Any, settings: Settings,
             "后台协调器未在运行（COORDINATOR_ENABLED=0？）—— 没有任务推进者，"
             "同步等待无法履行。请改用异步端点 POST /async/v1/images/generations，"
             "或开启协调器后重试。")
-    rec = svc.create(body, credential=credential, sessionid=sessionid)
+    rec = svc.create(body, credential=credential, sessionid=sessionid,
+                     preset_degradations=preset_degradations)
     coordinator.wake()
     rec = svc.wait_terminal(rec.task_id, credential,
                             max_wait=settings.sync_max_wait)
@@ -508,6 +538,89 @@ def _install_routes(app: FastAPI) -> None:
             headers["Location"] = f"/async/v1/images/generations/{rec.task_id}"
         return JSONResponse(status_code=status_code, content=payload,
                             headers=headers)
+
+    # ------------------------------------ 兼容面：OpenAI 图片编辑端点（edits）
+    @app.post("/v1/images/edits")
+    def edit_image_sync(
+        request: Request,
+        image: list[UploadFile] = File(default=[]),
+        image_brackets: list[UploadFile] = File(default=[], alias="image[]"),
+        prompt: str | None = Form(None),
+        model: str | None = Form(None),
+        n: int | None = Form(None),
+        size: str | None = Form(None),
+        seed: int | None = Form(None),
+        negative_prompt: str | None = Form(None),
+        response_format: str | None = Form(None),
+        quality: str | None = Form(None),
+        style: str | None = Form(None),
+        user: str | None = Form(None),
+        mask: UploadFile | None = File(None),
+        credential: str = Depends(require_key),
+    ) -> JSONResponse:
+        """OpenAI **图片编辑端点** —— `multipart/form-data` 上传图 + prompt。
+
+        为什么需要它：OpenAI 的图片编辑（`dall-e-2` / `gpt-image-1` 的
+        `POST /v1/images/edits`）是 **multipart** 形态，与我们的 JSON 端点不同；
+        只支持 JSON 的话这类客户端/网关根本接不上。
+
+        🔴 与 `/v1/images/generations` 共用**同一套**下游与同步语义
+        （`_sync_generate`）：上传的字节转 `data:` URI 之后就是一张普通输入图，
+        归一化 / 上传 / 计费 / 素材预审一条都不少。
+
+        三个口径（2026-10-14 用户拍板）：
+          · **未传 `model` ⇒ 默认 `jimeng-i2i`**（图生图 + Lite，实测 0 积分）——
+            端点语义就是"带输入图的编辑"；不给默认的话会撞上"未指定 model
+            且多个能力可选"的 400，客户端永远调不通；
+          · **`mask`（局部重绘遮罩）⇒ 忽略 + 留痕**：即梦这条链路没有遮罩重绘，
+            整图按 prompt 重绘 —— 必须让调用方看见，否则会以为只有遮罩区在变；
+          · **`response_format` ⇒ 忽略 + 留痕**：产物本来就是上游预签名 URL。
+
+        ⚠️ 字段名同时收 `image` 与 `image[]` —— OpenAI SDK 两种写法都存在。
+        """
+        settings: Settings = request.app.state.settings
+        uploads = [f for f in [*image, *image_brackets]
+                   if f is not None and (f.filename or "")]
+        if not uploads:
+            raise InvalidParameterError(
+                "图生图必须带输入图：`image` 字段传文件（多张就重复该字段）。"
+                "文生图请改用 POST /v1/images/generations"
+                "（JSON：`prompt` + 可选的 `image` URL 列表）。", param="image")
+
+        degradations: list[str] = []
+        if mask is not None and (mask.filename or ""):
+            degradations.append(
+                "参数 mask（局部重绘遮罩）本服务不支持：即梦这条链路没有遮罩重绘，"
+                "**已忽略** —— 整图按 prompt 重绘，不要按「只有遮罩区域会变」预期结果。")
+        body: dict[str, Any] = {
+            "image": [_upload_to_data_uri(f, settings) for f in uploads],
+            "prompt": prompt,
+            "model": model,
+            "n": n,
+            "size": size,
+            "seed": seed,
+            "negative_prompt": negative_prompt,
+            "response_format": response_format,
+            "quality": quality,
+            "style": style,
+            "user": user,
+        }
+        if not (model or "").strip():
+            body["model"] = "jimeng-i2i"
+            degradations.append(
+                "未指定 model：edits 端点按「带输入图编辑」语义默认用 `jimeng-i2i`"
+                "（图生图 + Lite，实测 0 积分）。要指定别的能力请显式传 model。")
+
+        rec = _sync_generate(request.app.state.service,
+                             request.app.state.coordinator, settings, body,
+                             credential=credential, sessionid=_bearer(request),
+                             preset_degradations=degradations)
+        status_code, payload = view(rec)
+        headers2: dict[str, str] = {}
+        if status_code == 202:
+            headers2["Location"] = f"/async/v1/images/generations/{rec.task_id}"
+        return JSONResponse(status_code=status_code, content=payload,
+                            headers=headers2)
 
     # ------------------------------------------------------------- 查询
     @app.get("/async/v1/images/generations/{task_id}")
