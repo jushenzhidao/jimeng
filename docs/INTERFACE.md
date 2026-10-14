@@ -13,6 +13,7 @@
 | `GET` | `/async/v1/images/generations/{task_id}` | 🔒 | `202`/`200` | 非终态回排队态；终态回结果 |
 | `POST` | `/v1/images/generations` | 🔒 | `200`/`202`/`503` | **同步**出图：创建+轮询合并（≤300s），见 §0.5 |
 | `GET` | `/v1/models` | 🔓 | `200` | 能力清单（OpenAI 形态）；**只此一条路径**、**免鉴权** |
+| `POST` | `/v1/chat/completions` | 🔒 | `200` | **兼容占位**（2026-10-14）：满足 OpenAI 客户端/网关的连通性探针，**不建任何任务**；正文引导到图片/视频端点 |
 | `DELETE` | `/async/v1/images/generations/{task_id}` | 🔒 | `200`/`400` | 删除**已终态**的任务 |
 | `GET` | `/async/v1/images/generations` | 🔒 | `200` | 本 Key 的任务列表 |
 | `POST` | `/api/v3/contents/generations/tasks` | 🔒 | `200` | **视频唯一入口**：火山方舟契约（创建）。按方舟模型名分流档位；带素材走全能参考 |

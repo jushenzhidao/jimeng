@@ -550,6 +550,58 @@ h2{{color:#7cb0ff}}a{{color:#7cb0ff}}td,th{{border-color:#1e2836}}}}</style></he
         """
         return {"object": "list", "data": models.catalog()}
 
+    # ------------------------------------------- 兼容面：OpenAI 对话端点（占位）
+    @app.post("/v1/chat/completions")
+    async def chat_completions(
+        request: Request,
+        credential: str = Depends(require_key),
+    ) -> JSONResponse:
+        """OpenAI **对话端点**的兼容占位（2026-10-14 用户要求）。
+
+        为什么需要它：OpenAI 风格客户端/网关（new-api 等）把本服务当渠道接入时，
+        默认用 `POST /v1/chat/completions` 做**连通性测试** —— 404 会被判成
+        "渠道不可用"，于是渠道根本加不上（线上日志里这类探针占相当比例）。
+
+        🔴 **刻意不真生图**：探针请求带的是测试 prompt，若这里真触发生成，
+        每点一次"测试"都会建一条**计费任务**。所以本端点**只回一个形状合法的
+        说明**，并把真正出图的端点写进正文 —— 既不误报"不可用"，也不偷偷花钱。
+        出图请用 `POST /v1/images/generations`（同步）或
+        `POST /async/v1/images/generations`（异步）。
+
+        ⚠️ 归属：它是**同步语义**端点（一问一答、立即返回），与 `/v1/models`、
+        `POST /v1/images/generations` 同族 ⇒ 允许挂在 `/v1`；白名单见
+        `tests/test_api.py::_V1_SYNC_ENDPOINTS`。
+        """
+        body: Any = {}
+        try:
+            body = await request.json()
+        except Exception:      # noqa: BLE001 —— 空体/非 JSON 也要应答（探针常发空体）
+            body = {}
+        model = str((body or {}).get("model") or "jimeng-service")
+        text = (
+            "本服务是**即梦图片/视频生成出口**，不提供对话能力 —— "
+            "此响应仅用于满足 OpenAI 客户端的连通性探针，**未产生任何生成任务**。\n\n"
+            "出图请用：\n"
+            "· 同步 POST /v1/images/generations"
+            "  {\"model\":\"jimeng-t2i\",\"prompt\":\"一只橘猫\"}\n"
+            "· 异步 POST /async/v1/images/generations"
+            " → GET /async/v1/images/generations/{task_id}\n"
+            "· 视频（方舟契约）POST /api/v3/contents/generations/tasks\n"
+            "能力/计费清单：GET /v1/models · /llms.txt"
+        )
+        return JSONResponse(status_code=200, content={
+            "id": f"chatcmpl-jimeng-{uuid.uuid4().hex[:24]}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": text},
+                "finish_reason": "stop",
+            }],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        })
+
     # ------------------------------------------------------------- 运维
     @app.get("/healthz")
     async def healthz() -> dict:

@@ -433,7 +433,11 @@ def test_models_endpoint_lists_only_verified_capabilities(client):
 #: 2026-09-23 从 `{"/v1/models"}` 扩到当前集合：新增了**同步生成**端点
 #: （创建+轮询合并），它同样属于"同步、无 `202 + task_id` 轮询语义"的正牌成员。
 #: **异步**族（受理/查询/删除）必须留在 `/async/v1`（护栏拦的是"异步语义挂 /v1"）。
-_V1_SYNC_ENDPOINTS = frozenset({"/v1/models", "/v1/images/generations"})
+#: 🔴 `/v1` 下的白名单 —— 只放**同步语义**端点（一问一答/立即返回）。
+#: 2026-10-14 新增 `/v1/chat/completions`：它是 OpenAI 客户端的**连通性探针**
+#: 端点，同步语义 ⇒ 同族。注意它**不建任何任务**（见对应用例）。
+_V1_SYNC_ENDPOINTS = frozenset({"/v1/models", "/v1/images/generations",
+                                "/v1/chat/completions"})
 
 
 def test_models_endpoint_lives_only_under_v1(client):
@@ -468,6 +472,43 @@ def test_models_endpoint_lives_only_under_v1(client):
     leaked = {p for p in paths if p.startswith("/v1/")} - _V1_SYNC_ENDPOINTS
     assert not leaked, \
         f"/v1 下只允许同步语义端点（白名单）：{sorted(leaked)}"
+
+
+def test_chat_completions_is_probe_compatible_and_never_builds_a_task(
+        client, client_state):
+    """🔴 2026-10-14（用户要求）：`POST /v1/chat/completions` 不再 404。
+
+    OpenAI 风格客户端/网关（new-api 等）把本服务当渠道接入时，默认拿它做
+    **连通性测试**；404 会被判成"渠道不可用"，于是渠道加不上。
+
+    同时钉住另一头：**绝不建任务**。探针带的是测试 prompt，若这里触发生成，
+    每点一次"测试"都会产生一条**计费任务**。
+    """
+    before = client.get(BASE, headers=AUTH).json()["total"]
+    r = client.post("/v1/chat/completions",
+                    json={"model": "jimeng-t2i",
+                          "messages": [{"role": "user", "content": "ping"}]},
+                    headers=AUTH)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["object"] == "chat.completion"
+    assert body["choices"][0]["message"]["role"] == "assistant"
+    assert "images/generations" in body["choices"][0]["message"]["content"], \
+        "要把调用方引到真正出图的端点"
+    after = client.get(BASE, headers=AUTH).json()["total"]
+    assert after == before, "探针**绝不能**建任务 —— 否则每次连通性测试都花钱"
+
+
+def test_chat_completions_tolerates_an_empty_body(client):
+    """探针常发空体/非 JSON ⇒ 不能因此 500。"""
+    r = client.post("/v1/chat/completions", content=b"", headers=AUTH)
+    assert r.status_code == 200, r.text
+
+
+def test_chat_completions_requires_a_bearer(client):
+    """门禁口径统一：业务端点一律要 Bearer。"""
+    r = client.post("/v1/chat/completions", json={"messages": []})
+    assert r.status_code == 401
 
 
 #: FastAPI 自带的接口文档路由 —— 它们**不是**本服务的业务端点，

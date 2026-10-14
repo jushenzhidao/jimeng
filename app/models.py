@@ -906,6 +906,30 @@ def resolve(model: str | None, *, has_image: bool,
             _LAST_FALLBACK[raw] = eff or cands[0].api_id
         return cands[0], eff
 
+    #: 🔴 2026-10-14（用户口径："没登记的回退到模型 5.0 lite"）：
+    #: 调用方**写了名字**但我们**没登记**（占位名）时，带输入图也**不再 400**，
+    #: 改为回退到「i2i + 默认 Lite」并**留痕**。
+    #:
+    #: 为什么与"没写 model"分叉：`raw` 为空 = 真没写 ⇒ 有图时确实无法确定用哪个
+    #: （5 个能力计费不同）⇒ 保持 400 是对的；而 `raw` 非空 = 调用方**给了意图**，
+    #: "我们不认识这个名字"是**我们登记表不全**，把它当"没写 model"处理会报出
+    #: 一条与意图无关的错（现场：传 `doubao-seedream-4-5-251128`，却被告知
+    #: "未指定 model"）。
+    #:
+    #: 能力取 `i2i`（图生图）：它是"Lite 模型 + 输入图"的自然落点，**实扣 0**；
+    #: 与已登记别名的带图路径（`cap = _BY_NAME["i2i"] if has_image ...`）**同一条**。
+    #: ⚠️ 只对**图片族**生效 —— 视频族的占位名有自己的分流（`doubao-seedance-*`
+    #: 在 `Service.create` 里按前缀处理，不走这里）。
+    #: ⚠️ 这**不是**"静默换档"：占位名兜底一律 `_LAST_FALLBACK` 留痕（见上方
+    #: `take_fallback_note`），调用方在响应里看得到"你写的名字我没登记，用了什么"。
+    if raw and has_image and not video:
+        cap = _BY_NAME["i2i"]
+        _check_shape(cap, raw=raw, has_image=True, n_images=n_images,
+                     upstream_model=DEFAULT_UPSTREAM_MODEL)
+        if _LAST_FALLBACK:
+            _LAST_FALLBACK[raw] = f"{cap.api_id} + {DEFAULT_UPSTREAM_MODEL}"
+        return cap, DEFAULT_UPSTREAM_MODEL
+
     kind = "带输入图" if has_image else "无输入图"
     if not cands:
         raise InvalidParameterError(
