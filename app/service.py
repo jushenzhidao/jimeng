@@ -2149,7 +2149,7 @@ class Service:
         # → 点 Upscale → 监听 normal_hd 请求）。实测（2026-10-16）闭环成立：
         # 2k 产物 → 4096² 交付、cost=28 credits。返回 bridge handle 前缀，
         # 轮询复用 `_poll_bridge_one`（done 换真 sid → `_advance` 进 settle）。
-        if self._sg_bridge_mode(rec.upstream_model):
+        if self._dispatch_via_bridge():
             return self._submit_upscale_via_bridge(rec)
         opts = self.cfg.count_options(DEFAULT_MODEL) if self.cfg else None
         try:
@@ -2878,11 +2878,25 @@ class Service:
                  "16:9": 16 / 9, "2:3": 2 / 3, "3:2": 1.5, "21:9": 21 / 9}
         return min(cands, key=lambda k: abs(math.log(target / cands[k])))
 
+    def _dispatch_via_bridge(self) -> bool:
+        """派发期判定：**凭据站点=sg** ⇒ 生成腿/超分腿走 bridge。
+
+        🔴 2026-10-16 口径放宽："seedream 图片模型全部走 [SG UI]，请求 4k
+        走一次超分" —— 判定从「SG 专属模型」放宽为**凭据站点**：SG 专属
+        模型 + Seedream 双站（凭据归属 sg 时）都走；**国内凭据一律直出**。
+        此判定在 `_submit` 内调用（此刻 `self.client` 已是 `_push_cred`
+        换入的、站点已探明的客户端）。
+        """
+        if not self.settings.sg_bridge_url:
+            return False
+        prof = getattr(self.client, "profile", None)
+        return prof is not None and getattr(prof, "name", "") == "sg"
+
     def _use_sg_bridge(self, rec: TaskRecord, cap: models.Capability) -> bool:
-        """该任务是否走 sg-bridge 提交（国际站专属模型 + 已配置 bridge）。"""
+        """该任务是否走 sg-bridge 提交（生成腿）。"""
         if cap.name != "t2i":
             return False
-        return self._sg_bridge_mode(rec.upstream_model)
+        return self._dispatch_via_bridge()
 
     def _sg_bridge_mode(self, upstream_model: str | None) -> bool:
         """受理/派发共用的 bridge 模式判定（配置 + SG 专属模型）。"""
