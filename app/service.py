@@ -694,7 +694,11 @@ class Service:
             #: 🔴 2026-10-09（负缓存"看起来没生效"排查）：把计数暴露进 `/stats`。
             #: `records` 涨 = 审核拒绝真的写进来了；`hits` 涨 = 受理时真的拦住了。
             #: 这两个数之前**没有任何对外出口** ⇒ "有没有生效"只能靠猜。
-            "neg": self.neg.stats(),
+            "neg": {**self.neg.stats(),
+                    #: 🔴 2026-10-15：命中后的动作（`fail` = 受理不拒但立即终态失败、
+                    #: 不提交上游 ⇒ 零计费；`warn` = 只留痕、照常提交）。
+                    #: `hits` 涨 = 又有请求撞上"注定失败"的输入。
+                    "action": self.settings.neg_cache_action},
             #: prompt 前置决策预审（Jev）：blocks/errors/cache_hits 一眼看闸门状态。
             "prompt_guard": self.guard.stats(),
             #: 🔴 2026-10-15："减少无效重试"的效果出口。`hits` 涨 = 调用方在重投、
@@ -1212,10 +1216,13 @@ class Service:
                     f"要自由控制张数请换一个声明了多个取值的模型。")
 
         # 🔴 2026-10-02：内容审核负缓存 —— **受理时先查**。
-        # 位置很关键：必须在**所有**参数校验（model/size/n/image）**之后**、
-        # 落库**之前** ⇒ ① 参数错误仍然报得更准（不掩盖真因）、
-        # ② 命中时**不建任务**⇒ 不落库、不调上游、**不花钱**。
-        self.neg.raise_if_blocked(
+        # 🔴 2026-10-15 改口径（用户："按道理是不拒绝客户请求的" +
+        # "4xx 的失败立即返回"）：命中**不再拒绝请求** —— 只把原因记下来、照常受理，
+        # 落库后立刻把这条任务**受理即终态**判成那个 4xx 失败
+        # （**不提交上游 = 不花钱**，但**立即**给结果，见下方 `neg_err` 的处理）。
+        # 位置照旧在**所有**参数校验（model/size/n/image）**之后**：参数错误仍报得
+        # 更准（不掩盖真因），而且命中的"原因"要挂到随后建的那条任务上。
+        neg_err = self.neg.hit_error(
             cap_id=cap.key or cap.api_id,
             upstream_model=upstream_model,
             prompt=prompt,
@@ -1229,13 +1236,24 @@ class Service:
         # 与图无关 ⇒ 补查**纯 prompt 键**（`images=[]`）。该键**只在**
         # `_advance` 判定"文字违规"时才写入 ⇒ 图类拒绝（版权/素材）不受影响，
         # "换图重试"照常放行（不错杀）。对 t2i（无图）这是同键重复查询，无害。
-        self.neg.raise_if_blocked(
-            cap_id=cap.key or cap.api_id,
-            upstream_model=upstream_model,
-            prompt=prompt,
-            images=[],
-            resolution_tier=tier,
-        )
+        if neg_err is None:
+            # 第二查（第一查命中就不必再查，也不多记一次 miss）：
+            neg_err = self.neg.hit_error(
+                cap_id=cap.key or cap.api_id,
+                upstream_model=upstream_model,
+                prompt=prompt,
+                images=[],
+                resolution_tier=tier,
+            )
+        if neg_err is not None:
+            _m = self.neg.ttl_minutes()
+            degradations.append(
+                f"⚠️ **负缓存命中**（{_m} 分钟前同样的输入被上游内容审核拒绝过；"
+                f"TTL {_m} 分钟、**不是永久封禁**）。"
+                + ("本次**未提交上游**（未计费），任务立即判为审核失败；"
+                   "换个 prompt 或换素材即可正常受理。"
+                   if self.settings.neg_cache_action == "fail" else
+                   "本次按调用方口径**照常提交上游**（会重新计费）。"))
 
         # 🔴 2026-10-09（用户口径三条）：**prompt 前置决策预审**——
         # ① 决策模型判定"是否放行提示词进入下一步"：违规 ⇒ 本地拦
@@ -1311,6 +1329,21 @@ class Service:
                     return prev
             self.store.put(rec)
 
+        # 🔴 2026-10-15：负缓存命中 ⇒ **受理即终态失败**（与 `jimeng-audit` 同一种
+        # "受理即终态"形态 —— 判定不需要在途态）。**受理层不拒**（调用方照常拿到
+        # `task_id`），但那个 4xx 失败**立即**可见：同步端点毫秒级回 451，
+        # 而不是排队等到预算耗尽再降级成 202（用户实测的正是那种等待）。
+        # `_fail` 只落库、不发上游 ⇒ **零计费**；这里也**不重写**负缓存
+        #（命中本身就是"已记录"的证据）。
+        if neg_err is not None and self.settings.neg_cache_action == "fail":
+            OBS.warning("negcache hit, not submitted", task_id=rec.task_id,
+                        model=rec.model, capability=rec.cap_key,
+                        upstream_model=rec.upstream_model, n=rec.n)
+            # ⚠️ 返回**落库后**的记录：`_fail` 写的是库，内存里的 `rec` 还是
+            # `queued`（2026-10-15 踩过 —— 那样调用方会拿到一条自称"排队中"、
+            # 实际已经失败的任务）。
+            return self._fail(rec, neg_err) or rec
+
         # 🔴 2026-10-02：`jimeng-audit`（素材预审）**在受理时同步完成**。
         # 为什么不用"建任务→派发→轮询"那条通用路：预审本身是**同步接口**
         # （`execute_generate_audit` 一次调用即出判定），没有"在途态"可言；
@@ -1319,6 +1352,9 @@ class Service:
         #   落库后立刻 patch 成 success/failure，不进协调器队列。
         if cap.name == "audit":
             self._run_audit(rec)
+            # 同上：`_run_audit` 只写库 ⇒ 把**落库后**的状态回给调用方
+            #（同为"受理即终态"的能力，别让 `create` 的返回值骗人）。
+            rec = self.store.get(rec.task_id) or rec
 
         OBS.info("task accepted",
                  task_id=rec.task_id, model=rec.model, capability=rec.cap_key,
@@ -2710,15 +2746,24 @@ class Service:
         self._fail(rec, err, attempts=attempts)
 
     def _fail(self, rec: TaskRecord, err: AdapterError,
-              *, attempts: int | None = None) -> None:
+              *, attempts: int | None = None) -> TaskRecord | None:
+        """把任务判失败（写库），并**返回落库后的那条记录**。
+
+        🔴 2026-10-15（写"受理即终态"时踩到）：原实现只 `store.patch`、**不动**
+        传进来的 `rec` —— 于是"受理即终态"的路径（负缓存命中 / `_run_audit`）
+        会把一个**自称 `queued`、库里已是 `failure`**的记录返回给调用方。
+        返回值以前没人用（10 处调用点全忽略），所以加返回值是兼容的；
+        新代码**必须**用返回值，别再用那个陈旧对象。
+        """
         now = int(time.time())
-        self.store.patch(
+        out = self.store.patch(
             rec.task_id, status="failure", error=err.to_error()["error"],
             finished_at=now, attempts=attempts if attempts is not None
             else rec.attempts)
         OBS.error("task failed", task_id=rec.task_id, model=rec.model,
                   err_type=err.err_type, err_code=err.err_code,
                   message=err.message)
+        return out
 
     @staticmethod
     def _terminal_error(st: Any) -> AdapterError:

@@ -107,9 +107,13 @@ def test_repeat_of_rejected_input_is_blocked():
     assert hit, "同样的输入第二次必须命中"
     assert "text_violates_community" in hit
 
-    with pytest.raises(ContentPolicyError) as e:
-        neg.raise_if_blocked(**_kw())
-    assert "不是永久封禁" in e.value.message, (
+    # 2026-10-15 改口径：`hit_error` **只构造**错误（**不抛**）—— 受理路径不再
+    # 拒绝请求，由 `Service.create` 把任务受理即终态判成这个失败
+    #（见 `test_negcache_accept_does_not_reject_but_fails_immediately`）。
+    err = neg.hit_error(**_kw())
+    assert err is not None, "命中必须能拿到那个 4xx 失败（否则受理侧无从判）"
+    assert isinstance(err, ContentPolicyError), err
+    assert "不是永久封禁" in err.message, (
         "必须说清这是 TTL 缓存而非永久封禁，否则调用方不敢再试")
 
 
@@ -208,9 +212,17 @@ def test_only_content_policy_is_recorded():
 
 
 def test_lookup_happens_before_the_task_row_is_created():
-    """🔴 命中时**不建任务**（不落库、不调上游、不花钱）⇒ 查询点必须早于落库。"""
+    """🔴 负缓存查询必须早于建任务行。
+
+    ⚠️ **2026-10-15 口径变了**：命中**不再"不建任务"**（受理层不拒客户请求 ——
+    用户：「按道理是不拒绝客户请求的」+「4xx 的失败立即返回」），而是把那条任务
+    **受理即终态**判成 4xx 失败。这条门禁因此改钉**位置**：查询要先跑，
+    命中的原因才能挂到随后建的那条任务上。
+    "零提交、零计费"改由行为门禁
+    `test_negcache_accept_does_not_reject_but_fails_immediately` 负责。
+    """
     src = inspect.getsource(Service.create)
-    i_query = src.index("raise_if_blocked")
+    i_query = src.index("self.neg.hit_error(")
     i_row = src.index("rec = TaskRecord(")
     assert i_query < i_row, "负缓存查询必须早于建任务行"
 
@@ -299,7 +311,7 @@ def test_prompt_only_lookup_is_wired_into_create_and_advance():
     """接线门禁：受理处**两连查**（精确键 + 纯 prompt 键）、
     `_advance` 按 `is_text_policy_failure` 分流（字符串/数值两形态）。"""
     src_create = inspect.getsource(Service.create)
-    assert src_create.count("raise_if_blocked") >= 2, (
+    assert src_create.count("self.neg.hit_error(") >= 2, (
         "受理处必须补查纯 prompt 键（第二查 images=[]）")
     src_advance = inspect.getsource(Service._advance)
     assert "is_text_policy_failure" in src_advance, (
@@ -372,3 +384,66 @@ def test_default_ttl_is_24h_and_stays_configurable():
             "NEG_CACHE_TTL 必须能覆盖默认值"
     finally:
         del os.environ["NEG_CACHE_TTL"]
+
+
+# ---------------------------------------------------------------------------
+# ⑤ 受理口径：**不拒绝客户请求** + **4xx 的失败立即返回**（2026-10-15）
+# ---------------------------------------------------------------------------
+
+def _seed_cache_from(service, rec, *, reason="web_text_violates_community"):
+    """用**第一条真实任务解析出来的**字段写缓存。
+
+    不靠猜 `resolution_tier` / `upstream_model` —— 猜错就等于"缓存没命中"，
+    用例会退化成一条**永远绿**的假门禁（本仓最忌讳）。
+    """
+    service.neg.record_failure(cap_id=rec.cap_key, upstream_model=rec.upstream_model,
+                               prompt=rec.prompt, images=[],
+                               resolution_tier=rec.resolution_tier, reason=reason)
+
+
+def test_negcache_accept_does_not_reject_but_fails_immediately(service,
+                                                               fake_jimeng):
+    """🔴 命中负缓存 ⇒ **受理不拒**，但那条 4xx 失败**立即**可见。
+
+    用户口径（2026-10-15）：「按道理是不拒绝客户请求的」+「4xx 的失败立即返回」。
+
+    三件事一起钉：
+      · 调用方**拿到一条任务**（不再在受理口被 451 挡掉）；
+      · 该任务**立刻**就是终态失败、错误类型是内容审核
+        ⇒ 同步端点毫秒级回 451（**不排队、不等预算、不降级 202**）；
+      · **一个字节都不打上游**（`upstream_submit_id` 为空 ⇒ **零计费**）。
+    """
+    body = {"model": "jimeng-t2i", "prompt": "同一句违规话"}
+    first = service.create(body, credential="cred-neg-1", sessionid="sid-1")
+    _seed_cache_from(service, first)
+
+    calls_before = len(fake_jimeng.calls)
+    # ⚠️ 换凭据：受理去重按凭据算，同凭据 + 同请求会被（正确地）收敛到第一条
+    rec = service.create(body, credential="cred-neg-2", sessionid="sid-2")
+
+    assert rec.task_id != first.task_id, "必须是**新**任务（受理不拒）"
+    assert rec.terminal, "命中后必须**立即**是终态（别让调用方等）"
+    assert rec.status == "failure", rec.status
+    assert (rec.error or {}).get("type") == "content_policy_violation", rec.error
+    assert rec.upstream_submit_id is None, "命中绝不能再提交上游（那是付钱动作）"
+    assert len(fake_jimeng.calls) == calls_before, "零上游往返"
+    assert any("负缓存命中" in d for d in rec.degradations), rec.degradations
+    assert service.neg.hits >= 1, "命中计数要能看见（/stats 的 neg.hits）"
+
+
+def test_neg_cache_action_warn_still_submits(service, fake_jimeng, monkeypatch):
+    """`NEG_CACHE_ACTION=warn` ⇒ 只留痕、**照常提交**（彻底不拦，但会重新付费）。
+
+    默认是 `fail`（受理不拒 + 立即终态失败、不提交）—— 省钱的保护留着；
+    `warn` 是"绝不拦"的彻底档，留给"宁可多花钱也要真跑一次"的场合。
+    """
+    body = {"model": "jimeng-t2i", "prompt": "另一句违规话"}
+    first = service.create(body, credential="cred-warn-1", sessionid="sid-w1")
+    _seed_cache_from(service, first)
+
+    monkeypatch.setattr(service.settings, "neg_cache_action", "warn")
+    rec = service.create(body, credential="cred-warn-2", sessionid="sid-w2")
+
+    assert rec.status == "queued", "warn 档照常受理、照常排队（会重新付费）"
+    assert not rec.terminal, "warn 档不得终态失败"
+    assert any("负缓存命中" in d for d in rec.degradations), rec.degradations

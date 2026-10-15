@@ -179,6 +179,14 @@ class Settings:
     neg_cache_ttl: float = 86400.0
     #: 有界 LRU 条数（无界缓存 = 内存泄漏）。
     neg_cache_max: int = 2048
+    #: 🔴 2026-10-15 用户口径「**按道理是不拒绝客户请求的**」+「**4xx 的失败立即返回**」：
+    #: 命中负缓存时**受理层不再拒绝**（不再在受理口抛 451），而是把那条任务
+    #: **受理即终态**判成同一个 4xx 失败：
+    #:   · `fail`（默认）：**不提交上游**（`upstream_submit_id` 为空 ⇒ 零计费），
+    #:     但失败**立即**可见 —— 同步端点毫秒级回 451，不再排队/等预算/降级 202；
+    #:   · `warn`：只在 `degradations` 留痕、**照常提交上游**
+    #:     —— 彻底不拦，但会**重新为注定失败的请求付费**（调用方明确要"照常提交"时才用）。
+    neg_cache_action: str = "fail"
 
     # ------------------------------------------------ prompt 决策预审（Jev）
     #: 🔴 2026-10-09：prompt **前置**内容审查闸（Jev 决策模型，见
@@ -323,6 +331,7 @@ class Settings:
             sync_max_wait=_f("SYNC_MAX_WAIT", 300.0),
             neg_cache_ttl=_f("NEG_CACHE_TTL", 86400.0),
             neg_cache_max=int(_f("NEG_CACHE_MAX", 2048)),
+            neg_cache_action=_s("NEG_CACHE_ACTION", "fail").strip().lower(),
             guard_enabled=_b("PROMPT_GUARD_ENABLED", True),
             jev_base_url=_s("JEV_BASE_URL", "https://jev.bocha.cn/v1"),
             jev_api_key=_s("JEV_API_KEY"),
@@ -360,6 +369,10 @@ class Settings:
             raise ConfigError("TASK_TIMEOUT 必须 > 0")
         if self.max_queued_per_credential < 0:
             raise ConfigError("MAX_QUEUED_PER_CREDENTIAL 必须 >= 0（0 = 不限）")
+        if self.neg_cache_action not in ("fail", "warn"):
+            raise ConfigError("NEG_CACHE_ACTION 只能是 fail / warn"
+                              "（fail = 受理不拒但立即终态失败、不提交；"
+                              "warn = 只留痕、照常提交）")
         if self.accept_dedupe_window_s < 0:
             raise ConfigError(
                 "ACCEPT_DEDUPE_WINDOW_S 必须 >= 0（0 = 只看非终态）")

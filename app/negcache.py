@@ -35,10 +35,20 @@
   这是**有意的取舍**（不引外部依赖）；代价是**命中率打折**，
   但不会错杀 ⇒ 安全方向。
 
-## 命中后的行为
+## 命中后的行为（2026-10-15 改口径）
 
-**不受理、不建任务**，直接抛 `ContentPolicyError`（400，不可重试）
-并带上"因为 N 分钟前同样的输入被拒过"的留痕。
+🔴 用户口径：「**按道理是不拒绝客户请求的**」+「**4xx 的失败立即返回**」。
+
+⇒ **受理路径不再拒绝请求**：命中不再抛 451，而是由 `Service.create` 把任务
+**受理即终态**判成那个 4xx 失败（`ContentPolicyError`）：
+
+· **不提交上游**（`upstream_submit_id` 为空 ⇒ **零计费**）—— 省钱的保护照旧；
+· 但**任务照建**（受理层永远不拒）⇒ 异步端点正常 `202 + task_id`，
+  查询时立刻看到终态失败；
+· 同步端点**立即**拿到 `451`（不再排队、不等 `SYNC_MAX_WAIT`、不降级 `202`）——
+  「4xx 的失败立即返回」。
+
+`hit_error()` 只**构造**那个错误（不抛）；调用方决定挂到哪条任务上。
 ⚠️ 错误文案必须说清是**缓存命中**、**首次仍要真跑** ——
 否则调用方会以为"这个 prompt 永久被禁了"。
 """
@@ -155,13 +165,24 @@ class NegativeCache:
         return {"entries": live, "ttl_s": self._ttl, "max": self._max,
                 "hits": self.hits, "misses": self.misses, "records": self.records}
 
-    def raise_if_blocked(self, **kw: Any) -> None:
-        """受理路径用：命中即抛 `ContentPolicyError`（**不建任务、不花钱**）。"""
+    def ttl_minutes(self) -> int:
+        """TTL 的分钟数（下限 1）—— 对外留痕与错误文案共用同一处计算。"""
+        return max(1, int(self._ttl // 60))
+
+    def hit_error(self, **kw: Any) -> ContentPolicyError | None:
+        """命中则**构造**那个 4xx 失败（`ContentPolicyError`），**不抛**。
+
+        🔴 2026-10-15 用户口径：「按道理是不拒绝客户请求的」+「4xx 的失败立即返回」。
+        受理路径**不再用它拒绝请求** —— 由 `Service.create` 把任务受理即终态判成
+        这个失败（**不提交上游 = 不花钱**），于是：
+          · 异步端点永远正常受理（`202 + task_id`），查询时立刻看到终态失败；
+          · 同步端点**立即**拿到 `451`（不排队、不等预算、不降级 202）。
+        """
         reason = self.would_block(**kw)
         if not reason:
-            return
-        minutes = max(1, int(self._ttl // 60))
-        raise ContentPolicyError(
+            return None
+        minutes = self.ttl_minutes()
+        return ContentPolicyError(
             f"**同样的输入在 {minutes} 分钟前被上游内容审核拒绝过**"
             f"（{reason}）⇒ 本次**不再提交上游**。"
             f"原样重试必然再被拒，且每次都会计费 —— 请**改prompt 或换输入图**。"
