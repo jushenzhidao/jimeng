@@ -1237,6 +1237,11 @@ class Service:
                 bool(self.settings.sg_bridge_url)
                 and models.model_sites(upstream_model or DEFAULT_MODEL)
                 == frozenset({"sg"}))
+            if _sg_bridge_mode and _req_tier == "1k":
+                # 🔴 2026-10-16 口径"1-2k 定向到2k即可"：SG 专属模型 1k
+                # 请求按 2k 交付（bridge 生成腿恒 2k 直出）。
+                degradations.append(
+                    "国际站按 **2k** 交付（1k 请求定向 2k，bridge 直出）。")
             _pin = (None if _sg_bridge_mode else
                     models.pinned_resolution_tier(
                         upstream_model or DEFAULT_MODEL))
@@ -2914,15 +2919,14 @@ class Service:
         bridge 路径按请求档 UI 直出（超分腿的 UI 自动化未做）。
         """
         import httpx as _httpx  # noqa: PLC0415 —— 局部引入避免模块级依赖
-        from .upstream.jimeng.client import (  # noqa: PLC0415
-            resolution_type_for_size)
         model = rec.upstream_model or ""
         display = models.UPSTREAM_WEB_NAMES.get(model, model)
         w, h = (int(x) for x in (rec.size or "2048x2048").split("x"))
-        tier = resolution_type_for_size(w, h) if w and h else "2k"
+        # 🔴 bridge 生成腿**恒 2k 直出**（2026-10-16 口径"1-2k 定向到2k
+        # 即可"）：1k/2k 请求都按 2k 交付（1k 档 UI 自动化的坑就此绕开）；
+        # 4k 请求已由改道块把生成腿定为 2k，交付 4096 由超分链补。
         body = {"prompt": rec.prompt, "model": display,
-                "resolution": {"1k": "1k", "2k": "2k", "4k": "4k"}.get(
-                    tier or "2k", "2k"),
+                "resolution": "2k",
                 "ratio": self._nearest_ui_ratio(w, h)}
         r = _httpx.post(f"{self.settings.sg_bridge_url}/generate-ui-async",
                         json=body, timeout=30.0, trust_env=False)
