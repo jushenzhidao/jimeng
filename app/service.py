@@ -1218,7 +1218,28 @@ class Service:
             # 无论请求什么档（含 `-4k` 后缀）都直接落 1k，不会进"4k 改道 /
             # 直出 4k"两条路径。尺寸吸附到 1k 槽（能力表精确像素优先），
             # 留痕落库（响应默认不展示，见 `Settings.show_degradations`）。
-            _pin = models.pinned_resolution_tier(upstream_model or DEFAULT_MODEL)
+            # 🔴 SG 专属模型的 4k 请求**不受理**（2026-10-15 用户口径
+            # "4k 请求 不受理 都走超分"）：实测 UI 4K 档收 50 credits 却交付
+            # 2048²（上游对 GPT Image/Nano Banana 系无 4k 直出）——按 4k 收费
+            # 交 2k 图是资损/投诉源，拒绝优于静默降级。4k 交付等超分链（
+            # normal_hd 腿）在国际站开放后再放开为「2k 生成 + 超分」。
+            if (_req_tier == "4k"
+                    and models.model_sites(
+                        upstream_model or DEFAULT_MODEL)
+                    == frozenset({"sg"})):
+                raise InvalidParameterError(
+                    "该模型不支持 4k 直出（上游实测 4K 档仅交付 2048²）。"
+                    "请请求 2k；4k 交付能力（生成+超分）暂未开放。")
+            # 🔴 bridge 模式（SG_BRIDGE_URL 已配置）不走 pin/超分链 —— UI 按
+            # 请求档直出（2k=2048²），留痕如实说明；pin/超分链是直出路径的
+            # 机制（tests/test_site.py 的 pin 用例在无 bridge 配置下仍生效）。
+            _sg_bridge_mode = (
+                bool(self.settings.sg_bridge_url)
+                and models.model_sites(upstream_model or DEFAULT_MODEL)
+                == frozenset({"sg"}))
+            _pin = (None if _sg_bridge_mode else
+                    models.pinned_resolution_tier(
+                        upstream_model or DEFAULT_MODEL))
             if _pin and _req_tier != _pin:
                 _req_orig = _req_tier     # 用户**请求**的档（2k/4k），改写前留档
                 size, _pin_note = self._pinned_size(
@@ -2839,12 +2860,16 @@ class Service:
 
     def _use_sg_bridge(self, rec: TaskRecord, cap: models.Capability) -> bool:
         """该任务是否走 sg-bridge 提交（国际站专属模型 + 已配置 bridge）。"""
-        if not self.settings.sg_bridge_url:
-            return False
         if cap.name != "t2i":
             return False
-        key = rec.upstream_model or ""
-        return models.model_sites(key) == frozenset({"sg"})
+        return self._sg_bridge_mode(rec.upstream_model)
+
+    def _sg_bridge_mode(self, upstream_model: str | None) -> bool:
+        """受理/派发共用的 bridge 模式判定（配置 + SG 专属模型）。"""
+        if not self.settings.sg_bridge_url:
+            return False
+        return (models.model_sites(upstream_model or DEFAULT_MODEL)
+                == frozenset({"sg"}))
 
     def _submit_via_bridge(self, rec: TaskRecord) -> str:
         """经 sg-bridge 的 **UI 驱动**提交（异步 handle，毫秒级返回）。

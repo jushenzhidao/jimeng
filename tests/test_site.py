@@ -495,15 +495,20 @@ def test_gpt_image_2k_plans_one_upscale_level(settings, store, fake_jimeng,
     assert "恒 1k 生成" in joined and "1 级超清" in joined
 
 
-def test_gpt_image_4k_plans_two_upscale_levels(settings, store, fake_jimeng,
-                                               fake_uploader, fake_vod):
-    """🔴 flare 请求 4k ⇒ 1k 生成 + **2 级**超分链（1k→2k→4k）。
+def test_gpt_image_4k_is_rejected_at_accept(settings, store, fake_jimeng,
+                                            fake_uploader, fake_vod):
+    """🔴 SG 专属模型的 4k 请求**不受理**（2026-10-15 口径"4k 不受理 都走
+    超分"）：实测 UI 4K 档收 50 credits 交付 2048²——按 4k 收费交 2k 图
+    是资损源。受理层 400 拒绝，错误信息指引 2k。
 
-    回归史：本用例的前身钉的是"pin 后不许再触发 4k 改道"（当时 4k 改道
-    会按请求档把 size 二次覆盖成 2k）。口径升级后，4k 请求的正确行为是
-    「1k 生成 + 2 级超分」——计划由 pin 块自己构造，国内 4k 改道分支
-    （`_req_tier == "4k"`）依然不得触发（否则就是那同一个 bug）。
+    🔴 回归史：本用例的前身锁的是「4k → 1k 生成 + 2 级超分链」——那是
+    直出路径的设计，而 SG 模型**没有直出路径**（shark 拦 ⇒ 只有 bridge
+    UI 通路），超分腿的 UI 自动化未做 ⇒ 4k 超分链在 SG 上执行不了，
+    受理了只会卡死。多级链代码保留（`_plan_gpt_image_upscale`），待
+    SG 超分腿开放后本用例再改回「受理 + 降级 2k + 超分」。
     """
+    import pytest
+    from app.errors import InvalidParameterError
     from app.service import Service
     from tests.conftest import FakeConfigCache
 
@@ -512,18 +517,12 @@ def test_gpt_image_4k_plans_two_upscale_levels(settings, store, fake_jimeng,
                   uploader=fake_uploader, vod=fake_vod,
                   cfg=FakeConfigCache(rmap=FLARE_RMAP),
                   upstream_transport=_Capture(_ret("0")))
-    rec = svc.create({"model": "gpt-image-2-5-flare", "prompt": "a cat",
-                      "size": "4096x4096"},
-                     credential="c", sessionid="pin-cred")
-    assert rec.size == "1024x1024", f"生成腿必须锁 1k：{rec.size}"
-    assert rec.resolution_tier == "1k"
-    plan = json.loads(rec.extra_json or "{}").get("upscale") or {}
-    assert plan.get("levels") == 2 and plan.get("gen_tier") == "1k"
-    assert plan.get("requested_size") == "4096x4096"
-    joined = json.dumps(rec.degradations, ensure_ascii=False)
-    assert "2 级超清" in joined
-    # 国内 4k 改道的文案不得出现（那是另一个分支，触发即 bug）
-    assert "已自动改走" not in joined, joined
+    with pytest.raises(InvalidParameterError) as ei:
+        svc.create({"model": "gpt-image-2-5-flare", "prompt": "a cat",
+                    "size": "4096x4096"},
+                   credential="c", sessionid="pin-cred")
+    msg = str(ei.value)
+    assert "4k" in msg and "2k" in msg, msg
 
 
 # ---------------------------------------------------------------------------
@@ -551,13 +550,12 @@ def _leg_ok(url: str, *, hist: str, item: int, size: tuple[int, int]):
     return st
 
 
-def test_gpt_image_4k_chain_runs_two_upscale_levels(
+def _test_gpt_image_4k_chain_runs_two_upscale_levels_DISABLED(
         client, client_state, fake_jimeng, service):
-    """🔴 4k 链端到端：1k 生成 → 超分级 1（→2048）→ 超分级 2（→4096）⇒ 交付。
+    """⛔ 已停用（2026-10-15）：SG 4k 不受理后此链路不可达。
 
-    关键断言：**第 2 级的引用对**必须来自第 1 级的产物
-    （item_id=888）与第 1 级**超分腿自己的 history**——混用生成腿的旧
-    history 是引用错配（上游会拒或引错图）。
+    保留函数体作参考 —— SG 超分腿（normal_hd UI 自动化）开放后，
+    按「受理 2k 降级 + 超分链」口径恢复并改名。
     """
     from tests.test_coordinator import submitted_state
     from tests.test_upscale_4k import _gen_ok
@@ -597,9 +595,10 @@ def test_gpt_image_4k_chain_runs_two_upscale_levels(
     assert "4096x4096" in joined, "交付尺寸必须写进留痕"
 
 
-def test_gpt_image_chain_level_failure_delivers_previous_level(
+def _test_gpt_image_chain_level_failure_DISABLED(
         client, client_state, fake_jimeng, service):
-    """🔴 第 2 级失败 ⇒ 交付**第 1 级产物**（2048），不判任务失败。
+    """⛔ 已停用（同上，4k 链不可达）。🔴 第 2 级失败 ⇒ 交付**第 1 级
+    产物**（2048），不判任务失败。
 
     与国内改道同一口径：腿失败不砸任务，退回上一级并响亮留痕
     （该张尺寸低于请求档，调用方在留痕里看得见）。
