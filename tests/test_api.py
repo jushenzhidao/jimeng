@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 from typing import Any
 
 import pytest
@@ -992,6 +993,48 @@ def test_sync_empty_result_raises_451(sync_client, fake_jimeng):
     for leaked in ("jimeng-t2i", "jimeng:", "status=", "submit_id",
                    "capability", "model", "total"):
         assert leaked not in err["message"], f"message 不该出现 {leaked!r}"
+
+
+def test_sync_zero_product_success_raises_451(sync_client, fake_jimeng):
+    """🔴 终态 **success 却零产物** ⇒ 同步接口**直接抛 451**（2026-10-15 用户口径：
+    "同步接口返回空图请报错"）。
+
+    ⚠️ 与上面那条 `test_sync_empty_result_raises_451` 判据**不同**：那条是
+    `_advance` 把"零产物"判成了**失败**（落库 `error.type`），这条是任务**被判成功**、
+    只是交付张数为 0 —— 所以闸口必须落在**交付张数**上。
+
+    场景取当前**唯一**已知的真实来源：`jimeng-audit`（素材预审，成功时本就没有产物，
+    任务级刻意豁免"零产物=失败"）。用户口径：**一律** —— 同步接口不交付空的成功。
+
+    同时钉住**反面**：异步端点不受影响（`data: []` + `degradations` 里的判定
+    仍是预审类能力的正规出口）—— 这条闸只加在同步链上。
+    """
+    # 预审走的是"受理即终态"（`Service._run_audit`），不需要派发/轮询剧本；
+    # 素材用 data URI（测试零网络纪律，见文件顶部）。
+    r = sync_client.post(SYNC, json={"model": "jimeng-audit",
+                                     "image": [PNG_DATA_URI]}, headers=AUTH)
+    assert r.status_code == 451, r.text
+    err = r.json()["error"]
+    assert err["type"] == "empty_result_error", err
+    assert err["code"] == "upstream_empty_result", err
+    assert "零产物" in err["message"], err
+    # 对外**只给错误信息**（2026-10-12 口径）：连 `detail` 都不出现。
+    assert set(err) == {"message", "type", "code"}, err
+    # 上游/内部标识一律不外泄（能力 key、模型名、上游 id、状态码）。
+    for leaked in ("jimeng-audit", "jimeng:", "audit", "skill",
+                   "status=", "capability", "model"):
+        assert leaked not in err["message"], f"message 不该出现 {leaked!r}"
+
+    # 🔴 闸口**不是**把任务判失败：库里它仍是 success + 零产物，
+    # 且 message 里给了"去哪看完整记录" ⇒ 调用方能无缝转异步。
+    tid = re.search(r"jimeng_[0-9a-f]{32}", err["message"])
+    assert tid, f"message 必须带上可继续查询的 task_id：{err['message']!r}"
+    got = sync_client.get(f"{BASE}/{tid.group(0)}", headers=AUTH)
+    assert got.status_code == 200, got.text
+    rec = got.json()
+    assert rec["status"] == "success", rec
+    assert rec["data"] == [], rec          # 异步侧**仍是** data:[]（契约不变）
+    assert any("素材预审" in d for d in rec.get("degradations", [])), rec
 
 
 def test_sync_content_policy_raises_451(sync_client, fake_jimeng):

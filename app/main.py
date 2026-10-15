@@ -472,6 +472,11 @@ async def _sync_generate(svc: Service, coordinator: Any, settings: Settings,
       · **内容审核拒绝** → 451 `ContentPolicyError`；
       · **空图**（上游报成功却零产物）→ 451 `EmptyResultError`。
     其余失败保持"任务完成了、结果是失败"的语义，返回 rec 由调用方渲染。
+
+    🔴 还有**第三种**转抛（2026-10-15 用户口径："同步接口返回空图请报错"）：
+    终态 **`success` 却零产物** ⇒ 同样 451（见下方那道闸）—— 它与上面那条
+    **判据不同**：上面看的是落库的 `error.type`（任务已被判失败），这条看的是
+    **交付张数**（任务被判成功，但一张图都没有）。
     """
     if not coordinator.running:
         # 配置只说明意图，线程活着才算数（与 Coordinator.running 同口径）：
@@ -497,6 +502,44 @@ async def _sync_generate(svc: Service, coordinator: Any, settings: Settings,
             raise EmptyResultError(
                 stored.get("message") or "上游报成功但零产物",
                 **(stored.get("detail") or {}))
+        return rec
+
+    # 🔴 **同步接口不交付"空的成功"**（2026-10-15 用户口径："同步接口返回空图请报错"）。
+    #
+    # 为什么要在**同步层**单独拦一道，而不是只靠 `_advance` 那条"零产物=失败"：
+    # 那一条判的是**任务**配不配算成功，而它有一处**刻意的任务级豁免**
+    # —— `jimeng-audit`（素材预审）成功时**本来就没有产物**（判定写在
+    # `degradations`，见 `models.py` 的能力说明与 `Service._run_audit`）。
+    # 于是那条记录是 `status=success` + `images=[]`，一路走到 `view()` 就成了
+    # `200 + {"status":"success","data":[]}` —— 对"一锤子买卖"的同步调用方
+    # 就是**看起来成功、实际什么都没有**的响应（用户口径：等于被骗）。
+    #
+    # 🔴 判据刻意落在**交付张数**上（`rec.status == "success" and not rec.images`），
+    # **不看**这个 success 是哪个能力/哪条路径写下来的 —— 这就是"一律"的含义：
+    # 将来任何"成功却零产物"的新路径（豁免扩张、超清队列收尾、
+    # 上游新形态被解析成零 item）都会在这里被兜住，不必再去追每一处写点。
+    #
+    # ⚠️ 异步端点**不受影响**：`view()` 对它是"任务记录"语义，
+    # `data: []` + `degradations 里的判定` 正是 `jimeng-audit` 的正规出口
+    # （本闸只加在 `_sync_generate` 这条同步链上）。
+    # ⚠️ 也**不动** 202（预算耗尽、任务还在跑）与 200 + `failure` 体：
+    # 前者是"还没好"（2026-10-14 口径：降级不是失败），后者是"任务完了、
+    # 结果是失败"（2026-10-10 口径）—— 两者都**不是**"空图"。
+    if rec.status == "success" and not rec.images:
+        # 现场进服务端日志（对外仍然只给 message/type/code，见 `errors.py`）：
+        # 排查要靠它区分"上游真零产物"（`_advance` 的 `empty result`）与
+        # "任务被判成功但没图"（本条）—— 后者当前唯一已知来源是预审类能力。
+        OBS.warning(
+            "sync empty success", task_id=rec.task_id, model=rec.model,
+            capability=rec.cap_key, n=rec.n, attempts=rec.attempts,
+            continuations=rec.continuations,
+            upstream_submit_id=rec.upstream_submit_id,
+            upstream_history_id=rec.upstream_history_id)
+        raise EmptyResultError(
+            "上游报成功但**零产物**：本服务不交付空成功（0 张）。"
+            f"如需该任务的完整记录（判定与降级说明都在里面），"
+            f"请用 GET /async/v1/images/generations/{rec.task_id} 查看。",
+            upstream="jimeng")
     return rec
 
 
@@ -557,6 +600,12 @@ def _install_routes(app: FastAPI) -> None:
             2026-10-12 口径：空图多由上游内容审核所致，故与审核同类归 451）；
           · **内容审核拒绝** → **451**（`ContentPolicyError`，换 prompt/素材
             才有用，原样重试必再拒）。
+        🔴 2026-10-15 补第三种（用户口径："同步接口返回空图请报错"）：
+        **终态 `success` 却零产物** ⇒ 同样 **451**。它与上面第一条**判据不同** ——
+        上面看落库的 `error.type`（任务已被判失败），这条看**交付张数**
+        （任务被判成功、但一张图都没有；当前唯一已知来源是 `jimeng-audit`
+        这类"成功时本就没有产物"的豁免能力）。**异步端点不受此闸影响**：
+        `data: []` + `degradations` 里的判定仍从异步查询读。
         判据是落库的 `error.type`（`_fail` 存的就是 `to_error()["error"]`），
         不做 message 字符串匹配。错误体**只含** `message` / `type` / `code`：
         不回显模型名、能力 key、上游状态码与计数、上游 id（2026-10-12 口径：
