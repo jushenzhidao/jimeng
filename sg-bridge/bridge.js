@@ -426,6 +426,43 @@ app.get("/debug/shot", async (_req, res) => {
   }
 });
 
+// 🔧 调试端点（只绑 127.0.0.1）：页面内执行 JS（产物按钮定位等探测用）
+app.post("/debug/eval", async (req, res) => {
+  try {
+    const p = await ensurePage();
+    const out = await p.evaluate(String((req.body || {}).expr || "1"));
+    res.json({ ok: true, out });
+  } catch (e) {
+    res.status(502).json({ error: String(e).slice(0, 300) });
+  }
+});
+
+// 🔧 调试端点（只绑 127.0.0.1）：真鼠标坐标点击（React 重渲染环境下的
+// 可靠点击；坐标来源：/debug/eval 里 getBoundingClientRect）
+app.post("/debug/click", async (req, res) => {
+  try {
+    const { x, y } = req.body || {};
+    const p = await ensurePage();
+    await p.mouse.click(Number(x), Number(y));
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(502).json({ error: String(e).slice(0, 200) });
+  }
+});
+
+// 🔧 调试端点（只绑 127.0.0.1）：hover（产物操作按钮多为 hover 出现）
+app.post("/debug/hover", async (req, res) => {
+  try {
+    const { x, y } = req.body || {};
+    const p = await ensurePage();
+    await p.mouse.move(Number(x), Number(y));
+    await p.waitForTimeout(800);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(502).json({ error: String(e).slice(0, 200) });
+  }
+});
+
 app.get("/login/qr.png", async (_req, res) => {
   try {
     const p = await ensurePage();
