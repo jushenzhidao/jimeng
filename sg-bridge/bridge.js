@@ -291,7 +291,7 @@ app.post("/generate-ui", async (req, res) => {
   p.on("request", onRequest);
   const started = Date.now();
   try {
-    await generateUiCore(Object.assign({}, req.body));
+    await withUiLock(() => generateUiCore(Object.assign({}, req.body)));
     const dl0 = Date.now() + 10000;
     while (!genSubmitId && Date.now() < dl0) await p.waitForTimeout(400);
     if (!genSubmitId) throw new Error("no generate request observed");
@@ -304,10 +304,26 @@ app.post("/generate-ui", async (req, res) => {
   }
 });
 
+// 🔴 UI 互斥锁：同一 page 同时只能跑一个 UI 流程 —— 并发任务的
+// 面板点击/键入互相污染（实测 4 连发时比例错乱：1:1 和 16:9 都出了
+// 上一任务的 3:4）。后来者排队等前一个完成。
+let _uiBusy = null;
+async function withUiLock(fn) {
+  while (_uiBusy) { await _uiBusy.catch(() => {}); }
+  let release;
+  _uiBusy = new Promise((r) => { release = r; });
+  try {
+    return await fn();
+  } finally {
+    release();
+    _uiBusy = null;
+  }
+}
+
 // 🔱 异步入口（jimeng-service 派发线程用）：立即返回 handle，UI 流程后台跑。
 // 派发线程 20s+ 的 UI 流程会阻塞 WORKERS=1 的串行派发 —— 绝不能同步等。
 app.post("/generate-ui-async", async (req, res) => {
-  const { prompt, model, resolution } = req.body || {};
+  const { prompt, model, resolution, ratio } = req.body || {};
   if (!prompt) return res.status(400).json({ error: "prompt required" });
   const id = "h" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
   HANDLES.set(id, { state: "running", startedAt: Date.now() });
@@ -326,7 +342,8 @@ app.post("/generate-ui-async", async (req, res) => {
     };
     p.on("request", onRequest);
     try {
-      await generateUiCore({ prompt, model, resolution, ratio });
+      await withUiLock(() => generateUiCore({ prompt, model, resolution,
+        ratio }));
       const dl = Date.now() + 15000;
       while (!genSubmitId && Date.now() < dl) await p.waitForTimeout(300);
       if (!genSubmitId) throw new Error("no generate request observed");
