@@ -114,6 +114,21 @@ class ModelConfigCache:
         specs, notes = parse_common_config(cfg)
         return Snapshot(specs=specs, fetched_at=time.time(), shape_notes=notes)
 
+    def seed(self, cfg: dict) -> Snapshot:
+        """用**已经拿到手**的能力表响应预热缓存（不重新发请求）。
+
+        🔴 站点探测（`Service.bundle_for`）与能力表读取**合流**：
+        探测那次 `common_config()` 的响应直接喂进来，避免同一凭据
+        刚探测完又原样重读一遍（两次网络往返 → 一次）。
+        """
+        self.refresh_attempts += 1
+        specs, notes = parse_common_config(cfg)
+        snap = Snapshot(specs=specs, fetched_at=time.time(), shape_notes=notes)
+        with self._lock:
+            self._snap = snap
+            self.last_error = None
+        return snap
+
     # ------------------------------------------------------------------ 查询
 
     def count_options(self, model: str) -> tuple[int, ...]:

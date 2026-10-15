@@ -408,6 +408,9 @@ def settings(db_dsn) -> Settings:
         task_db=db_dsn,
         normalize_uploads=False,
         otel_token="",
+        # 🔴 存量测试大量断言"响应含 degradations"—— 生产默认已**不展示**
+        #（2026-10-15 用户口径），测试夹具显式开回来；"默认不展示"单独有用例钉。
+        show_degradations=True,
     )
 
 

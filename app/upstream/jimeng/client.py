@@ -54,8 +54,11 @@ import httpx
 # 静态门禁：`ruff check`（F821）+ `tests/test_wiring.py` 里有专门用例守着。
 from ...observability import OBS
 
-from .sign import (APPID, APP_SDK_VERSION, APPVR, DA_VERSION, PF,
+# 🔴 APPID 不再被本模块引用（站点化后 aid 从 profile 取）—— 常量的单一
+# 出处仍是 sign.py，别的模块要国内 aid 直接从那里 import。
+from .sign import (APP_SDK_VERSION, APPVR, DA_VERSION, PF,
                    WEB_VERSION, sign_headers)
+from .site import CN_SITE, SiteProfile
 
 BASE = "https://jimeng.jianying.com"
 PATH_SUBMIT = "/mweb/v1/aigc_draft/generate"
@@ -453,6 +456,13 @@ COUNT_OPTIONS_BY_MODEL: dict[str, tuple[int, ...]] = {
     "high_aes_general_v40": (1, 2, 3, 4, 5, 6, 7, 8),
     "high_aes_general_v30l_art_fangzhou:general_v3.0_18b": (1, 2, 3, 4),
     "high_aes_general_v30l:general_v3.0_18b": (1, 2, 3, 4),
+    # ---- 国际版特有（2026-10-15 get_common_config 实读，非猜）----
+    # GPT Image 2.5 两兄弟与 GPT Image 2 服务端只声明 [1]；Nano Banana 系 1..4。
+    "dreamina_gpt_image_2_5_flare": (1,),
+    "dreamina_gpt_image_2_5_sunburst": (1,),
+    "gpt_image_2": (1,),
+    "gemini_3_image_pro": (1, 2, 3, 4),
+    "jm_image_model_gg_bp_21": (1, 2, 3, 4),
 }
 #: 未登记模型的兜底：取各模型选项的**下确界**（最严的那个），宁少勿多。
 DEFAULT_COUNT_OPTIONS: tuple[int, ...] = (1, 2, 3, 4)
@@ -523,7 +533,8 @@ def build_draft(*, prompt: str, model: str = DEFAULT_MODEL, count: int = 1,
                 width: int = 2048, height: int = 2048,
                 negative_prompt: str = "", seed: int | None = None,
                 sample_strength: float = 0.5,
-                resolution_type: str | None = None) -> str:
+                resolution_type: str | None = None,
+                da_version: str = DA_VERSION) -> str:
     """构造**文生图**的 `draft_content` —— 返回的是 **JSON 字符串**（上游要双重编码）。
 
     结构完全照抄抓包，只把可变字段参数化。
@@ -545,7 +556,7 @@ def build_draft(*, prompt: str, model: str = DEFAULT_MODEL, count: int = 1,
         "min_version": "3.0.2",
         "min_features": [],
         "is_from_tsn": True,
-        "version": DA_VERSION,
+        "version": da_version,
         "main_component_id": comp_id,
         "component_list": [{
             "type": "image_base_component",
@@ -823,7 +834,8 @@ def build_post_edit_draft(*, tool: str, image_uri: str = "", image_url: str = ""
                           resolution_type: str = "2k",
                           up_scale: dict[str, Any] | None = None,
                           parent_id: str | None = None,
-                          count: int = 1) -> str:
+                          count: int = 1,
+                          da_version: str = DA_VERSION) -> str:
     """构造**后编辑**任务的 `draft_content`（返回 JSON 字符串）。
 
     `source_from`：`upload` = 引用即梦存储里的 `image_uri`（抓包实测形态）；
@@ -911,7 +923,7 @@ def build_post_edit_draft(*, tool: str, image_uri: str = "", image_url: str = ""
 
     draft = {
         "type": "draft", "id": _uid(), "min_version": "3.2.9", "min_features": [],
-        "is_from_tsn": True, "version": DA_VERSION,
+        "is_from_tsn": True, "version": da_version,
         "main_component_id": comp_id, "component_list": [comp],
     }
     return json.dumps(draft, ensure_ascii=False, separators=(",", ":"))
@@ -941,7 +953,8 @@ def build_blend_draft(*, prompt: str, image_uris: Sequence[str] | None = None,
                       source_from: str = "upload", model: str = DEFAULT_MODEL,
                       strength: float = 0.5, width: int = 2048, height: int = 2048,
                       resolution_type: str | None = None,
-                      count: int = 1) -> str:
+                      count: int = 1,
+                      da_version: str = DA_VERSION) -> str:
     """构造**图生图（blend）**的 `draft_content`（JSON 字符串）。
 
     `source_from`：`upload` = 即梦存储里的 `image_uri`（**样本实测形态**）；
@@ -983,7 +996,7 @@ def build_blend_draft(*, prompt: str, image_uris: Sequence[str] | None = None,
     comp_id = _uid()
     draft = {
         "type": "draft", "id": _uid(), "min_version": "3.0.2", "min_features": [],
-        "is_from_tsn": True, "version": DA_VERSION,
+        "is_from_tsn": True, "version": da_version,
         "main_component_id": comp_id,
         "component_list": [{
             "type": "image_base_component", "id": comp_id, "min_version": "3.0.2",
@@ -1120,7 +1133,8 @@ def build_video_draft(*, prompt: str,
                       min_version: str = "3.0.5",
                       min_features: list[str] | None = None,
                       draft_mode: bool = False,
-                      metrics: dict[str, Any] | None = None) -> str:
+                      metrics: dict[str, Any] | None = None,
+                      da_version: str = DA_VERSION) -> str:
     """构造**文生视频（t2v）**的 `draft_content` —— 返回 JSON 字符串（双重编码）。
 
     结构逐字段照抄 2026-09-20 的网页端实抓（t2v）。与图片族的关键差异：
@@ -1145,7 +1159,7 @@ def build_video_draft(*, prompt: str,
         "min_version": min_version,
         "min_features": list(min_features or []),
         "is_from_tsn": True,
-        "version": DA_VERSION,
+        "version": da_version,
         "main_component_id": comp_id,
         "component_list": [{
             "type": "video_base_component",
@@ -1209,7 +1223,8 @@ def build_video_vfi_draft(source_draft: str | None, *, prompt: str, vid: str,
                           origin_fps: int = DEFAULT_VFI_ORIGIN_FPS,
                           target_fps: int = DEFAULT_VFI_TARGET_FPS,
                           insert_duration_ms: int | None = None,
-                          metrics: dict[str, Any] | None = None) -> str:
+                          metrics: dict[str, Any] | None = None,
+                          da_version: str = DA_VERSION) -> str:
     """构造**视频补帧**（`scene: "insert_frame"`）的 `draft_content`。
 
     两种形态（均有真跑实证，2026-09-20）：
@@ -1316,7 +1331,7 @@ def build_video_vfi_draft(source_draft: str | None, *, prompt: str, vid: str,
         "min_version": "3.1.0",              # 补帧实抓是 3.1.0（t2v 是 3.0.5）
         "min_features": [],
         "is_from_tsn": True,
-        "version": DA_VERSION,
+        "version": da_version,
         "main_component_id": child_id,
         "component_list": component_list,
     }
@@ -1331,7 +1346,8 @@ def build_video_omni_draft(*, instruction: str,
                            aspect_ratio: str = DEFAULT_VIDEO_ASPECT_RATIO,
                            fps: int = DEFAULT_VIDEO_FPS,
                            seed: int | None = None,
-                           metrics: dict[str, Any] | None = None) -> str:
+                           metrics: dict[str, Any] | None = None,
+                           da_version: str = DA_VERSION) -> str:
     """构造**全能参考视频**（omni_reference / unified_edit）的 `draft_content`。
 
     结构逐字段照抄 2026-09-20 实抓（2 视频 + 1 图 + 1 音频的混合参考）。
@@ -1418,7 +1434,7 @@ def build_video_omni_draft(*, instruction: str,
         "min_version": "3.3.9",
         "min_features": ["AIGC_Video_UnifiedEdit"],
         "is_from_tsn": True,
-        "version": DA_VERSION,
+        "version": da_version,
         "main_component_id": comp_id,
         "component_list": [{
             "type": "video_base_component",
@@ -1490,20 +1506,32 @@ class JimengClient:
                  base: str = BASE,
                  transport: httpx.BaseTransport | None = None,
                  user_agent: str | None = None,
-                 capture_upstream: bool = True) -> None:
+                 capture_upstream: bool = True,
+                 profile: "SiteProfile | None" = None) -> None:
         jar = _parse_cookie(cookie) if cookie else {}
         if sessionid:
             jar["sessionid"] = sessionid
         if not jar.get("sessionid"):
             raise JimengAuthError("缺少 sessionid —— 即梦唯一的硬前提凭据")
         self.jar = jar
-        self.base = base.rstrip("/")
+        # 🔴 站点 Profile（2026-10-15 国际版适配）：默认国内站，行为与
+        # profile 化之前**逐字节一致**（等价重构，存量调用方零感知）。
+        # `base` 参数仍保留 —— 它是"部署级覆盖"（如反代/抓包中转），
+        # 传了就以它为准，否则用 profile.base。
+        self.profile = profile or CN_SITE
+        self.base = (base.rstrip("/") if base != BASE
+                     else self.profile.base)
         self.timeout = timeout
         self.poll_interval = poll_interval
         self.poll_timeout = poll_timeout
         # webId 在抓包里等于 `_tea_web_id` cookie；没有就随机造一个 19 位数字
         self.web_id = (web_id or jar.get("_tea_web_id")
                        or str(random.randint(10 ** 18, 10 ** 19 - 1)))
+        # 🔴 `did` 头（设备 id）：国内版抓包里**没有**这个头；国际版抓包里
+        # 是一个 19 位数字（与 web_id 同量纲）。探测实测不带也能过（零成本读
+        # 三个接口都 ret=0），但带上更贴合浏览器形态 —— 生成规则与 web_id
+        # 同款（随机 19 位数字，每 client 一份，生命周期内稳定）。
+        self.did = str(random.randint(10 ** 18, 10 ** 19 - 1))
         self.workspace_id = workspace_id
         # cookie 挂在 **client 上**，不是每个请求上传：httpx 已弃用
         # per-request `cookies=`（"cookie 持久化的预期行为有歧义"），
@@ -1536,39 +1564,46 @@ class JimengClient:
     # ------------------------------------------------------------ 内部工具
 
     def _url(self, path: str, extra: dict[str, str] | None = None) -> str:
+        p = self.profile
         q = {
-            "aid": APPID, "device_platform": "web", "region": "cn",
-            "webId": self.web_id, "da_version": DA_VERSION,
+            "aid": p.aid, "device_platform": "web", "region": p.region,
+            "webId": self.web_id, "da_version": p.da_version,
             "web_version": WEB_VERSION, "aigc_features": "app_lip_sync",
         }
         q.update(extra or {})
         return f"{self.base}{path}?" + "&".join(f"{k}={v}" for k, v in q.items())
 
     def _headers(self, path: str) -> dict[str, str]:
+        p = self.profile
         h = {
             "accept": "application/json, text/plain, */*",
-            "accept-language": "zh-CN,zh;q=0.9",
+            "accept-language": p.accept_language,
             "app-sdk-version": APP_SDK_VERSION,
-            "appid": APPID,
+            "appid": p.aid,
             "appvr": APPVR,
             "content-type": "application/json",
-            "lan": "zh-Hans",
-            "loc": "cn",
-            "origin": self.base,
+            "lan": p.lan,
+            "loc": p.loc,
+            "origin": p.origin,
             "pf": PF,
             "priority": "u=1, i",
-            "referer": f"{self.base}/ai-tool/generate"
-                       + (f"?workspace={self.workspace_id}" if self.workspace_id else ""),
+            "referer": p.origin + p.referer_path,
             "sec-ch-ua": '"Chromium";v="152", "Not?A_Brand";v="24", '
                          '"Google Chrome";v="152"',
             "sec-ch-ua-mobile": "?0",
             "sec-ch-ua-platform": '"macOS"',
             "sec-fetch-dest": "empty",
             "sec-fetch-mode": "cors",
-            "sec-fetch-site": "same-origin",
+            "sec-fetch-site": p.sec_fetch_site,
             "tdid": "",
             "user-agent": self.ua,
         }
+        if p.store_country_code:
+            # 国际版独有（抓包两件套 + did 设备头）；国内版抓包里没有
+            # 这三个头 —— 不带（保持与原实现的请求字节一致）
+            h["store-country-code"] = p.store_country_code
+            h["store-country-code-src"] = "uid"
+            h["did"] = self.did
         # sign 不是硬前提（实测），但纯 MD5 零成本，带上以贴合浏览器形态
         h.update(sign_headers(path))
         return h
@@ -1630,6 +1665,7 @@ class JimengClient:
             body=body if capture else None,
             response=resp if capture else None,
             error=None if ok else "upstream_rejected",
+            site=self.profile.name,   # cn / sg —— 双站混跑时按站过滤
         )
 
     # ------------------------------------------------------------ 建任务
@@ -1651,7 +1687,8 @@ class JimengClient:
         draft = build_draft(prompt=prompt, model=model, count=count,
                             width=width, height=height,
                             negative_prompt=negative_prompt, seed=seed,
-                            resolution_type=resolution_type)
+                            resolution_type=resolution_type,
+                            da_version=self.profile.da_version)
         sid = submit_id or _uid()
         if dry_run:
             return sid
@@ -1666,7 +1703,7 @@ class JimengClient:
                 "isRegenerate": False, "isBoxSelect": False, "isCutout": False,
             }, separators=(",", ":")),
             "draft_content": draft,
-            "http_common_info": {"aid": int(APPID)},
+            "http_common_info": {"aid": int(self.profile.aid)},
         }
         self.last_draft = draft
         self._post(PATH_SUBMIT, body)
@@ -1701,7 +1738,8 @@ class JimengClient:
                                   image_url=image_url, source_from=source_from,
                                   model=model, strength=strength,
                                   width=width, height=height, count=count,
-                                  resolution_type=resolution_type)
+                                  resolution_type=resolution_type,
+                                  da_version=self.profile.da_version)
         sid = submit_id or _uid()
         if dry_run:
             return sid
@@ -1715,7 +1753,7 @@ class JimengClient:
                 "templateSource": "", "lastRequestId": "", "originRequestId": "",
             }, separators=(",", ":")),
             "draft_content": draft,
-            "http_common_info": {"aid": int(APPID)},
+            "http_common_info": {"aid": int(self.profile.aid)},
         }
         self.last_draft = draft
         self._post(PATH_SUBMIT, body)
@@ -1792,7 +1830,8 @@ class JimengClient:
             min_features=(["AIGC_Video_Seedance25ResultAction"]
                           if draft_mode else None),
             draft_mode=draft_mode,
-            metrics=metrics)
+            metrics=metrics,
+            da_version=self.profile.da_version)
         # ⚠️ 必须在 dry_run 早退**之前**设好（与 blend/edit 同一教训）
         self.last_warnings = []
         self.last_draft = draft
@@ -1810,7 +1849,7 @@ class JimengClient:
             "metrics_extra": json.dumps(metrics, ensure_ascii=False,
                                         separators=(",", ":")),
             "draft_content": draft,
-            "http_common_info": {"aid": int(APPID)},
+            "http_common_info": {"aid": int(self.profile.aid)},
         }
         self._post(PATH_SUBMIT, body)
         return sid
@@ -1880,7 +1919,8 @@ class JimengClient:
             source_draft, prompt=prompt, vid=vid,
             origin_history_id=origin_history_id, item_id=item_id,
             resolution=resolution, duration_ms=duration_ms,
-            origin_fps=origin_fps, target_fps=target_fps, metrics=metrics)
+            origin_fps=origin_fps, target_fps=target_fps, metrics=metrics,
+            da_version=self.profile.da_version)
         self.last_warnings = []
         self.last_draft = draft
         if dry_run:
@@ -1898,7 +1938,7 @@ class JimengClient:
             "metrics_extra": json.dumps(metrics, ensure_ascii=False,
                                         separators=(",", ":")),
             "draft_content": draft,
-            "http_common_info": {"aid": int(APPID)},
+            "http_common_info": {"aid": int(self.profile.aid)},
         }
         self._post(PATH_SUBMIT, body)
         return sid
@@ -1968,7 +2008,8 @@ class JimengClient:
         draft = build_video_omni_draft(
             instruction=instruction, materials=materials,
             resolution=resolution, duration_ms=duration_ms,
-            aspect_ratio=aspect_ratio, seed=seed, metrics=metrics)
+            aspect_ratio=aspect_ratio, seed=seed, metrics=metrics,
+            da_version=self.profile.da_version)
         self.last_warnings = []
         self.last_draft = draft
         if dry_run:
@@ -1986,7 +2027,7 @@ class JimengClient:
             "metrics_extra": json.dumps(metrics, ensure_ascii=False,
                                         separators=(",", ":")),
             "draft_content": draft,
-            "http_common_info": {"aid": int(APPID)},
+            "http_common_info": {"aid": int(self.profile.aid)},
         }
         self._post(PATH_SUBMIT, body)
         return sid
@@ -2020,7 +2061,8 @@ class JimengClient:
             tool=tool, image_uri=image_uri, image_url=image_url,
             item_id=item_id, origin_history_id=origin_history_id,
             source_from=source_from, width=width, height=height,
-            resolution_type=resolution_type, up_scale=up_scale, count=count)
+            resolution_type=resolution_type, up_scale=up_scale, count=count,
+            da_version=self.profile.da_version)
         sid = submit_id or _uid()
         spec = POST_EDIT_TOOLS[tool]
         if dry_run:
@@ -2048,7 +2090,7 @@ class JimengClient:
             "submit_id": sid,
             "metrics_extra": json.dumps(metrics, separators=(",", ":")),
             "draft_content": draft,
-            "http_common_info": {"aid": int(APPID)},
+            "http_common_info": {"aid": int(self.profile.aid)},
         }
         self.last_draft = draft
         self._post(PATH_SUBMIT, body)
@@ -2097,7 +2139,7 @@ class JimengClient:
                 "isRegenerate": False, "isBoxSelect": False, "isCutout": False,
             }, separators=(",", ":")),
             "draft_content": draft,
-            "http_common_info": {"aid": int(APPID)},
+            "http_common_info": {"aid": int(self.profile.aid)},
         }
         self._post(PATH_SUBMIT, body)
         return sid

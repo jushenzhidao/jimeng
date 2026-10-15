@@ -1,0 +1,12 @@
+{
+  "name": "sg-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Dreamina SG write-path browser bridge (secsdk-signed via live page)",
+  "main": "bridge.js",
+  "scripts": { "start": "node bridge.js" },
+  "dependencies": {
+    "express": "^4.19.2",
+    "playwright": "1.48.0"
+  }
+}

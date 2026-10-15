@@ -70,6 +70,16 @@ UPSTREAM_MODEL_KEYS: tuple[str, ...] = (
     "high_aes_general_v41",
     "high_aes_general_v40l",
     "high_aes_general_v40",
+    # ---- 国际版（Dreamina SG）特有：2026-10-15 能力表实读登记 ----
+    # 🔴 证据等级与 Flash 同款：**能力表实读**（服务端宣告能跑），
+    # **未端到端实跑**（建任务=计费，红线）；credits 全 None（未对账）。
+    # 共享 key（Seedream 家族/mj82）不在此列 —— 它们两站同名（见
+    # `SG_ONLY_UPSTREAM_KEYS` 与 `model_sites`）。
+    "dreamina_gpt_image_2_5_flare",       # GPT Image 2.5 Flare（counts=[1]）
+    "dreamina_gpt_image_2_5_sunburst",    # GPT Image 2.5 Sunburst（counts=[1]）
+    "gpt_image_2",                        # GPT Image 2（counts=[1]）
+    "gemini_3_image_pro",                 # Nano Banana Pro（counts 1..4）
+    "jm_image_model_gg_bp_21",            # Nano Banana 2.1（counts 1..4）
 )
 
 
@@ -190,6 +200,19 @@ UPSTREAM_MODEL_ALIASES: dict[str, str] = {
     "seedream-4-0": "high_aes_general_v40",
     "4-0": "high_aes_general_v40",
     "图片-4-0": "high_aes_general_v40",
+    # ---- 国际版（Dreamina SG）面板名：2026-10-15 能力表 model_name 归一 ----
+    # 🔴 `gpt-image` 在 PLACEHOLDER_PREFIXES 里 —— 这些别名能生效全靠
+    # `resolve` 的"别名判在占位判之前"机关（与 doubao-seedream 同机制）。
+    # 归一规则：点/空格/下划线 → 连字符 ⇒ `GPT Image 2.5 Flare` →
+    # `gpt-image-2-5-flare`。**别名键必须与 `_norm_model_name` 输出逐字一致**。
+    "gpt-image-2-5-flare": "dreamina_gpt_image_2_5_flare",
+    "gpt-image-25-flare": "dreamina_gpt_image_2_5_flare",
+    "gpt-image-2-5-sunburst": "dreamina_gpt_image_2_5_sunburst",
+    "gpt-image-25-sunburst": "dreamina_gpt_image_2_5_sunburst",
+    "gpt-image-2": "gpt_image_2",
+    "nano-banana-pro": "gemini_3_image_pro",
+    "nano-banana-2-1": "jm_image_model_gg_bp_21",
+    "nano-banana-21": "jm_image_model_gg_bp_21",
 }
 
 #: 🔴 **方舟模型名并进别名表**（2026-10-02）—— 这一步是让方舟名能"穿过"
@@ -218,6 +241,62 @@ UNSUPPORTED_WEB_MODELS: dict[str, str] = {
     "图片-3-0": "high_aes_general_v30l:general_v3.0_18b",
 }
 
+#: 🔴 **国际站特有**的上游 key（2026-10-15）。判定依据是**两站能力表实读**：
+#: 这些 key 只在国际版 `get_common_config` 的 model_list 里出现；
+#: Seedream 家族 / mj82 则**两站同名**（同名但账号与计费完全独立）。
+#: 为什么必须有这个集合：站点判定**只认 sessionid**（`high_aes_general_v50`
+#: 两站都有 ⇒ 模型名推不出站点），但**站点特定模型 + 错站凭据**是可校验的
+#: 错配 —— 消费方 `Service` 用 `model_sites()` 在已判定的站点上拦截
+#: （受理期凭缓存零成本校验；派发期归属已定，拦在提交上游之前）。
+SG_ONLY_UPSTREAM_KEYS: frozenset[str] = frozenset({
+    "dreamina_gpt_image_2_5_flare",
+    "dreamina_gpt_image_2_5_sunburst",
+    "gpt_image_2",
+    "gemini_3_image_pro",
+    "jm_image_model_gg_bp_21",
+})
+
+
+#: 🔴 **生成腿恒 1k** 的上游模型（2026-10-15 用户口径，两次拍板合成）：
+#: ① "gpt-image 清晰度定死1k" —— GPT Image 系（flare / sunburst /
+#: gpt_image_2）的**生成腿**无论请求什么档都按 1k 槽提交（能力表优先，
+#: 静态兜底 1024² 同比例）；② "根据用户请求的 2k 4k 就地请求超分实现" ——
+#: 请求 2k/4k 时由**超清链补足交付档**（2k=1 级、4k=2 级，每级固定 2×，
+#: 推进机制与国内 4k 改道共用，见 `Service._upscale_*`）。
+#: 受理层留痕（落库）；响应体默认不展示（见 `Settings.show_degradations`）。
+#: 为什么生成腿锁 1k：上游对这三个模型的 2k/4k 生成口径未取证，抓包样本
+#: （用户实际使用形态）就是 `resolution_type=1k / 1024×1024`；锁最小档
+#: 也是最便宜的生成腿。⚠️ 国际站超清腿的可用性/免费性未验证。
+PINNED_1K_UPSTREAM_KEYS: frozenset[str] = frozenset({
+    "dreamina_gpt_image_2_5_flare",
+    "dreamina_gpt_image_2_5_sunburst",
+    "gpt_image_2",
+})
+
+
+def pinned_resolution_tier(upstream_key: str | None) -> str | None:
+    """该上游模型被**定死**的分辨率档；`None` = 不限制（按请求）。"""
+    if upstream_key and upstream_key in PINNED_1K_UPSTREAM_KEYS:
+        return "1k"
+    return None
+
+
+def model_sites(upstream_key: str | None) -> frozenset[str] | None:
+    """上游模型 key 可用的站点集合；`None` = 与站点无关（或未知 key）。
+
+    · SG 特有 → `{"sg"}`；
+    · 已登记的其余 key → `{"cn", "sg"}`（两站同名同 key，草稿同构）；
+    · 未登记 key / None → None（调用方跳过站点校验）。
+    """
+    if not upstream_key:
+        return None
+    if upstream_key in SG_ONLY_UPSTREAM_KEYS:
+        return frozenset({"sg"})
+    if upstream_key in UPSTREAM_MODEL_KEYS:
+        return frozenset({"cn", "sg"})
+    return None
+
+
 #: 上游 key → **面板正式名**（服务端能力表的 `model_name`，逐字照抄）。
 #: 单一真相：`GET /v1/models` 的 `upstream_models` 由它渲染，
 #: 门禁断言"已登记 key 集合 == 本表键集合"，防止两张表漂移。
@@ -231,6 +310,12 @@ UPSTREAM_WEB_NAMES: dict[str, str] = {
     "high_aes_general_v40l": "Seedream 4.5",
     "high_aes_general_v41": "Seedream 4.1",
     "high_aes_general_v40": "Seedream 4.0",
+    # ---- 国际版（Dreamina SG）面板名：2026-10-15 能力表实读逐字照抄 ----
+    "dreamina_gpt_image_2_5_flare": "GPT Image 2.5 Flare",
+    "dreamina_gpt_image_2_5_sunburst": "GPT Image 2.5 Sunburst",
+    "gpt_image_2": "GPT Image 2",
+    "gemini_3_image_pro": "Nano Banana Pro",
+    "jm_image_model_gg_bp_21": "Nano Banana 2.1",
 }
 
 #: 上游模型 → **实测**单价（积分/张）。`None` = 未实测（**不等于免费**）。
@@ -263,6 +348,13 @@ UPSTREAM_MODEL_CREDITS: dict[str, int | None] = {
     "high_aes_general_v40l": None,
     "high_aes_general_v41": None,
     "high_aes_general_v40": None,
+    # ---- 国际版特有：**全部未实测**（credits 体系与国内不同，未对账；
+    # 建任务=计费的红线下不实跑）⇒ /v1/models 不报价。⚠️ 未实测 ≠ 免费。
+    "dreamina_gpt_image_2_5_flare": None,
+    "dreamina_gpt_image_2_5_sunburst": None,
+    "gpt_image_2": None,
+    "gemini_3_image_pro": None,
+    "jm_image_model_gg_bp_21": None,
 }
 
 #: 文生图族才吃上游模型 —— 目录里只给这一个能力挂 `upstream_models`。

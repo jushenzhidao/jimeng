@@ -79,6 +79,27 @@ class ImageXError(JimengError):
     """上传链路失败（与生成无关，不消耗积分）。"""
 
 
+def _aws_region(t: dict, host: str) -> str:
+    """AWS4 scope 的 region 取值 —— 顺序刻意，别调换：
+
+    1. **token 下发的 `region`**（服务端数据优先）。国际版实测 `region='sg'`。
+       ⚠️ 2026-10-15：以 `sg` 与 `ap-singapore-1` 签名**都被拒**
+       （`SignatureDoesNotMatch`）⇒ 国际上传链路当前**不可用**（签名细节
+       未定位，等真实抓包），本函数只保证"服务端给了就优先用它"的顺序，
+       **不代表国际站能传**。
+    2. 域名首段推导（`imagex-<region>.…` → `<region>`）：token 没带 region
+       时的兜底（国内老 token 形态）。
+    3. 国内常量 `cn-north-1`（`imagex.bytedanceapi.com` 无 region 段）。
+    """
+    r = t.get("region")
+    if r:
+        return str(r)
+    first = (host or "").split(".")[0]
+    if first.startswith("imagex-") and first != "imagex-":
+        return first[len("imagex-"):]
+    return REGION
+
+
 def _sha256_hex(b: bytes) -> str:
     return hashlib.sha256(b).hexdigest()
 
@@ -96,11 +117,21 @@ def aws4_sign(*, method: str, host: str, path: str, query: dict[str, str],
               payload: bytes, signed_headers: tuple[str, ...],
               extra_headers: dict[str, str] | None = None,
               service: str = SERVICE,
+              region: str = REGION,
               now: _dt.datetime | None = None) -> dict[str, str]:
     """按抓包的形态生成 AWS4 签名头。返回需要附加到请求上的头。
 
     `service`：ImageX 是 `imagex`，VOD（视频/音频上传）是 `vod`
     （2026-09-20 实抓：Credential=`.../cn-north-1/vod/aws4_request`）。
+
+    `region`：AWS4 scope 的 region 段。国内 = `cn-north-1`（抓包钉死）。
+    国际版（2026-10-15）：token 下发 `region='sg'`、`upload_domain` 首段是
+    `imagex-ap-singapore-1` —— **两个候选都以 `SignatureDoesNotMatch`(100010)
+    被拒**（`scripts/probe_sg_upload.py` 实跑）：国际上传的签名细节与国内
+    存在未定位差异（候选：签名头名/STS 参与方式/payload 规则），缺一份
+    真实浏览器上传抓包做参照，**不盲试**。⇒ 国际站 i2i（依赖上传）首期
+    **不开放**；待抓包对差后再钉死。`_aws_region` 只收拢"取值顺序"，
+    不承诺国际站可用。
     """
     now = now or _dt.datetime.now(_dt.timezone.utc)
     amz_date = now.strftime("%Y%m%dT%H%M%SZ")
@@ -122,7 +153,7 @@ def aws4_sign(*, method: str, host: str, path: str, query: dict[str, str],
         method, path, canonical_query, canonical_headers, signed,
         hdrs["x-amz-content-sha256"],
     ])
-    scope = f"{date}/{REGION}/{service}/aws4_request"
+    scope = f"{date}/{region}/{service}/aws4_request"
     string_to_sign = "\n".join([
         "AWS4-HMAC-SHA256", amz_date, scope, _sha256_hex(canonical_request.encode()),
     ])
@@ -215,7 +246,8 @@ class ImageXUploader:
                       access_key=t["access_key_id"],
                       secret_key=t["secret_access_key"],
                       session_token=t["session_token"], payload=b"",
-                      signed_headers=signed)
+                      signed_headers=signed,
+                      region=_aws_region(t, host))
         url = f"https://{host}/?" + "&".join(f"{k}={v}" for k, v in query.items())
         try:
             r = self._client.get(url, headers=h)
@@ -278,7 +310,8 @@ class ImageXUploader:
                       secret_key=t["secret_access_key"],
                       session_token=t["session_token"], payload=body,
                       signed_headers=signed,
-                      extra_headers={"content-type": "application/json"})
+                      extra_headers={"content-type": "application/json"},
+                      region=_aws_region(t, host))
         url = f"https://{host}/?" + "&".join(f"{k}={v}" for k, v in query.items())
         try:
             r = self._client.post(url, headers=h, content=body)

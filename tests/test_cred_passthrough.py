@@ -71,6 +71,15 @@ def test_view_of_one_task_does_not_leak_anothers_credential():
 # ② 客户端池：按 sessionid 隔离 + 有界 + 向后兼容
 # ---------------------------------------------------------------------------
 
+def _dead_transport():
+    """恒 500 的假 transport —— 站点探测（bundle_for）会发零成本读请求，
+    用它接住，守住"测试一个真字节都不发"的纪律（500 ⇒ 探测'不确定' ⇒
+    默认按 cn 建 bundle，正是本组用例想要的隔离行为）。"""
+    import httpx
+    return httpx.MockTransport(
+        lambda request: httpx.Response(500, json={"ret": "1002"}))
+
+
 def test_bundle_pool_is_isolated_per_credential(settings, store):
     """🔴 不同 sessionid 必须拿到**不同的** client/uploader/vod。
 
@@ -79,7 +88,7 @@ def test_bundle_pool_is_isolated_per_credential(settings, store):
     """
     from app.service import Service
 
-    svc = Service(settings, store=store)
+    svc = Service(settings, store=store, upstream_transport=_dead_transport())
     a = "522ceab845a313502b72f5067534d191"
     b = "a4196393c9c61b568e0ce3bc14d4fda9"
     ba = svc.bundle_for(a)
@@ -96,7 +105,7 @@ def test_bundle_pool_is_bounded(settings, store):
     from app.service import Service
 
     settings.cred_pool_max = 3
-    svc = Service(settings, store=store)
+    svc = Service(settings, store=store, upstream_transport=_dead_transport())
     for i in range(10):
         svc.bundle_for(f"{i:032x}")
     assert len(svc._cred_pool) <= 3, f"池没封顶：{len(svc._cred_pool)}"

@@ -77,8 +77,9 @@ from .upstream.jimeng import (
     resolve_video_commerce,
 )
 from .upstream.jimeng.capabilities import ModelConfigCache
-from .upstream.jimeng.client import (CODES_SECURITY, is_security_key,
+from .upstream.jimeng.client import (BASE, CODES_SECURITY, is_security_key,
                                      is_text_policy_failure)
+from .upstream.jimeng.site import CN_SITE, SITES, SiteProfile, with_overrides
 
 log = logging.getLogger(__name__)
 
@@ -247,8 +248,13 @@ def _degradations(rec: TaskRecord) -> dict[str, Any]:
     return {"degradations": list(rec.degradations)} if rec.degradations else {}
 
 
-def view(rec: TaskRecord) -> tuple[int, dict[str, Any]]:
+def view(rec: TaskRecord, *,
+         show_degradations: bool = True) -> tuple[int, dict[str, Any]]:
     """任务记录 → (HTTP 状态码, 响应体)。
+
+    `show_degradations=False`（生产默认，2026-10-15 用户口径"不展示
+    degradations"）⇒ 响应体**整个省略** `degradations` 键 —— 留痕照常落库
+    （服务端日志/任务表可查），只是不透出给调用方。测试夹具显式开 True。
 
     四条刻意选择：
       · **非终态回 202**：调用方拿到 202 就该继续轮询，不该把排队态当结果；
@@ -261,7 +267,7 @@ def view(rec: TaskRecord) -> tuple[int, dict[str, Any]]:
         "有没有 `data`"推断终态。取值与 `store` 状态同名（小写）**是本服务的契约**；
         对接 New API 任务插件时由**插件侧**归一化到其大写枚举，本服务不做跨系统对齐。
     """
-    deg = _degradations(rec)
+    deg = _degradations(rec) if show_degradations else {}
     if rec.status == "queued":
         return 202, {"task_id": rec.task_id, "status": "queued", **deg}
     if rec.status == "in_progress":
@@ -435,7 +441,8 @@ class Service:
                  uploader: ImageXUploader | None = None,
                  vod: VodUploader | None = None,
                  gate: UpstreamGate | None = None,
-                 cfg: ModelConfigCache | None = None) -> None:
+                 cfg: ModelConfigCache | None = None,
+                 upstream_transport: Any = None) -> None:
         self.settings = settings
         self.store = store or TaskStore(
             settings.db_target,
@@ -502,8 +509,57 @@ class Service:
         self._cred_pool: "OrderedDict[str, tuple[Any, Any, Any, Any]]" = \
             OrderedDict()
         self._cred_pool_max = max(1, int(getattr(settings, "cred_pool_max", 32)))
+        #: 🔴 2026-10-15：**凭据 → 归属站点**的进程内缓存（见 bundle_for 的
+        #: 站点自动判定）。两站账号体系独立 ⇒ 归属一旦确定不变；
+        #: 探测不确定（网络故障）时**不写**这里，下次再探。
+        self._site_cache: dict[str, "SiteProfile"] = {}
+        #: httpx transport 注入口（**测试专用**）：站点探测会真发
+        #: `get_common_config`（零成本读，但仍是网络字节）—— 测试用
+        #: MockTransport 接住它，守住"零真上游调用"纪律。
+        self._upstream_transport = upstream_transport
 
     # ------------------------------------------------------- 透传：客户端池
+
+    def _profile_for(self, site: "SiteProfile") -> "SiteProfile":
+        """按部署配置覆盖站点里**跟账号走**的取值（国际版 region 等）。
+
+        只对 sg 生效（cn 没有"账号地区"这回事）；配置缺省 = 原样。
+        """
+        if site.name != "sg":
+            return site
+        return with_overrides(
+            site,
+            region=self.settings.jimeng_sg_region or None,
+            store_country_code=self.settings.jimeng_sg_store_cc or None,
+        )
+
+    def _build_bundle(self, sessionid: str, profile: "SiteProfile"):
+        """为某凭据按指定站点建**一整套**上游组件（不进池）。"""
+        st = self.settings
+        c = JimengClient(
+            sessionid=sessionid,
+            cookie=st.jimeng_cookie,
+            # 部署级 base 覆盖（JIMENG_BASE_URL）只对 cn 站有意义 ——
+            # 传"未覆盖"哨兵值（== BASE 常量）时 client 用 profile.base
+            base=st.jimeng_base_url if profile.name == "cn" else BASE,
+            workspace_id=(st.jimeng_workspace_id if profile.name == "cn"
+                          else st.jimeng_sg_workspace_id),
+            poll_interval=st.jimeng_poll_interval,
+            capture_upstream=st.otel_capture_upstream,
+            profile=profile,
+            transport=self._upstream_transport,
+        )
+        up = ImageXUploader(c)
+        cfg2 = ModelConfigCache(c)
+        return (c, up, VodUploader(c, imagex=up), cfg2)
+
+    def _warm_cfg(self, bundle) -> None:
+        """回填 blend 门控 + 垫图上限（能力表快照 → models 注册表）。"""
+        _, _, _, cfg2 = bundle
+        try:
+            self.refresh_blend_capability(cfg2)
+        except Exception as e:            # noqa: BLE001 —— 回填失败不挡建连
+            log.warning("blend 能力表回填失败（门控将 fail-open）: %s", e)
 
     def bundle_for(self, sessionid: str | None):
         """取（或建）某个 sessionid 对应的一整套上游组件。
@@ -514,6 +570,17 @@ class Service:
         🔴 为什么四个东西必须**成套**取：`VodUploader` 复用 `ImageXUploader`
         的 STS（与 Memory 里"改 service 参数时密钥推导要跟着改"同源），
         混用两把 sessionid 的组件会拿到**不属于它的**上传凭据。
+
+        🔴 **站点自动判定（2026-10-15，用户口径"自动判 base url by sessionid"）**：
+        首次遇到某凭据时对两站各打一次**零成本**读（`get_common_config`），
+        `ret=0` 即归属、`1015`（login error）换下一站 —— 探测与建连**合流**
+        （探测用的那套 client/cfg 直接升级为本凭据的 bundle，探测读到的
+        能力表经 `seed()` 预热缓存，**同一凭据两次探测只发一次读请求**）。
+        为什么探测放在这里而不是受理期：这里是"要打上游之前"的**唯一必经
+        收缝**（受理/派发/轮询/预审都从 bundle_for 拿组件），站点判定一次
+        完成、全链路一致。归属缓存进程内保存（两站账号体系独立，归属不变）。
+        网络瞬断/5xx **不缓存**也不判归属（下次再探）—— 瞬时故障不该把
+        凭据钉死在错误的站。
         """
         if not sessionid:
             return (self.client, self.uploader, self.vod, self.cfg)
@@ -529,26 +596,42 @@ class Service:
             if hit is not None:
                 self._cred_pool.move_to_end(sessionid)
                 return hit
-        # 🔴 建连接要读 env / 做派生，**别持锁**做（会串行化所有请求）。
-        st = self.settings
-        c = JimengClient(
-            sessionid=sessionid,
-            cookie=st.jimeng_cookie,
-            base=st.jimeng_base_url,
-            workspace_id=st.jimeng_workspace_id,
-            poll_interval=st.jimeng_poll_interval,
-            capture_upstream=st.otel_capture_upstream,
-        )
-        up = ImageXUploader(c)
-        cfg2 = ModelConfigCache(c)
-        # 🔴 2026-10-03：blend 门控的**回填点**（此前全仓无人调 refresh ⇒
-        # 门控从未生效）。建 cfg 后顺手回填；snapshot 失败只会留下空表，
-        # 消费端（i2i 分支）对空表 fail-open，不会拒掉正常请求。
-        try:
-            self.refresh_blend_capability(cfg2)
-        except Exception as e:            # noqa: BLE001 —— 回填失败不挡建连
-            log.warning("blend 能力表回填失败（门控将 fail-open）: %s", e)
-        bundle = (c, up, VodUploader(c, imagex=up), cfg2)
+        # 🔴 建连接要读 env / 做派生（含站点探测的读请求），**别持锁**做
+        #（会串行化所有请求）。
+        uncertain: list[str] = []
+        chosen: tuple | None = None
+        for site in SITES:
+            profile = self._profile_for(site)
+            bundle = self._build_bundle(sessionid, profile)
+            c = bundle[0]
+            try:
+                # 🔴 探测端点**必须是 `get_history_by_ids`**，不能用
+                # `get_common_config`：后者在国内站**匿名可读** —— 对任何
+                # sessionid（包括别站凭据）都回 `ret=0`（2026-10-15 实测：
+                # SG 凭据打 CN 回 0 ⇒ 国际凭据会被误判成 cn，错站提交）。
+                # 这正是项目记忆"判凭据必须打生成类端点（get_common_config
+                # 骗人）"的又一实锤；`get_history_by_ids` 才做登录校验
+                # （无效凭据 1015）。假 submit_id ⇒ 空结果、零额度。
+                c.fetch_many(["site-probe-0"])
+            except JimengAuthError:
+                c.close()
+                continue                     # 1015：凭据不在此站 → 试下一站
+            except JimengError as e:
+                c.close()
+                uncertain.append(f"{site.name}: {e}")
+                continue                     # 瞬时故障：不判归属，也不缓存
+            # 探测成功：站点即归属。（探测读的是 history 不是能力表，
+            # 能力表由 `_warm_cfg` 的常规刷新补 —— 每凭据共 2 次零成本读。）
+            self._site_cache[sessionid] = profile
+            self._warm_cfg(bundle)
+            chosen = bundle
+            break
+        if chosen is None:
+            log.warning("站点探测未定（%s）；默认按 cn 建 bundle（不缓存归属）",
+                        "; ".join(uncertain) or "两站均未响应")
+            chosen = self._build_bundle(sessionid, self._profile_for(CN_SITE))
+            self._warm_cfg(chosen)
+        bundle = chosen
         with self._cred_lock:
             self._cred_pool[sessionid] = bundle
             self._cred_pool.move_to_end(sessionid)
@@ -858,6 +941,23 @@ class Service:
         cap, upstream_model = models.resolve(eff_model, has_image=bool(image),
                                             n_images=len(image), video=video)
 
+        #: 🔴 站点一致性（受理期，2026-10-15 国际版适配）：**只查已缓存**的
+        #: 凭据归属（`_site_cache`），**绝不**在这里触发探测 —— 受理路径的
+        #: "请求内零上游往返"不变式优先；未判定（新凭据）就放行，
+        #: 派发期 `bundle_for` 探明归属后由 `_submit` 在**提交上游之前**拦。
+        #: 拦的意义：sg 特有模型（GPT Image / Nano Banana 系）配国内凭据、
+        #: 或 mj82/Flash 配国际凭据，都是"必然失败"的错配 —— 能本地说清
+        #: 就不发上游（提交失败也计费的风险归零）。
+        _allowed_sites = models.model_sites(upstream_model)
+        if _allowed_sites:
+            _site = self._site_cache.get(sessionid or "")
+            if _site is not None and _site.name not in _allowed_sites:
+                raise InvalidParameterError(
+                    f"model {eff_model!r}（上游 {upstream_model}）只在"
+                    f"{'/'.join(sorted(_allowed_sites))} 站可用，但该凭据"
+                    f"已判定为 {_site.name} 站 —— 请换对应站点账号的"
+                    f"sessionid。", param="model")
+
         #: 🔴 方案 B = **冲突当场 400，绝不静默取一个**。
         #: 为什么不静默取舍：`model` 后缀与 `size` 表达的是**同一件事**
         #: （档位），两个入口给不同答案时，取任一个都是"替调用方做决定"——
@@ -1112,6 +1212,39 @@ class Service:
             #      只看 `size` 会把这条入口整条漏掉；
             #   ② `size` 就近吸附。
             _req_tier = tier or _rtype
+            # 🔴 GPT Image 系**清晰度定死 1k**（2026-10-15 用户口径
+            # "gpt-image 清晰度定死1k"）：在 4k 改道**之前**执行 —— pin 命中时
+            # 无论请求什么档（含 `-4k` 后缀）都直接落 1k，不会进"4k 改道 /
+            # 直出 4k"两条路径。尺寸吸附到 1k 槽（能力表精确像素优先），
+            # 留痕落库（响应默认不展示，见 `Settings.show_degradations`）。
+            _pin = models.pinned_resolution_tier(upstream_model or DEFAULT_MODEL)
+            if _pin and _req_tier != _pin:
+                _req_orig = _req_tier     # 用户**请求**的档（2k/4k），改写前留档
+                size, _pin_note = self._pinned_size(
+                    _pin, str(size), _req_tier, _w, _h,
+                    model_key=upstream_model or DEFAULT_MODEL,
+                    sessionid=sessionid)
+                tier = _pin        # 落库 / 提交 / 负缓存键都用**实际**档位
+                # 🔴 **必须同步改写 `_req_tier`**：它驱动下面的 4k 改道判断 ——
+                # 实测（本行缺失时）flare 4k 请求先被 pin 到 1k、又被 4k 改道
+                # 按"请求档 4k"二次覆盖成 2k（degradations 同时出现两条互斥
+                # 留痕，最终 size=2048）。pin 是**最终口径**，改道不得再看请求档。
+                _req_tier = _pin
+                degradations.append(_pin_note)
+                # 🔴 GPT Image 系「**1k 生成 + N 级超清就地放大**」（2026-10-15
+                # 用户口径"根据用户请求的 2k 4k 就地请求超分"）：生成腿锁 1k
+                # （成本最低），交付档由超分链补足 —— 2k=1 级、4k=2 级（每级
+                # 固定 2×），与国内 4k 改道**同一套推进机制**（extra_json.upscale
+                # → 生成腿成功后 `_upscale_begin` 接管）。⚠️ 国际站超清腿的
+                # 可用性/免费性**未验证**：腿失败按**上一级产物**交付并留痕。
+                if _req_orig in ("2k", "4k"):
+                    _plan = self._plan_gpt_image_upscale(
+                        _req_orig, _w, _h,
+                        model_key=upstream_model or DEFAULT_MODEL,
+                        sessionid=sessionid)
+                    if _plan is not None:
+                        extra_info = {**(extra_info or {}), "upscale": _plan}
+                        degradations.append(self._upscale_note(_plan))
             if _req_tier == "4k":
                 # 🔴 2026-10-12（用户口径）：请求清晰度 > 2k 的一律改走
                 # 「2k 生成 + 超清就地放大」以降本，见 `docs/UPSTREAM.md` §21。
@@ -1790,6 +1923,69 @@ class Service:
         plan = info.get("upscale") if isinstance(info, dict) else None
         return plan if isinstance(plan, dict) else None
 
+    def _pinned_size(self, tier: str, size: str, req_tier: str | None,
+                     width: int, height: int, *, model_key: str,
+                     sessionid: str | None) -> tuple[str, str]:
+        """把请求尺寸吸附到**定死档**的槽位，返回 (新尺寸, 留痕文案)。
+
+        槽位来源：服务端能力表（`accept_cfg` 的 `slot_for_ratio`，
+        同比例精确像素，与 4k 改道同一机制）—— 读不到时**静态兜底**：
+        同比例缩到长边 1024（偶数对齐）。兜底与"读不到不猜"不冲突：
+        pin 是**用户口径的强约束**（该模型只按 1k 交付），兜底尺寸只影响
+        像素精度、不影响档位与计费方向（1k 是最小档）。
+        """
+        slot = self._tier_slot(tier, width, height, model_key=model_key,
+                               sessionid=sessionid, fallback=1024)
+        new_size = f"{slot[0]}x{slot[1]}"
+        note = (f"GPT Image 系**恒 1k 生成**：请求 {size}"
+                f"（{req_tier or '未知'} 档）生成腿按 1k 档提交（{new_size}）。")
+        return new_size, note
+
+    def _tier_slot(self, tier: str, width: int, height: int, *,
+                   model_key: str, sessionid: str | None,
+                   fallback: int) -> tuple[int, int]:
+        """档位槽位：能力表精确像素优先（与 4k 改道同一机制）；读不到时
+        **静态兜底** —— 同比例、长边 = `fallback`（偶数对齐）。pin 是用户口径
+        的强约束，兜底只影响像素精度、不影响档位方向。"""
+        cfg = self.accept_cfg(sessionid)
+        if cfg is not None:
+            try:
+                slot = cfg.slot_for_ratio(model_key, tier, width, height)
+                if slot:
+                    return slot
+            except Exception as e:       # noqa: BLE001 —— 查表失败走静态兜底
+                log.debug("档位槽位查表失败（%s %s），走静态兜底: %s",
+                          model_key, tier, e)
+        scale = float(fallback) / max(width, height, 1)
+        return (max(2, int(round(width * scale / 2.0)) * 2),
+                max(2, int(round(height * scale / 2.0)) * 2))
+
+    def _plan_gpt_image_upscale(self, req_tier: str, width: int, height: int, *,
+                                model_key: str,
+                                sessionid: str | None) -> dict[str, Any] | None:
+        """GPT Image 系「**1k 生成 + N 级超分**」计划（受理期构造）。
+
+        级数：2k → 1 级（1k→2k）、4k → 2 级（1k→2k→4k），每级固定 2×。
+        返回结构对齐 `_plan_upscale`（消费者 `_upscale_begin/_pump/_settle`
+        共用），额外带 `gen_tier="1k"` / `levels` —— 推进层按它串级。
+        """
+        levels = {"2k": 1, "4k": 2}.get(req_tier)
+        if not levels:
+            return None
+        slot_req = self._tier_slot(req_tier, width, height,
+                                   model_key=model_key, sessionid=sessionid,
+                                   fallback=4096)
+        slot_gen = self._tier_slot("1k", width, height,
+                                   model_key=model_key, sessionid=sessionid,
+                                   fallback=1024)
+        return {
+            "requested_size": f"{slot_req[0]}x{slot_req[1]}",
+            "gen_size": f"{slot_gen[0]}x{slot_gen[1]}",
+            "gen_tier": "1k", "levels": levels, "stage": "generate",
+            "hist": None, "src": [], "out": [], "i": 0, "legs_failed": 0,
+            "notes": [], "credits": None,
+        }
+
     def _plan_upscale(self, *, cap: models.Capability, model_key: str,
                       width: int, height: int,
                       cfg: Any | None = None) -> dict[str, Any] | None:
@@ -1832,9 +2028,19 @@ class Service:
 
     @staticmethod
     def _upscale_note(plan: dict[str, Any]) -> str:
-        """改道留痕（**降级必须可见**）—— 交付尺寸与请求档位的关系必须写清楚。"""
+        """改道留痕（**降级必须可见**）—— 交付尺寸与请求档位的关系必须写清楚。
+
+        两种形态：国内 4k 改道（2k 生成 + 1 级）与 GPT Image 链
+        （1k 生成 + N 级，`gen_tier="1k"`），按 `gen_tier` 分叉文案。
+        """
         rw, rh = (int(x) for x in str(plan["requested_size"]).split("x"))
         gw, gh = (int(x) for x in str(plan["gen_size"]).split("x"))
+        if plan.get("gen_tier") == "1k":
+            lv = int(plan.get("levels") or 1)
+            return (f"🔁 GPT Image 系**恒 1k 生成**（{plan['gen_size']}）⇒ 请求的 "
+                    f"**{plan['requested_size']}** 由 **{lv} 级超清就地放大**补足"
+                    f"（每级固定 2×，按输入比例逐级放大）。⚠️ 国际站超清腿的"
+                    f"免费性**未验证**；某级失败时该张按**上一级产物**交付并留痕。")
         head = (f"🔁 请求的是 **4k 档**（{plan['requested_size']}）⇒ 已自动改走"
                 f"「2k 生成（{plan['gen_size']}）+ 超清就地放大」以降低消耗"
                 f"（4k 直出更贵；超清**免费**，服务端实测**固定 2×**）。")
@@ -1905,19 +2111,25 @@ class Service:
         plan = dict(plan)
         plan.update({
             "stage": "upscale", "src": images, "out": [], "i": 0,
-            # 逐张的**提交次数**（`str(下标) -> 次数`）：重试预算的账本，见
+            # 逐张的**提交次数**（`"{level}:{下标}" -> 次数`）：重试预算的账本，
+            # 键带**级数**（GPT Image 多级链里同一张会逐级重跑），见
             # `_upscale_pump` / `_upscale_settle`。
             "tries": {},
+            "level": 1,
             "credits": getattr(st, "cost", None),
             "hist": (getattr(st, "history_record_id", None)
                      or rec.upstream_history_id),
         })
+        if plan.get("gen_tier") == "1k":
+            leg_note = (f"🔁 1k 生成已完成（{len(images)} 张），开始**逐张超清"
+                        f"就地放大**（{plan.get('levels', 1)} 级，引用形态）。")
+        else:
+            leg_note = (f"🔁 2k 生成已完成（{len(images)} 张），开始**逐张超清"
+                        f"就地放大**（引用形态，2026-10-12 实测成立）。")
         self.store.patch(
             rec.task_id, extra_json=self._extra_with(rec, plan),
             upstream_history_id=plan["hist"],
-            degradations=list(deg) + [
-                f"🔁 2k 生成已完成（{len(images)} 张），开始**逐张超清就地放大**"
-                f"（引用形态，2026-10-12 实测成立）。"])
+            degradations=list(deg) + [leg_note])
         self._upscale_pump(rec, plan)
 
     def _upscale_retry_budget(self) -> int:
@@ -1941,9 +2153,10 @@ class Service:
         src = plan["src"]
         budget = self._upscale_retry_budget()
         tries: dict[str, int] = plan.setdefault("tries", {})
+        level = int(plan.get("level") or 1)
         while plan["i"] < len(src):
             j = plan["i"]
-            key = str(j)
+            key = f"{level}:{j}"
             tries[key] = tries.get(key, 0) + 1
             ok, sid_or_why, retryable = self._submit_upscale_leg(rec, plan, src[j])
             if ok:
@@ -1985,7 +2198,10 @@ class Service:
         if up is None:
             why = (getattr(st, "failed_reason", "") or
                    getattr(st, "status_name", "") or "无产物")
-            key = str(j)
+            # 🔴 键必须与 `_upscale_pump` **同构**（"{level}:{下标}"）——
+            # 实测（本行漏改时）settle 查的是旧键 "0" 而 pump 写的是 "2:0"
+            # ⇒ 重试计数永远读到 0 ⇒ 无限重投（每次 tick 一条超分腿）。
+            key = f"{int(plan.get('level') or 1)}:{j}"
             tries: dict[str, int] = plan.setdefault("tries", {})
             budget = self._upscale_retry_budget()
             if tries.get(key, 0) <= budget:
@@ -2019,6 +2235,27 @@ class Service:
                 gen_submit_id=rec.gen_submit_id,
                 upstream_status=getattr(st, "status_name", None),
                 failed_reason=why)
+        # 🔴 多级链（GPT Image：1k 生成 + N 级）：本级成功且还有下一级 ⇒
+        # 本级**产物**成为下一级的输入（`src[j]` 原地替换），同一张重跑
+        # `pump`；`hist` 更新为**本级**超分腿的 history —— 下一级引用
+        # `item_id + origin_history_id` 必须是同一任务的产物对，混用生成腿的
+        # 旧 hist 是错配（上游会拒或引用错图）。
+        levels = int(plan.get("levels") or 1)
+        level = int(plan.get("level") or 1)
+        if (level < levels and up is not None and up.get("item_id")):
+            plan["level"] = level + 1
+            src[j] = up
+            _leg_hist = getattr(st, "history_record_id", None)
+            if _leg_hist:
+                plan["hist"] = _leg_hist
+            plan["notes"].append(
+                f"🔁 第 {j + 1} 张第 {level}/{levels} 级超清完成"
+                f"（{up.get('width') or '?'}x{up.get('height') or '?'}）"
+                f"⇒ 继续第 {level + 1} 级。")
+            self.store.patch(rec.task_id,
+                             extra_json=self._extra_with(rec, plan))
+            self._upscale_pump(rec, plan)
+            return
         plan["out"].append(up)
         plan["i"] = j + 1
         self.store.patch(rec.task_id, extra_json=self._extra_with(rec, plan))
@@ -2033,19 +2270,24 @@ class Service:
         """
         plan = dict(plan)
         plan["stage"] = "done"
+        is_1k_chain = plan.get("gen_tier") == "1k"
+        chain = ("GPT Image 超分链" if is_1k_chain else "4k 改道")
         deg = list(rec.degradations) + list(plan["notes"])
         if plan["legs_failed"]:
             deg.append(
-                f"🔁 4k 改道收尾：{len(plan['out'])} 张中 **{plan['legs_failed']} 张"
-                f"未能超清**，按 2k 原图交付（已逐张留痕）。")
+                f"🔁 {chain}收尾：{len(plan['out'])} 张中 **{plan['legs_failed']} 张"
+                f"未能完成超分**，按**上一级产物**交付（已逐张留痕；"
+                f"该张尺寸可能低于请求档）。")
         _retried = sum(1 for v in (plan.get("tries") or {}).values() if v > 1)
         if _retried:
-            deg.append(f"🔁 4k 改道收尾：其中 **{_retried} 张超清重试过**"
-                       f"（瞬时失败；超清免费，重试**不额外计费**）。")
+            deg.append(f"🔁 {chain}收尾：其中 **{_retried} 次超分提交重试过**"
+                       f"（瞬时失败；按 `UPSCALE_MAX_RETRIES` 预算）。")
         sizes = "、".join(f"{im.get('width')}x{im.get('height')}"
                           for im in plan["out"] if im.get("width"))
-        deg.append(f"🔁 4k 改道完成：请求 {plan['requested_size']}，"
-                   f"实际交付 {sizes or '—'}（2k 生成 + 超清就地放大）。")
+        how = ("1k 生成 + 超清逐级放大" if is_1k_chain
+               else "2k 生成 + 超清就地放大")
+        deg.append(f"🔁 {chain}完成：请求 {plan['requested_size']}，"
+                   f"实际交付 {sizes or '—'}（{how}）。")
         self._succeed(rec, images=[dict(im) for im in plan["out"]],
                       credits=plan.get("credits"), deg=deg,
                       upstream_history_id=plan.get("hist"),
@@ -2547,9 +2789,35 @@ class Service:
             f"请更换垫图 —— 原样重试必然再被拒。",
             upstream="jimeng")
 
+    def _check_site_of_record(self, rec: TaskRecord,
+                              cap: models.Capability) -> None:
+        """派发期的**站点↔模型**一致性校验（见 `_submit` 开头调用）。
+
+        归属查 `_site_cache`（`bundle_for` 探明后写入）；未判定 ⇒ 放行
+        （保守：本地判不了就交给上游，绝不因校验缺失而误杀正常任务）。
+        视频族看 `video_model`（方舟名，不在站点表里 ⇒ `model_sites`
+        返回 None ⇒ 天然放行）。
+        """
+        sid = getattr(rec, "upstream_sessionid", None) or ""
+        site = self._site_cache.get(sid)
+        if site is None:
+            return
+        key = cap.video_model if cap.media == "video" else rec.upstream_model
+        allowed = models.model_sites(key)
+        if allowed and site.name not in allowed:
+            raise JimengParamError(
+                f"上游模型 {key} 只在 {'/'.join(sorted(allowed))} 站可用，"
+                f"但该凭据归属 {site.name} 站 —— 换对应站点账号的凭据后重试。",
+                code=1001)
+
     def _submit(self, rec: TaskRecord, cap: models.Capability,
                 image_uris: list[str]) -> str:
         assert self.client is not None
+        #: 🔴 站点一致性（派发期）：此刻 `self.client` 已是 `_push_cred`
+        #: 换入的、经 `bundle_for` 探明归属的客户端 —— 错配在这里**提交上游
+        #: 之前**拦死（JimengParamError = 不可重试，直落失败终态），
+        #: 而不是发给上游吃一个未知模型错误（可能计费）。
+        self._check_site_of_record(rec, cap)
         size = rec.size or _default_size()
         if cap.name == "t2i":
             model_key = rec.upstream_model or DEFAULT_MODEL

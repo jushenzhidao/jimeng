@@ -101,6 +101,35 @@ services:
         max-size: "10m"
         max-file: "5"
 
+  sg-bridge:
+    # 国际站（Dreamina SG）写链路的浏览器代签桥 —— shark 风控要求浏览器
+    # 运行时会话（2026-10-15 实测矩阵：任何纯 HTTP 组合 `ret=-6`，页面上下文
+    # fetch 天然通过）。**只服务国际站写请求**；国内站纯 HTTP 直连不受影响。
+    # 登录态：`/data/profile` 持久化（user-data-dir），首次由 /cookies 端点
+    # 注入抓包 cookie 或 /login/qr.png 扫码；sessionid 有效期 60 天。
+    # jimeng-service 经内网服务名访问：SG_BRIDGE_URL=http://sg-bridge:8300
+    build: ./sg-bridge
+    container_name: sg-bridge
+    restart: unless-stopped
+    environment:
+      SG_START_URL: "https://dreamina.capcut.com/ai-tool/image"
+      SG_PROFILE_DIR: "/data/profile"
+      SG_LISTEN: "8300"
+    volumes:
+      - sg-profile:/data/profile
+      # bridge.js 走挂载：改代码 restart 即生效（实验期高频迭代，不重 build）
+      - ./sg-bridge/bridge.js:/app/bridge.js:ro
+    # 只绑宿主回环（运维用 /health 与 /cookies）；业务调用走 compose 内网
+    ports:
+      - "127.0.0.1:8300:8300"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
 volumes:
   pgdata:
     name: jimeng-service-pgdata
+  sg-profile:
+    name: jimeng-service-sgprofile

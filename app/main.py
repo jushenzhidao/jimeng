@@ -624,7 +624,8 @@ def _install_routes(app: FastAPI) -> None:
                                    body.model_dump(), credential=credential,
                                    sessionid=_bearer(request))
 
-        status_code, payload = view(rec)
+        status_code, payload = view(
+            rec, show_degradations=request.app.state.settings.show_degradations)
         headers: dict[str, str] = {}
         if status_code == 202:
             # 预算耗尽但任务仍在跑：告诉调用方"去哪继续查"。
@@ -710,7 +711,8 @@ def _install_routes(app: FastAPI) -> None:
                                    body, credential=credential,
                                    sessionid=_bearer(request),
                                    preset_degradations=degradations)
-        status_code, payload = view(rec)
+        status_code, payload = view(
+            rec, show_degradations=request.app.state.settings.show_degradations)
         headers2: dict[str, str] = {}
         if status_code == 202:
             headers2["Location"] = f"/async/v1/images/generations/{rec.task_id}"
@@ -742,7 +744,8 @@ def _install_routes(app: FastAPI) -> None:
         """
         svc: Service = request.app.state.service
         rec = svc.get_for_credential(task_id, credential)
-        status_code, payload = view(rec)
+        status_code, payload = view(
+            rec, show_degradations=request.app.state.settings.show_degradations)
         return JSONResponse(status_code=status_code, content=payload)
 
     # ------------------------------------------------------------- 列表 / 删除

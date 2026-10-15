@@ -301,7 +301,8 @@ def test_upscale_leg_failure_delivers_the_2k_original(
     note = " ".join(rec.degradations)
     assert "超清未成功" in note and "2k 原图" in note
     assert "重试" in note, "试过重试也要留痕（降级可见的同一条纪律）"
-    assert "未能超清" in note, "收尾时要给出'几张没放大'的总计"
+    assert "未能完成超分" in note, "收尾时要给出'几张没放大'的总计"
+    #（2026-10-15 文案统一：国内改道与 GPT Image 超分链共用"未能完成超分"）
 
 
 # ---------------------------------------------------------------------------
@@ -335,7 +336,7 @@ def test_a_transient_upscale_failure_is_retried_and_then_delivered(
     assert edits[1]["item_id"] == edits[0]["item_id"], "重试的是**同一张**"
     note = " ".join(rec.degradations)
     assert "重试" in note, "重试必须留痕"
-    assert "未能超清" not in note, "重试成功就不该再报'未能超清'"
+    assert "未能完成超分" not in note, "重试成功就不该再报'未能完成超分'"
 
 
 def test_retry_budget_zero_restores_the_immediate_fallback(

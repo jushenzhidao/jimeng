@@ -72,6 +72,22 @@ class Settings:
     jimeng_workspace_id: int | None = None
     jimeng_base_url: str = "https://jimeng.jianying.com"
 
+    # ------------------------------------------------------------ 国际站（Dreamina SG）
+    #: 🔴 2026-10-15 国际版适配。站点**常量**在 `upstream/jimeng/site.py`
+    #: （域名/aid 等，不是部署配置）；这里只放**跟账号走**的三个值：
+    #: `region` / `store-country-code`（国际版抓包样本账号是 PH 区，
+    #: 别区账号用这两个覆盖）与工作台 id（国际版抓包带了 workspace_id）。
+    #: 三个都可选：缺省 = 按抓包样本值 / 不带 workspace_id。
+    jimeng_sg_region: str = ""
+    jimeng_sg_store_cc: str = ""
+    jimeng_sg_workspace_id: int | None = None
+
+    #: 🔴 2026-10-15（用户口径："不展示degradations"）：**响应体默认不吐
+    #: `degradations` 字段**。降级留痕照常**落库**（服务端日志/任务记录可见），
+    #: 只是不再透出给调用方 —— 内部细节挡在服务端。`SHOW_DEGRADATIONS=1`
+    #: 可恢复旧行为（调试/联调用）。
+    show_degradations: bool = False
+
     # ------------------------------------------------------------ 对外鉴权
     #:🔴 2026-10-03 起**不再参与鉴权**（sessionid 透传：Bearer 就是凭据）。
     #: 保留字段仅为不破坏现有 `.env`；这里刻意**加一处读取**（见
@@ -311,6 +327,11 @@ class Settings:
             jimeng_cookie=_s("JIMENG_COOKIE"),
             jimeng_workspace_id=int(ws_raw) if ws_raw else None,
             jimeng_base_url=_s("JIMENG_BASE_URL", "https://jimeng.jianying.com"),
+            jimeng_sg_region=_s("JIMENG_SG_REGION", ""),
+            jimeng_sg_store_cc=_s("JIMENG_SG_STORE_CC", ""),
+            jimeng_sg_workspace_id=(
+                int(sgws) if (sgws := _s("JIMENG_SG_WORKSPACE_ID", "")) else None),
+            show_degradations=_s("SHOW_DEGRADATIONS", "") in ("1", "true", "yes"),
             api_keys=_csv("API_KEYS"),
             jm_concurrency=_i("JM_CONCURRENCY", 1),
             jm_min_interval=_f("JM_MIN_INTERVAL", 0.0),
