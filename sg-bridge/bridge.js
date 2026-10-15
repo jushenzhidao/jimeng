@@ -192,7 +192,7 @@ const HISTORY_QS = "aid=513641&device_platform=web&region=PH"
   + "&da_version=3.3.30&web_version=7.5.0";
 // UI 流程核心：切 AI Image → （可选）选模型/档位 → 填 prompt → 发送 →
 // 返回 submit_id。终态轮询由调用方直连读接口完成（读接口不受 shark 影响）。
-async function generateUiCore({ prompt, model, resolution }) {
+async function generateUiCore({ prompt, model, resolution, ratio }) {
   const p0 = await ensureLogin();
   const p = p0.p;
   // 🔴 模型/模式必须选 AI Image（默认 AI Agent 的提交不走
@@ -223,10 +223,10 @@ async function generateUiCore({ prompt, model, resolution }) {
       await p.waitForTimeout(600);
     }
   }
-  // 🔴 档位选择（可选）：radio 在**档位面板**里（点参数行的档位按钮才
-  // 渲染——实测（2026-10-15）面板不开时 radio 不在 DOM，静默跳过 = 档位
-  // 失效。所以先点开面板（含 "2K" 文本的档位按钮）再 JS click radio。
-  if (resolution) {
+  // 🔴 比例/档位都在**参数面板**里（点参数行的档位按钮才渲染——实测
+  // 面板不开时控件不在 DOM）。比例 = 面板顶部格子（SPAN 叶子，文本
+  // "1:1"/"16:9"/…）；档位 = radiogroup 的 radio（value 1k/2k/4k）。
+  if (ratio || resolution) {
     await p.evaluate(() => {
       const b = [...document.querySelectorAll("button")]
         .find((x) => /2K/.test(x.textContent || "")
@@ -234,12 +234,23 @@ async function generateUiCore({ prompt, model, resolution }) {
       if (b) b.click();
     });
     await p.waitForTimeout(700);
-    await p.evaluate((want) => {
-      const radio = [...document.querySelectorAll('[role=radio]')]
-        .find((r) => r.getAttribute("value") === want);
-      if (radio) radio.click();
-    }, String(resolution)).catch(() => {});
-    await p.waitForTimeout(500);
+    if (ratio) {
+      await p.evaluate((want) => {
+        const span = [...document.querySelectorAll("span")]
+          .find((e) => e.childElementCount === 0
+                        && e.textContent.trim() === want);
+        if (span) (span.closest("button") || span).click();
+      }, String(ratio)).catch(() => {});
+      await p.waitForTimeout(500);
+    }
+    if (resolution) {
+      await p.evaluate((want) => {
+        const radio = [...document.querySelectorAll('[role=radio]')]
+          .find((r) => r.getAttribute("value") === want);
+        if (radio) radio.click();
+      }, String(resolution)).catch(() => {});
+      await p.waitForTimeout(500);
+    }
   }
   const comp = p.locator('[contenteditable="true"]').first();
   await comp.click({ force: true, timeout: 10000 });
@@ -315,7 +326,7 @@ app.post("/generate-ui-async", async (req, res) => {
     };
     p.on("request", onRequest);
     try {
-      await generateUiCore({ prompt, model, resolution });
+      await generateUiCore({ prompt, model, resolution, ratio });
       const dl = Date.now() + 15000;
       while (!genSubmitId && Date.now() < dl) await p.waitForTimeout(300);
       if (!genSubmitId) throw new Error("no generate request observed");

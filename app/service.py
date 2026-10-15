@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import threading
 from collections import OrderedDict
 import hmac
@@ -2824,6 +2825,18 @@ class Service:
                 f"但该凭据归属 {site.name} 站 —— 换对应站点账号的凭据后重试。",
                 code=1001)
 
+    @staticmethod
+    def _nearest_ui_ratio(w: int, h: int) -> str:
+        """size(WxH) → UI 面板的比例格子文本（8 选 1，对数距离最近）。
+
+        UI 只提供 8 种比例；非标准比例吸附最近项（受理层照常留痕
+        "非方形按输入比例交付" 的 UI 版），交付像素由上游按所选比例出。
+        """
+        target = w / max(h, 1)
+        cands = {"1:1": 1.0, "3:4": 0.75, "4:3": 4 / 3, "9:16": 9 / 16,
+                 "16:9": 16 / 9, "2:3": 2 / 3, "3:2": 1.5, "21:9": 21 / 9}
+        return min(cands, key=lambda k: abs(math.log(target / cands[k])))
+
     def _use_sg_bridge(self, rec: TaskRecord, cap: models.Capability) -> bool:
         """该任务是否走 sg-bridge 提交（国际站专属模型 + 已配置 bridge）。"""
         if not self.settings.sg_bridge_url:
@@ -2850,7 +2863,8 @@ class Service:
         tier = resolution_type_for_size(w, h) if w and h else "2k"
         body = {"prompt": rec.prompt, "model": display,
                 "resolution": {"1k": "1k", "2k": "2k", "4k": "4k"}.get(
-                    tier or "2k", "2k")}
+                    tier or "2k", "2k"),
+                "ratio": self._nearest_ui_ratio(w, h)}
         r = _httpx.post(f"{self.settings.sg_bridge_url}/generate-ui-async",
                         json=body, timeout=30.0, trust_env=False)
         r.raise_for_status()
