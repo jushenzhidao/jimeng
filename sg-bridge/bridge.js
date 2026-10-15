@@ -493,3 +493,153 @@ async function main() {
 }
 
 main().catch((e) => { console.error("[sg-bridge] fatal:", e); process.exit(1); });
+
+// 🔱 超分腿（normal_hd）UI 驱动：进 session → hover 产物大图 → 工具行
+// tooltip 定位 Upscale → 真鼠标 click → 监听 generate 请求抓 submit_id。
+// 实测（2026-10-16）：产物 hover 出工具行，Upscale 图标 tooltip="Upscale"，
+// 点击后创建 normal_hd 任务（条目标注档位 2K→4K）。
+async function upscaleUiCore({ session }) {
+  const { p } = await ensureLogin();
+  await p.waitForSelector('[contenteditable="true"]', { timeout: 30000 });
+  // ① 进目标 session（prompt 前缀匹配 Generative sessions；缺省=第一条）
+  await p.evaluate((want) => {
+    // 🔴 取**第一个最内层**匹配（侧栏项在 DOM 前部）；取最后一个会命中
+    // 外层容器（click 无效，页面停在 home ⇒ 后续全链失败）
+    const items = [...document.querySelectorAll("span,div")]
+      .filter((e) => {
+        const t = (e.textContent || "").trim();
+        const r = e.getBoundingClientRect();
+        return t.startsWith(want) && t.length < 60 && r.width > 40
+               && e.childElementCount <= 2;
+      });
+    const target = items[0]
+      || [...document.querySelectorAll("span,div")].find((e) => {
+          const t = (e.textContent || "").trim();
+          const r = e.getBoundingClientRect();
+          return /flare|burst|leaf|boat|lighthouse|test|mandala/.test(t)
+                 && r.width > 40 && r.width < 260
+                 && e.childElementCount <= 2;
+        });
+    if (target) target.click();
+  }, String(session || "")).catch(() => {});
+  // 等 session 视图就绪：URL 跳到 /generate **或**大图出现（跳转+渲染
+  // 时序不稳，实测最长 10s+；在 home 上等大图是白等——feed 未加载）。
+  for (let i = 0; i < 20; i += 1) {
+    await p.waitForTimeout(1000);
+    const ready = await p.evaluate(() => ({
+      path: location.pathname,
+      hasBig: [...document.querySelectorAll("img")]
+        .some((el) => el.getBoundingClientRect().width > 200),
+    }));
+    if (ready.path.includes("generate") || ready.hasBig) break;
+  }
+  await p.waitForTimeout(500);
+  // ②③ 遍历 session 的每张大图：hover → 工具行 tooltip 找 "Upscale" →
+  // 找到即真鼠标点击。🔴 不能只试第一张 —— 已 Upscaled 的产物工具行里
+  // 没有 Upscale（实测第一张常是 4K 成品）。工具行 y 随滚动变化 ⇒
+  // 相对每张图自己的底边定位。
+  // 🔴 bigs 采集**轮询自愈**：session 跳转有瞬态空窗（DOM 骨架期 eval
+  // 返回空 ⇒ 立即抛错误报），轮询最多 15s 等图渲染。
+  let bigs = [];
+  for (let i = 0; i < 15 && !bigs.length; i += 1) {
+    await p.waitForTimeout(1000);
+    bigs = await p.evaluate(() => {
+      const out = [];
+      for (const el of document.querySelectorAll("img")) {
+        const r = el.getBoundingClientRect();
+        if (r.width > 200) out.push({ x: r.x + r.width / 2,
+          y: r.y + r.height / 2, bottom: r.bottom });
+      }
+      return out;
+    });
+  }
+  if (!bigs.length) throw new Error("no product image in session view");
+  let upPos = null;
+  for (const b of bigs) {
+    await p.mouse.move(b.x, b.y);
+    await p.waitForTimeout(900);
+    // 🔴 tooltip 用**真鼠标**逐图标 hover（合成 mouseenter 触发不了
+    // React tooltip；真实鼠标路径今晚已手动验证）
+    const iconCoords = await p.evaluate((btm) => {
+      const icons = [...document.querySelectorAll("button,div")]
+        .filter((x) => {
+          const r = x.getBoundingClientRect();
+          return r.width > 14 && r.width < 60 && r.height > 14
+                 && r.height < 60 && r.y > btm - 140
+                 && r.y < btm + 120 && r.x > 480;
+        });
+      const uniq = [];
+      const seen = new Set();
+      for (const ic of icons) {
+        const k = Math.round(ic.getBoundingClientRect().x);
+        if (seen.has(k)) continue;
+        seen.add(k);
+        const r = ic.getBoundingClientRect();
+        uniq.push({ x: r.x + r.width / 2, y: r.y + r.height / 2 });
+      }
+      return uniq;
+    }, b.bottom);
+    let found = null;
+    for (const c of iconCoords) {
+      await p.mouse.move(c.x, c.y);
+      await p.waitForTimeout(450);
+      const tip = await p.evaluate(() => {
+        const tips = [...document.querySelectorAll(
+          "[role=tooltip],[class*=tooltip],[class*=Tooltip]")]
+          .filter((e) => e.getBoundingClientRect().width > 0
+                         && (e.textContent || "").trim());
+        return tips.length ? tips[tips.length - 1].textContent.trim()
+                           : null;
+      });
+      if (tip === "Upscale") { found = c; break; }
+    }
+    if (found) { upPos = found; break; }
+  }
+  if (!upPos) throw new Error("Upscale icon not found on any product image");
+  await p.waitForTimeout(300);
+  await p.mouse.click(upPos.x, upPos.y);
+  await new Promise((r) => setTimeout(r, 4000));
+  return true;
+}
+
+app.post("/upscale-ui-async", async (req, res) => {
+  const { session } = req.body || {};
+  const id = "u" + Date.now().toString(36)
+           + Math.random().toString(36).slice(2, 8);
+  HANDLES.set(id, { state: "running", startedAt: Date.now() });
+  res.json({ ok: true, handle: id });
+  (async () => {
+    const p = (await ensureLogin()).p;
+    let upSubmitId = null;
+    const onRequest = (rq) => {
+      if (rq.method() === "POST" && rq.url().includes("aigc_draft/generate")) {
+        try {
+          const b = JSON.parse(rq.postData() || "{}");
+          const draft = (() => { try { return JSON.parse(b.draft_content
+            || "{}"); } catch (e) { return {}; } })();
+          const gt = (draft.component_list || [])[0]
+            && draft.component_list[0].generate_type;
+          if (gt === "normal_hd" || !gen_sid_marked(b)) {
+            upSubmitId = b.submit_id || upSubmitId;
+          }
+        } catch (e) { /* 非 JSON 帧 */ }
+      }
+    };
+    const gen_sid_marked = (b) => false;   // Upscale 的提交即目标
+    p.on("request", onRequest);
+    try {
+      await withUiLock(() => upscaleUiCore({ session }));
+      const dl = Date.now() + 15000;
+      while (!upSubmitId && Date.now() < dl) await p.waitForTimeout(300);
+      if (!upSubmitId) throw new Error("no normal_hd request observed");
+      HANDLES.set(id, { state: "done", submit_id: upSubmitId,
+                        startedAt: HANDLES.get(id).startedAt });
+    } catch (e) {
+      const prev = HANDLES.get(id) || {};
+      HANDLES.set(id, { state: "error", error: String(e).slice(0, 300),
+                        startedAt: prev.startedAt || Date.now() });
+    } finally {
+      p.off("request", onRequest);
+    }
+  })();
+});

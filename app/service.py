@@ -2104,6 +2104,20 @@ class Service:
         info["upscale"] = plan
         return json.dumps(info, ensure_ascii=False)
 
+    def _submit_upscale_via_bridge(self, rec: TaskRecord) -> str:
+        """超分腿经 sg-bridge 的 UI 驱动（session=生成腿 prompt 前缀定位）。"""
+        import httpx as _httpx  # noqa: PLC0415
+        r = _httpx.post(f"{self.settings.sg_bridge_url}/upscale-ui-async",
+                        json={"session": (rec.prompt or "")[:40]},
+                        timeout=30.0, trust_env=False)
+        r.raise_for_status()
+        j = r.json()
+        if not j.get("ok") or not j.get("handle"):
+            raise UpstreamUnavailableError(
+                "sg-bridge 超分受理失败："
+                f"{json.dumps(j, ensure_ascii=False)[:160]}", upstream="jimeng")
+        return f"bridge:{j['handle']}"
+
     def _submit_upscale_leg(self, rec: TaskRecord, plan: dict[str, Any],
                             img: dict[str, Any]) -> tuple[bool, str, bool]:
         """提交**一张**的 `normal_hd`（**引用形态**）。
@@ -2131,6 +2145,12 @@ class Service:
         except (TypeError, ValueError):
             # 即梦的 item_id / history_record_id 都是数字；非数字 ⇒ 不是我们能引用的形态
             return False, "该张的 item_id / history 不是数字 id", False
+        # 🔴 SG bridge 模式：超分腿经 sg-bridge 的 **UI 驱动**（hover 产物
+        # → 点 Upscale → 监听 normal_hd 请求）。实测（2026-10-16）闭环成立：
+        # 2k 产物 → 4096² 交付、cost=28 credits。返回 bridge handle 前缀，
+        # 轮询复用 `_poll_bridge_one`（done 换真 sid → `_advance` 进 settle）。
+        if self._sg_bridge_mode(rec.upstream_model):
+            return self._submit_upscale_via_bridge(rec)
         opts = self.cfg.count_options(DEFAULT_MODEL) if self.cfg else None
         try:
             sid = self.client.edit("normal_hd", item_id=item_num,
@@ -2936,8 +2956,15 @@ class Service:
             self._fail(rec, UpstreamUnavailableError(
                 "无可用凭据查询 bridge 任务终态", upstream="jimeng"))
             return
-        self.store.patch(rec.task_id, upstream_submit_id=real_sid,
-                         gen_submit_id=real_sid, attempts=rec.attempts + 1)
+        # 🔴 计费锚点保护：生成腿 handle done 时 `gen_submit_id=real_sid`
+        # 是对的；**超分腿**（plan.stage=="upscale"）的 real_sid 不是生成腿
+        # —— 覆盖 `gen_submit_id` 会把计费锚点错挂到超分腿上。
+        info = json.loads(rec.extra_json or "{}")
+        is_leg = (info.get("upscale") or {}).get("stage") == "upscale"
+        patch = {"upstream_submit_id": real_sid, "attempts": rec.attempts + 1}
+        if not is_leg:
+            patch["gen_submit_id"] = real_sid
+        self.store.patch(rec.task_id, **patch)
         rec = self.store.get(rec.task_id) or rec
         st = cli.fetch(real_sid)
         self._push_cred(*self.bundle_for(self.sessionid_of(rec)), rec=rec)

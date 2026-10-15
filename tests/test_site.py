@@ -415,7 +415,11 @@ def test_pinned_resolution_tier_classification():
     assert pinned_resolution_tier("dreamina_gpt_image_2_5_flare") == "1k"
     assert pinned_resolution_tier("dreamina_gpt_image_2_5_sunburst") == "1k"
     assert pinned_resolution_tier("gpt_image_2") == "1k"
-    assert pinned_resolution_tier("gemini_3_image_pro") is None      # nano banana 不限
+    # 🔴 2026-10-16 口径：nano-banana 两模型**也**定死 1k（5 个 SG 专属
+    # 模型全覆盖；Seedream 家族双站不限）
+    assert pinned_resolution_tier("gemini_3_image_pro") == "1k"
+    assert pinned_resolution_tier("jm_image_model_gg_bp_21") == "1k"
+    assert pinned_resolution_tier("high_aes_general_v50") is None  # 双站不限
     assert pinned_resolution_tier("high_aes_general_v50") is None
     assert pinned_resolution_tier(None) is None
 

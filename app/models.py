@@ -267,10 +267,16 @@ SG_ONLY_UPSTREAM_KEYS: frozenset[str] = frozenset({
 #: 为什么生成腿锁 1k：上游对这三个模型的 2k/4k 生成口径未取证，抓包样本
 #: （用户实际使用形态）就是 `resolution_type=1k / 1024×1024`；锁最小档
 #: 也是最便宜的生成腿。⚠️ 国际站超清腿的可用性/免费性未验证。
+#: 🔴 SG 专属模型**全部**定死 1k 生成（2026-10-16 口径"gpt-image 与
+#: nano-banana 全部定死1k，然后走多级超分【根据size自动推导控制】"）：
+#: 交付档由多级超分链补足（2k=1 级、4k=2 级，每级固定 2×，按请求 size
+#: 自动推导级数）。注：Seedream 家族是双站模型不在此列（cn 直出按请求档）。
 PINNED_1K_UPSTREAM_KEYS: frozenset[str] = frozenset({
     "dreamina_gpt_image_2_5_flare",
     "dreamina_gpt_image_2_5_sunburst",
     "gpt_image_2",
+    "gemini_3_image_pro",
+    "jm_image_model_gg_bp_21",
 })
 
 
