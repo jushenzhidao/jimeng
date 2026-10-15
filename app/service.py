@@ -1814,11 +1814,25 @@ class Service:
         # · 更糟：这是**越权** —— A 的凭据在试探 B 的任务是否存在。
         # 原来的"批量"设计（省请求量）仍然成立，只是**组的边界**变了。
         groups: "OrderedDict[str | None, list[TaskRecord]]" = OrderedDict()
+        bridge_recs: list[TaskRecord] = []
         for rec in asked:
             if rec.upstream_submit_id:
+                # 🔴 SG bridge 任务（`bridge:{handle}` 前缀）不在上游批量查询
+                # 里 —— handle 是 sg-bridge 的内部句柄，先查 handle 换真
+                # submit_id 再走读接口（见 `_poll_bridge_one`）。
+                if (rec.upstream_submit_id.startswith("bridge:")
+                        and self.settings.sg_bridge_url):
+                    bridge_recs.append(rec)
+                    continue
                 groups.setdefault(self.sessionid_of(rec), []).append(rec)
 
         polled = 0
+        for rec in bridge_recs:
+            try:
+                self._poll_bridge_one(rec)
+                polled += 1
+            except Exception:
+                log.exception("bridge poll failed task=%s", rec.task_id)
         for sid, bucket in groups.items():
             ids = [r.upstream_submit_id for r in bucket]
             cli = self.bundle_for(sid)[0]
@@ -2810,6 +2824,89 @@ class Service:
                 f"但该凭据归属 {site.name} 站 —— 换对应站点账号的凭据后重试。",
                 code=1001)
 
+    def _use_sg_bridge(self, rec: TaskRecord, cap: models.Capability) -> bool:
+        """该任务是否走 sg-bridge 提交（国际站专属模型 + 已配置 bridge）。"""
+        if not self.settings.sg_bridge_url:
+            return False
+        if cap.name != "t2i":
+            return False
+        key = rec.upstream_model or ""
+        return models.model_sites(key) == frozenset({"sg"})
+
+    def _submit_via_bridge(self, rec: TaskRecord) -> str:
+        """经 sg-bridge 的 **UI 驱动**提交（异步 handle，毫秒级返回）。
+
+        bridge 在真实浏览器页面里完成「切 AI Image → 选模型 → 填 prompt →
+        发送」，返回的 handle 稍后在 `poll_many` 里换真 submit_id。
+        🔴 档位映射到 UI 的 radio 值；1k pin / 超分链是**直出路径**的机制，
+        bridge 路径按请求档 UI 直出（超分腿的 UI 自动化未做）。
+        """
+        import httpx as _httpx  # noqa: PLC0415 —— 局部引入避免模块级依赖
+        from .upstream.jimeng.client import (  # noqa: PLC0415
+            resolution_type_for_size)
+        model = rec.upstream_model or ""
+        display = models.UPSTREAM_WEB_NAMES.get(model, model)
+        w, h = (int(x) for x in (rec.size or "2048x2048").split("x"))
+        tier = resolution_type_for_size(w, h) if w and h else "2k"
+        body = {"prompt": rec.prompt, "model": display,
+                "resolution": {"1k": "1k", "2k": "2k", "4k": "4k"}.get(
+                    tier or "2k", "2k")}
+        r = _httpx.post(f"{self.settings.sg_bridge_url}/generate-ui-async",
+                        json=body, timeout=30.0, trust_env=False)
+        r.raise_for_status()
+        j = r.json()
+        if not j.get("ok") or not j.get("handle"):
+            raise UpstreamUnavailableError(
+                f"sg-bridge 受理失败：{json.dumps(j, ensure_ascii=False)[:160]}",
+                upstream="jimeng")
+        return f"bridge:{j['handle']}"
+
+    def _poll_bridge_one(self, rec: TaskRecord) -> None:
+        """bridge handle 任务的一轮推进：running=记账；done=换真 submit_id
+        走直连读接口查终态（复用 `_advance`）；error=落失败终态。"""
+        import httpx as _httpx  # noqa: PLC0415
+        handle = (rec.upstream_submit_id or "").removeprefix("bridge:")
+        try:
+            r = _httpx.get(f"{self.settings.sg_bridge_url}/handle/{handle}",
+                           timeout=15.0, trust_env=False)
+            r.raise_for_status()
+            j = r.json()
+        except Exception as e:  # noqa: BLE001 —— bridge 短暂不可用只记账
+            self.store.patch(rec.task_id, attempts=rec.attempts + 1)
+            OBS.warning("bridge handle poll failed", task_id=rec.task_id,
+                        error=str(e)[:160])
+            return
+        state = j.get("state")
+        if state == "running":
+            self.store.patch(rec.task_id, attempts=rec.attempts + 1,
+                             updated_at=int(time.time()))
+            return
+        if state == "error":
+            self._fail(rec, UpstreamUnavailableError(
+                f"sg-bridge 提交失败：{j.get('error', '')[:160]}",
+                upstream="jimeng"))
+            return
+        # done：拿真 submit_id → 直连读接口查终态（读接口无 shark 问题）
+        real_sid = j.get("submit_id")
+        if not real_sid:
+            self._fail(rec, UpstreamUnavailableError(
+                "sg-bridge handle 完成但无 submit_id", upstream="jimeng"))
+            return
+        cli = self.bundle_for(self.sessionid_of(rec))[0]
+        if cli is None:
+            self._fail(rec, UpstreamUnavailableError(
+                "无可用凭据查询 bridge 任务终态", upstream="jimeng"))
+            return
+        self.store.patch(rec.task_id, upstream_submit_id=real_sid,
+                         gen_submit_id=real_sid, attempts=rec.attempts + 1)
+        rec = self.store.get(rec.task_id) or rec
+        st = cli.fetch(real_sid)
+        self._push_cred(*self.bundle_for(self.sessionid_of(rec)), rec=rec)
+        try:
+            self._advance(rec, st)
+        finally:
+            self._pop_cred()
+
     def _submit(self, rec: TaskRecord, cap: models.Capability,
                 image_uris: list[str]) -> str:
         assert self.client is not None
@@ -2818,6 +2915,12 @@ class Service:
         #: 之前**拦死（JimengParamError = 不可重试，直落失败终态），
         #: 而不是发给上游吃一个未知模型错误（可能计费）。
         self._check_site_of_record(rec, cap)
+        # 🔴 SG bridge 模式（2026-10-15）：国际站写接口被 shark 风控拦
+        # （纯 HTTP 全组合 -6）⇒ t2i 的提交经 sg-bridge 的 UI 驱动完成。
+        # 返回值是 **bridge handle**（带 `bridge:` 前缀，不是上游
+        # submit_id）—— 轮询期 `poll_many` 识别前缀先查 handle 再查上游。
+        if self._use_sg_bridge(rec, cap):
+            return self._submit_via_bridge(rec)
         size = rec.size or _default_size()
         if cap.name == "t2i":
             model_key = rec.upstream_model or DEFAULT_MODEL

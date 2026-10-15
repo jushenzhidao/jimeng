@@ -103,6 +103,17 @@ async function pageFetch(url, options) {
 const app = express();
 app.use(express.json({ limit: "4mb" }));
 
+// 异步 handle 注册表：jimeng-service 派发线程不能等 UI 流程（20s+），
+// 立即返回 handle，UI 流程后台跑，结果在 /handle/{id} 查。
+const HANDLES = new Map();   // id -> {state, submit_id?, url?, error?, startedAt}
+const HANDLES_TTL = 3600 * 1000;
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of HANDLES) {
+    if (now - v.startedAt > HANDLES_TTL) HANDLES.delete(k);
+  }
+}, 300 * 1000);
+
 app.get("/health", async (_req, res) => {
   try {
     const p = await ensurePage();
@@ -179,6 +190,81 @@ app.post("/generate", async (req, res) => {
 // Enter/按钮提交 → 轮询 get_history_by_ids（读接口无权限问题）到终态。
 const HISTORY_QS = "aid=513641&device_platform=web&region=PH"
   + "&da_version=3.3.30&web_version=7.5.0";
+// UI 流程核心：切 AI Image → （可选）选模型/档位 → 填 prompt → 发送 →
+// 返回 submit_id。终态轮询由调用方直连读接口完成（读接口不受 shark 影响）。
+async function generateUiCore({ prompt, model, resolution }) {
+  const p0 = await ensureLogin();
+  const p = p0.p;
+  // 🔴 模型/模式必须选 AI Image（默认 AI Agent 的提交不走
+  // aigc_draft/generate）。用「locate 坐标 → 真鼠标点击」模式：
+  // DOM 生命周期（React 重渲染）会让 locator.click 卡死，坐标不受影响。
+  await p.waitForSelector('[contenteditable="true"]', { timeout: 30000 });
+  const tabPos = await p.evaluate(() => {
+    const span = [...document.querySelectorAll("span,div")]
+      .find((e) => e.childElementCount === 0
+                    && e.textContent.trim() === "AI Image");
+    if (!span) return null;
+    const r = span.getBoundingClientRect();
+    return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+  });
+  if (tabPos) {
+    await p.mouse.click(tabPos.x, tabPos.y);
+    await p.waitForTimeout(800);
+  }
+  // 🔴 模型选择（可选）：参数行 combobox（当前值如 "GPT Image 2.5 Sunburst"）
+  // —— 点开下拉 → 点目标模型文本
+  if (model) {
+    const combo = p.locator("[role=combobox]").first();
+    if (await combo.isVisible().catch(() => false)) {
+      await combo.click({ force: true, timeout: 5000 });
+      await p.waitForTimeout(800);
+      const opt = p.getByText(String(model), { exact: false }).first();
+      await opt.click({ force: true, timeout: 5000 }).catch(() => {});
+      await p.waitForTimeout(600);
+    }
+  }
+  // 🔴 档位选择（可选）：radio 在**档位面板**里（点参数行的档位按钮才
+  // 渲染——实测（2026-10-15）面板不开时 radio 不在 DOM，静默跳过 = 档位
+  // 失效。所以先点开面板（含 "2K" 文本的档位按钮）再 JS click radio。
+  if (resolution) {
+    await p.evaluate(() => {
+      const b = [...document.querySelectorAll("button")]
+        .find((x) => /2K/.test(x.textContent || "")
+                      && x.getBoundingClientRect().width > 0);
+      if (b) b.click();
+    });
+    await p.waitForTimeout(700);
+    await p.evaluate((want) => {
+      const radio = [...document.querySelectorAll('[role=radio]')]
+        .find((r) => r.getAttribute("value") === want);
+      if (radio) radio.click();
+    }, String(resolution)).catch(() => {});
+    await p.waitForTimeout(500);
+  }
+  const comp = p.locator('[contenteditable="true"]').first();
+  await comp.click({ force: true, timeout: 10000 });
+  await p.keyboard.press("Escape").catch(() => {});
+  await comp.click({ force: true, timeout: 10000 });
+  await p.keyboard.type(String(prompt).slice(0, 400), { delay: 15 });
+  await p.waitForTimeout(400);
+  // 发送按钮：**精确**定位 primary（容器内唯一），禁用则等它启用
+  const sendBtn = p.locator(
+    "[class*='collapsed-submit-button-container'] button.lv-btn-primary"
+  ).first();
+  await sendBtn.waitFor({ state: "visible", timeout: 10000 })
+    .catch(() => {});
+  await p.waitForFunction(
+    () => { const b = document.querySelector(
+      "[class*='collapsed-submit-button-container'] button.lv-btn-primary");
+      return b && !b.disabled; }, { timeout: 15000 }).catch(() => {});
+  await sendBtn.evaluate((b) => {
+    b.click();   // 🔴 DOM click：React onClick 绑定在组件树内，直接触发
+  });
+  const dl0 = Date.now() + 10000;
+  // 提交完成即返回 —— submit_id 由入口的请求监听器捕获
+  await (await ensurePage()).waitForTimeout(1500);
+}
+
 app.post("/generate-ui", async (req, res) => {
   const { prompt, timeoutMs = 180000 } = req.body || {};
   if (!prompt) return res.status(400).json({ error: "prompt required" });
@@ -194,58 +280,10 @@ app.post("/generate-ui", async (req, res) => {
   p.on("request", onRequest);
   const started = Date.now();
   try {
-    // 🔴 模型/模式必须选 AI Image（默认 AI Agent 的提交不走
-    // aigc_draft/generate）。两种布局：顶部 tabs 或左下 lv-select 下拉。
-    // 等待 React 渲染完成（composer 挂载 + tabs 出现）
-    await p.waitForSelector('[contenteditable="true"]', { timeout: 30000 });
-    // 🔑 「locate 坐标 → 真鼠标点击」：React 重渲染会让 locator.click
-    // 卡死（元素 detach），坐标点击不受影响（与发送按钮同款方案）。
-    const tabPos = await p.evaluate(() => {
-      const span = [...document.querySelectorAll("span,div")]
-        .find((e) => e.childElementCount === 0
-                      && e.textContent.trim() === "AI Image");
-      if (!span) return null;
-      const r = span.getBoundingClientRect();
-      return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
-    });
-    if (tabPos) {
-      await p.mouse.click(tabPos.x, tabPos.y);
-      await p.waitForTimeout(800);
-    }
-    const comp = p.locator('[contenteditable="true"]').first();
-    await comp.click({ force: true, timeout: 10000 });
-    // 关掉可能存在的运营弹窗（Escape 双保险），聚焦后重试键入
-    await p.keyboard.press("Escape").catch(() => {});
-    await comp.click({ force: true, timeout: 10000 });
-    await p.keyboard.type(String(prompt).slice(0, 400), { delay: 15 });
-    await p.waitForTimeout(400);
-    // 提交：等参数行的 primary 发送按钮启用（有 prompt 后 dis=False），
-    // locator = 唯一 lv-btn-primary（外层容器类 collapsed-submit-button-container-*）
-    // 发送按钮：**精确**定位 primary（容器内唯一），禁用则等它启用
-    const sendBtn = p.locator(
-      "[class*='collapsed-submit-button-container'] button.lv-btn-primary");
-    await sendBtn.waitFor({ state: "visible", timeout: 10000 })
-      .catch(() => {});
-    // 等 enable（prompt 键入后 React 才解除 disabled）
-    await p.waitForFunction(
-      () => { const b = document.querySelector(
-        "[class*='collapsed-submit-button-container'] button.lv-btn-primary");
-        return b && !b.disabled; }, { timeout: 15000 }).catch(() => {});
-    const btnState = await sendBtn.evaluate((b) => {
-      b.click();   // 🔴 DOM click：React onClick 绑定在组件树内，直接触发
-      const r = b.getBoundingClientRect();
-      return { dis: b.disabled, x: Math.round(r.x), y: Math.round(r.y) };
-    }).catch((e) => { throw new Error("btn eval failed: "
-      + String(e).slice(0, 160)); });
+    await generateUiCore(Object.assign({}, req.body));
     const dl0 = Date.now() + 10000;
     while (!genSubmitId && Date.now() < dl0) await p.waitForTimeout(400);
-    if (!genSubmitId) {
-      throw new Error("no generate request observed (submit failed?) state="
-        + JSON.stringify(btnState));
-    }
-    // 🔴 拿到 submit_id 立即返回 —— 点击后页面跳转工作台，本 page 的
-    // evaluate 会被导航打断；终态轮询由调用方**直连读接口**完成
-    //（get_history_by_ids 不受 shark 影响，无需浏览器）。
+    if (!genSubmitId) throw new Error("no generate request observed");
     return res.json({ ok: true, mode: "ui", submit_id: genSubmitId,
                       elapsedMs: Date.now() - started });
   } catch (e) {
@@ -255,7 +293,54 @@ app.post("/generate-ui", async (req, res) => {
   }
 });
 
-// 🔧 调试端点：dump composer 周边按钮结构（定位发送按钮用）
+// 🔱 异步入口（jimeng-service 派发线程用）：立即返回 handle，UI 流程后台跑。
+// 派发线程 20s+ 的 UI 流程会阻塞 WORKERS=1 的串行派发 —— 绝不能同步等。
+app.post("/generate-ui-async", async (req, res) => {
+  const { prompt, model, resolution } = req.body || {};
+  if (!prompt) return res.status(400).json({ error: "prompt required" });
+  const id = "h" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+  HANDLES.set(id, { state: "running", startedAt: Date.now() });
+  res.json({ ok: true, handle: id });
+  // 后台执行（不 await）
+  (async () => {
+    const p = (await ensureLogin()).p;
+    let genSubmitId = null;
+    const onRequest = (rq) => {
+      if (rq.method() === "POST" && rq.url().includes("aigc_draft/generate")) {
+        try {
+          genSubmitId = JSON.parse(rq.postData() || "{}").submit_id
+            || genSubmitId;
+        } catch (e) { /* 非 JSON 帧 */ }
+      }
+    };
+    p.on("request", onRequest);
+    try {
+      await generateUiCore({ prompt, model, resolution });
+      const dl = Date.now() + 15000;
+      while (!genSubmitId && Date.now() < dl) await p.waitForTimeout(300);
+      if (!genSubmitId) throw new Error("no generate request observed");
+      HANDLES.set(id, { state: "done", submit_id: genSubmitId,
+                        startedAt: HANDLES.get(id).startedAt });
+    } catch (e) {
+      const prev = HANDLES.get(id) || {};
+      HANDLES.set(id, { state: "error", error: String(e).slice(0, 300),
+                        startedAt: prev.startedAt || Date.now() });
+    } finally {
+      p.off("request", onRequest);
+    }
+  })();
+});
+
+app.get("/handle/:id", async (req, res) => {
+  const h = HANDLES.get(req.params.id);
+  if (!h) return res.status(404).json({ error: "unknown handle" });
+  const out = { state: h.state, startedAt: h.startedAt };
+  if (h.submit_id) out.submit_id = h.submit_id;
+  if (h.error) out.error = h.error;
+  res.json(out);
+});
+
+
 app.get("/debug/buttons", async (_req, res) => {
   try {
     const p = await ensurePage();

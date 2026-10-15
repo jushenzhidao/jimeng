@@ -88,6 +88,12 @@ class Settings:
     #: 可恢复旧行为（调试/联调用）。
     show_degradations: bool = False
 
+    #: 🔴 国际站（SG）写链路的浏览器代签桥（2026-10-15）：shark 风控要求
+    #: 浏览器运行时会话 ⇒ SG 写请求转发 sg-bridge 的 UI 驱动（异步 handle），
+    #: 轮询仍走直连读接口。空 = 未部署 bridge（SG 写请求按原路径走——会被
+    #: shark 拒）。单实例部署形态：compose 内网 `http://sg-bridge:8300`。
+    sg_bridge_url: str = ""
+
     # ------------------------------------------------------------ 对外鉴权
     #:🔴 2026-10-03 起**不再参与鉴权**（sessionid 透传：Bearer 就是凭据）。
     #: 保留字段仅为不破坏现有 `.env`；这里刻意**加一处读取**（见
@@ -332,6 +338,7 @@ class Settings:
             jimeng_sg_workspace_id=(
                 int(sgws) if (sgws := _s("JIMENG_SG_WORKSPACE_ID", "")) else None),
             show_degradations=_s("SHOW_DEGRADATIONS", "") in ("1", "true", "yes"),
+            sg_bridge_url=_s("SG_BRIDGE_URL", "").rstrip("/"),
             api_keys=_csv("API_KEYS"),
             jm_concurrency=_i("JM_CONCURRENCY", 1),
             jm_min_interval=_f("JM_MIN_INTERVAL", 0.0),
