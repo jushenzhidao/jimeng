@@ -324,6 +324,52 @@ def empty_result_error() -> EmptyResultError:
 
 
 # ---------------------------------------------------------------------------
+# 受理去重（2026-10-15 用户口径："减少无效重试"）
+# ---------------------------------------------------------------------------
+
+
+def _fingerprint(*, model: Any, cap_key: Any, upstream_model: Any, prompt: Any,
+                 images: Any, size: Any, tier: Any, n: Any, seed: Any,
+                 negative_prompt: Any, duration_ms: Any, aspect_ratio: Any) -> str:
+    """一次请求的**去重指纹** —— 规范化后取 sha256。
+
+    🔴 两侧必须用**同一套规范化**（本函数只有这一份实现，正是为此）：
+      · 受理时用"本次请求"的已解析值算；
+      · 去重时用库里那条记录的**同名字段**算（`_fingerprint_of_record`）。
+    任一字段只要归一化不一致（如 `size` 一处是 `int` 一处是 `str`），
+    指纹就会永远对不上 ⇒ 去重静默失效（比报错更难发现）。
+
+    选字段的原则：**决定"这次要生成什么"的全部输入**。刻意**不含**：
+      · `credential` —— 调用方是键，不是请求内容（按凭据各自去重）；
+      · 降级留痕 / preset_degradations —— 那是**结果**不是输入；
+      · 客户端可选字段（如 `user`）—— 同一个请求换个 user 仍该去重。
+    """
+    blob = json.dumps({
+        "model": model, "cap": cap_key, "upstream": upstream_model,
+        "prompt": prompt or "",
+        #: 垫图**有序**（顺序影响生成语义）⇒ 原样进指纹，不排序。
+        "images": list(images or []),
+        #: `size` 统一成字符串（记录里存的就是 `str(size)`）。
+        "size": None if size is None else str(size),
+        "tier": tier, "n": n, "seed": seed,
+        "negative": str(negative_prompt or ""),
+        "duration_ms": duration_ms, "ratio": aspect_ratio,
+    }, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def _fingerprint_of_record(rec: TaskRecord) -> str:
+    """库里那条记录 → 指纹（字段与受理侧逐一同名，见 `_fingerprint`）。"""
+    return _fingerprint(
+        model=rec.model, cap_key=rec.cap_key, upstream_model=rec.upstream_model,
+        prompt=rec.prompt, images=rec.image_refs, size=rec.size,
+        tier=rec.resolution_tier, n=rec.n, seed=rec.seed,
+        negative_prompt=rec.negative_prompt, duration_ms=rec.duration_ms,
+        aspect_ratio=rec.aspect_ratio,
+    )
+
+
+# ---------------------------------------------------------------------------
 # 服务
 # ---------------------------------------------------------------------------
 
@@ -415,6 +461,15 @@ class Service:
         #: 🔴 外部注入（测试）标记：注入的 client 对**所有** sessionid 生效，
         #: 见 `bundle_for`。生产为False（client 由本类按 sessionid 自建）。
         self._client_injected = client is not None
+        #: 受理去重命中次数（进程内累计，`/stats` 的 `dedupe.hits` 读它）。
+        #: 它涨 = "调用方在重投、我们没跟着重复建任务"。
+        self._dedupe_hits = 0
+        #: 🔴 受理去重的**原子闸**（2026-10-15）。网关是**并发**重投的
+        #: （实测同一秒 4~5 条），而 `create` 会经 `run_in_threadpool` 在**多线程**
+        #: 里跑 ⇒ "查在途"与"落库"之间有竞态：不加锁两条都会通过检查、各建一个任务
+        #: —— 那就等于去重白做（该花的钱一分没省）。进程内锁足够：`WORKERS=1`
+        #: 是架构约束（见 README），不存在跨进程并发受理。
+        self._dedupe_lock = threading.Lock()
         # 🔴 2026-10-08（用户口径"不从环境变量取 sessionid，是用 bearer 鉴权"）：
         # **不再**用 `JIMENG_SESSIONID` 建默认客户端 —— 凭据一律由**每个请求的
         # Bearer** 带来（`bundle_for()`按 sessionid 现建/取缓存）。
@@ -642,6 +697,11 @@ class Service:
             "neg": self.neg.stats(),
             #: prompt 前置决策预审（Jev）：blocks/errors/cache_hits 一眼看闸门状态。
             "prompt_guard": self.guard.stats(),
+            #: 🔴 2026-10-15："减少无效重试"的效果出口。`hits` 涨 = 调用方在重投、
+            #: 而**没有**跟着重复建任务（每次重投原本都可能真花钱）。
+            "dedupe": {"enabled": self.settings.accept_dedupe_enabled,
+                       "window_s": self.settings.accept_dedupe_window_s,
+                       "hits": self._dedupe_hits},
             "model_config": self.cfg.stats() if self.cfg else None,
             "observability": OBS.status(),
         }
@@ -1185,6 +1245,16 @@ class Service:
         if guard_note:
             degradations.append(guard_note)
 
+        # 🔴 2026-10-15（用户口径"减少无效重试"）：**受理去重**。
+        # 位置很关键：在所有校验 / 负缓存 / 预审**之后**、落库**之前** ——
+        # 拦在前面的判据（参数错、审核拒、预审拒）仍然照常生效并**不建任务**；
+        # 这里只回答一件事："这个请求是不是**已经在途**了？"
+        #
+        # 线上现场（nginx 访问日志 + 库）：同一秒连发 4~5 条**完全相同**的请求。
+        # 每条都新建任务 ⇒ ① 每条都可能**计费**（重试的代价是钱）；② 队列被灌满
+        # ⇒ 所有人的同步请求一起降级（`oldest_wait_s` 涨到几千秒）。
+        # 指纹相同 + 同凭据 + 那条**仍在途**（且在窗口内）⇒ 复用它的 task_id。
+        # 对调用方是透明且正确的：它要的就是"这一次生成的结果"，而它正在跑。
         now = int(time.time())
         rec = TaskRecord(
             task_id=new_task_id(cap.api_id),
@@ -1215,7 +1285,31 @@ class Service:
             created_at=now,
             updated_at=now,
         )
-        self.store.put(rec)
+        # 🔴 去重检查与落库必须**原子**（见 `_dedupe_lock` 的说明）：
+        # 否则并发的两条相同请求都会"查不到在途"、各落一条 ⇒ 去重白做。
+        # `rec` 在锁外构造（纯计算）；锁里只做"查在途 + 落库"两次 DB 往返。
+        with self._dedupe_lock:
+            if self.settings.accept_dedupe_enabled:
+                window = self.settings.accept_dedupe_window_s
+                fp = _fingerprint(
+                    model=cap.api_id, cap_key=cap.key,
+                    upstream_model=upstream_model, prompt=prompt, images=image,
+                    size=size, tier=tier, n=n, seed=seed,
+                    negative_prompt=body.get("negative_prompt"),
+                    duration_ms=duration_ms, aspect_ratio=aspect_ratio)
+                prev = next(
+                    (r for r in self.store.active_for_credential(
+                        credential, since=(now - window) if window > 0 else None)
+                     if _fingerprint_of_record(r) == fp), None)
+                if prev is not None:
+                    self._dedupe_hits += 1
+                    OBS.info("accept deduped", task_id=prev.task_id,
+                             model=prev.model, capability=prev.cap_key,
+                             status=prev.status,
+                             age_s=now - (prev.created_at or now), n=prev.n,
+                             dedupe_hits=self._dedupe_hits)
+                    return prev
+            self.store.put(rec)
 
         # 🔴 2026-10-02：`jimeng-audit`（素材预审）**在受理时同步完成**。
         # 为什么不用"建任务→派发→轮询"那条通用路：预审本身是**同步接口**

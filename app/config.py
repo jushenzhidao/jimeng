@@ -113,6 +113,21 @@ class Settings:
     #: 变成"立刻知道该等一会儿"，而不是先收下再让人干等。
     max_queued_per_credential: int = 0
 
+    #: 🔴 2026-10-15（用户口径"减少无效重试"）：**受理去重** —— 同一凭据 +
+    #: 同一请求指纹 + 上一条**仍在途**（queued / in_progress）⇒ 直接复用那条任务
+    #: （不新建、**不重复计费**、不占新的队列位）。
+    #: 为什么必须补：调用方（网关）把 `202 + task_id` 当成"没有图"去重投 ——
+    #: 线上实测同一秒连发 4~5 条**一模一样**的请求，每条都建一个**真实生成任务**
+    #: （每次都可能计费），还把队列灌满、让所有人的同步请求一起降级。
+    #: ⚠️ **只覆盖"在途"**：上一条已到终态后照常新建 —— 那时的重复提交更可能是
+    #: "我还想要一张"（要第二张请用 `n=2` 或换 `seed`），不是重试。
+    #: 关掉（`ACCEPT_DEDUPE_ENABLED=0`）即回到"来多少建多少"的旧行为。
+    accept_dedupe_enabled: bool = True
+    #: 去重窗口（秒）：只认 `created_at >= now - 本值` 的在途任务。
+    #: 默认 600 = 与 `TASK_TIMEOUT` 同量级（在途任务的自然寿命），
+    #: 免得一条卡死的僵尸任务在它整个寿命里吞掉所有重复提交。**0 = 只看非终态**。
+    accept_dedupe_window_s: int = 600
+
     # ------------------------------------------------------------ 协调器
     coordinator_enabled: bool = True
     #: 🔴 **默认关**：自动续生成（`action=2`）的判据**尚未确定** ——
@@ -297,6 +312,8 @@ class Settings:
             poll_grace=_f("POLL_GRACE", 0.2),
             task_timeout=_f("TASK_TIMEOUT", 1800.0),
             max_queued_per_credential=_i("MAX_QUEUED_PER_CREDENTIAL", 0),
+            accept_dedupe_enabled=_b("ACCEPT_DEDUPE_ENABLED", True),
+            accept_dedupe_window_s=_i("ACCEPT_DEDUPE_WINDOW_S", 600),
             coordinator_enabled=_b("COORDINATOR_ENABLED", True),
             continue_enabled=_b("CONTINUE_ENABLED", False),
             upscale_4k_enabled=_b("UPSCALE_4K_ENABLED", True),
@@ -343,6 +360,9 @@ class Settings:
             raise ConfigError("TASK_TIMEOUT 必须 > 0")
         if self.max_queued_per_credential < 0:
             raise ConfigError("MAX_QUEUED_PER_CREDENTIAL 必须 >= 0（0 = 不限）")
+        if self.accept_dedupe_window_s < 0:
+            raise ConfigError(
+                "ACCEPT_DEDUPE_WINDOW_S 必须 >= 0（0 = 只看非终态）")
         if self.jimeng_poll_interval <= 0:
             raise ConfigError("JIMENG_POLL_INTERVAL 必须 > 0")
         if self.task_retention_days < 1:

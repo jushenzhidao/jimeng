@@ -502,6 +502,28 @@ class TaskStore:
         with Session(self.engine) as s:
             return int(s.exec(stmt).one())
 
+    def active_for_credential(self, credential_id: str, *,
+                              since: int | None = None,
+                              limit: int = 50) -> list[TaskRecord]:
+        """该凭据名下**非终态**（queued / in_progress）的任务，**新 → 旧**。
+
+        🔴 2026-10-15：**受理去重**（`Service.create`）用它找"上一条一模一样的
+        在途任务"。`since` = 去重窗口下界（`created_at >= since`）——
+        没有它的话，一条卡死的僵尸任务会在它整个寿命里吞掉所有重复提交。
+        """
+        stmt = (select(TaskRecord)
+                .where(TaskRecord.credential_id == credential_id)
+                .where(TaskRecord.status.in_(ACTIVE_STATES))  # type: ignore[attr-defined]
+                .order_by(TaskRecord.created_at.desc())
+                .limit(limit))
+        if since is not None:
+            stmt = stmt.where(TaskRecord.created_at >= since)
+        with Session(self.engine) as s:
+            rows = list(s.exec(stmt).all())
+            for r in rows:
+                s.expunge(r)
+            return rows
+
     def queue_snapshot(self, *, top: int = 5) -> dict:
         """队列水位快照：排队数 / 最老等待秒数 / 按凭据的 top N。
 

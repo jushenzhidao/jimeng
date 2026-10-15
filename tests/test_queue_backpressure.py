@@ -29,13 +29,19 @@ def test_backpressure_is_off_by_default(client):
 def test_backpressure_rejects_when_the_credential_queue_is_full(client_factory):
     """达到单凭据上限 ⇒ **429 `queue_overloaded`** + `Retry-After`。"""
     c = client_factory(max_queued_per_credential=2)
-    body = {"model": "jimeng-t2i", "prompt": "x"}
 
+    # ⚠️ 每条 prompt **必须不同**：2026-10-15 起有**受理去重**（同凭据 + 同请求
+    # 指纹 + 上一条仍在途 ⇒ 复用同一条任务，见 `Service.create`）——
+    # 用同一个 body 连发会被收敛成一条，队列永远到不了上限。
+    # 这里要测的是"把队列灌满"，所以按语义给不同请求。
     for i in range(2):
-        r = c.post("/async/v1/images/generations", json=body, headers=AUTH)
+        r = c.post("/async/v1/images/generations",
+                   json={"model": "jimeng-t2i", "prompt": f"fill{i}"},
+                   headers=AUTH)
         assert r.status_code == 202, f"第 {i + 1} 条应当被受理：{r.text}"
 
-    r = c.post("/async/v1/images/generations", json=body, headers=AUTH)
+    r = c.post("/async/v1/images/generations",
+               json={"model": "jimeng-t2i", "prompt": "overflow"}, headers=AUTH)
 
     assert r.status_code == 429, r.text
     err = r.json()["error"]
@@ -49,13 +55,16 @@ def test_backpressure_rejects_when_the_credential_queue_is_full(client_factory):
 def test_backpressure_is_per_credential_not_global(client_factory):
     """背压按**凭据**算：一个号灌满了，不该连坐别的号。"""
     c = client_factory(max_queued_per_credential=1)
-    body = {"model": "jimeng-t2i", "prompt": "x"}
 
-    assert c.post("/async/v1/images/generations", json=body,
+    # ⚠️ 三条 prompt 各不相同 —— 同体连发会被**受理去重**收敛（见上一个用例的说明）。
+    assert c.post("/async/v1/images/generations",
+                  json={"model": "jimeng-t2i", "prompt": "a1"},
                   headers=AUTH).status_code == 202
-    assert c.post("/async/v1/images/generations", json=body,
+    assert c.post("/async/v1/images/generations",
+                  json={"model": "jimeng-t2i", "prompt": "a2"},
                   headers=AUTH).status_code == 429        # A 满了
-    assert c.post("/async/v1/images/generations", json=body,
+    assert c.post("/async/v1/images/generations",
+                  json={"model": "jimeng-t2i", "prompt": "b1"},
                   headers=AUTH_B).status_code == 202      # B 不受影响
 
 

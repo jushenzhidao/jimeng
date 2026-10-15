@@ -316,7 +316,10 @@ def test_video_defaults_and_n_degradation(app_and_client, fake_jimeng, client_st
     # n 已无 HTTP 入口（方舟契约没有张数字段），受理层留痕逻辑仍要在：
     from conftest import KEY_A
     cred = client_state.service.credential_of(KEY_A)
-    rec2 = client_state.service.create({"prompt": "x", "n": 3},
+    # ⚠️ prompt 必须与上面那条**不同**：2026-10-15 起有**受理去重**
+    # （同凭据 + 同指纹 + 上一条仍在途 ⇒ 复用同一条任务）。这里问的其实是
+    # "另一条视频请求里 n 怎么处理"，用同一个 prompt 会被（正确地）收敛掉。
+    rec2 = client_state.service.create({"prompt": "y", "n": 3},
                                        credential=cred, video=True)
     assert rec2.n == 1
     assert any("n=3" in d and "n=1" in d for d in rec2.degradations)
