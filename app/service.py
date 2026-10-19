@@ -2985,9 +2985,14 @@ class Service:
         # 🔴 bridge 生成腿**恒 2k 直出**（2026-10-16 口径"1-2k 定向到2k
         # 即可"）：1k/2k 请求都按 2k 交付（1k 档 UI 自动化的坑就此绕开）；
         # 4k 请求已由改道块把生成腿定为 2k，交付 4096 由超分链补。
+        # 🔴 2026-10-19（用户口径"一次固定出 4 张……这个是可以控制的"）：
+        # 张数**必须传**给 bridge —— UI 参数面板里有 "Images to generate"（1..8），
+        # 不传就按面板默认 4 张出图。国际站 36/张，4 张 = 144，
+        # 也就是"调用方要 1 张、我们却花了 4 倍的钱"。
         body = {"prompt": rec.prompt, "model": display,
                 "resolution": "2k",
-                "ratio": self._nearest_ui_ratio(w, h)}
+                "ratio": self._nearest_ui_ratio(w, h),
+                "count": int(rec.n or 1)}
         r = _httpx.post(f"{self.settings.sg_bridge_url}/generate-ui-async",
                         json=body, timeout=30.0, trust_env=False)
         r.raise_for_status()

@@ -630,7 +630,7 @@ Authorization: Bearer <key>
 调用方不必去别处对照名字。
 
 - `credits_by_site`（2026-10-19 起）：**按站点**的实测单价，如
-  `{"cn": 0, "sg": 9.5}`。跨站调用方**只认它**。
+  `{"cn": 0, "sg": 36}`。跨站调用方**只认它**。
 - `credits_measured`：**单值**，只在"所有已登记站点同价"时给数；
   两站不同价时为 `null`（宁可不给，也不报一个只对一侧成立的数）。
 - `ark_name`：可原样传的**火山方舟模型名**，该档位没有方舟对应名时为 `null`。
@@ -640,7 +640,7 @@ Authorization: Bearer <key>
 | `model` 传这个 key | 上游名字 | 方舟对应名 | 张数选项 | 实测单价（按站点） |
 |---|---|---|---|---|
 | `high_aes_general_v50_flash` | **Seedream 5.0 Flash** | `doubao-seedream-5-0-flash-260915` | **1..4** | **3/张** |
-| `high_aes_general_v50`（**默认**） | Seedream 5.0 **Lite** | — | 1..8 | **国内 0 / 国际 9.5 每张**（国际站一次 4 张实扣 38） |
+| `high_aes_general_v50`（**默认**） | Seedream 5.0 **Lite** | — | 1..8 | **国内 0 / 国际 36 每张**（`user_credit_history` 实测：1 张 36、4 张 144） |
 | `high_aes_general_v50p_large` | **Seedream 5.0 Pro** | — | **1..4** | **8/张** |
 | `high_aes_general_v43` | Seedream 4.7 | — | 1..8 | 未测 |
 | `high_aes_general_v42` | Seedream 4.6 | — | 1..8 | 未测 |

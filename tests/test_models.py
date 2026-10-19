@@ -664,9 +664,10 @@ def test_upstream_model_credits_table_does_not_drift():
             assert site in ("cn", "sg"), f"{key} 的站点名 {site!r} 不认识"
             assert cost is None or cost >= 0, (key, site)
     # 🔴 2026-10-19 按站点分：Lite **两站不同价** —— 国内 2k 免费，
-    # 国际站 4 张实扣 38（≈9.5/张）。单值口径因此必须是 None（不许报 0）。
+    # 国际站 **36/张**（1 张 36、4 张 144，`user_credit_history` 两证）。
+    # 单值口径因此必须是 None（不许报 0）。
     assert UPSTREAM_MODEL_CREDITS_BY_SITE["high_aes_general_v50"]["cn"] == 0
-    assert UPSTREAM_MODEL_CREDITS_BY_SITE["high_aes_general_v50"]["sg"] == 9.5
+    assert UPSTREAM_MODEL_CREDITS_BY_SITE["high_aes_general_v50"]["sg"] == 36
     assert UPSTREAM_MODEL_CREDITS["high_aes_general_v50"] is None, \
         "两站不同价 ⇒ 单值必须 None（报 0 就等于对国际站说'免费'）"
     assert UPSTREAM_MODEL_CREDITS_BY_SITE["high_aes_general_v50_flash"]["cn"] == 3, \
@@ -692,7 +693,7 @@ def test_catalog_exposes_upstream_models_for_t2i_and_i2i():
             for u in m["upstream_models"]:
                 assert u["credits_measured"] == UPSTREAM_MODEL_CREDITS[u["key"]], u
                 # 🔴 2026-10-19：分站点单价必须出现在清单里 ——
-                # 只给单值会让国际站调用方把 Lite(9.5/张) 当免费。
+                # 只给单值会让国际站调用方把 Lite(36/张) 当免费。
                 assert u["credits_by_site"] == UPSTREAM_MODEL_CREDITS_BY_SITE[u["key"]], u
                 # 🔴 `pass_as` = 全部可传写法，必须包含 key 本身 + 指向它的每个别名
                 expect = passable_model_strings(u["key"])

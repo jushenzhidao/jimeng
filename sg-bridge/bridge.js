@@ -192,7 +192,7 @@ const HISTORY_QS = "aid=513641&device_platform=web&region=PH"
   + "&da_version=3.3.30&web_version=7.5.0";
 // UI 流程核心：切 AI Image → （可选）选模型/档位 → 填 prompt → 发送 →
 // 返回 submit_id。终态轮询由调用方直连读接口完成（读接口不受 shark 影响）。
-async function generateUiCore({ prompt, model, resolution, ratio }) {
+async function generateUiCore({ prompt, model, resolution, ratio, count }) {
   const p0 = await ensureLogin();
   const p = p0.p;
   // 🔴 模型/模式必须选 AI Image（默认 AI Agent 的提交不走
@@ -226,7 +226,7 @@ async function generateUiCore({ prompt, model, resolution, ratio }) {
   // 🔴 比例/档位都在**参数面板**里（点参数行的档位按钮才渲染——实测
   // 面板不开时控件不在 DOM）。比例 = 面板顶部格子（SPAN 叶子，文本
   // "1:1"/"16:9"/…）；档位 = radiogroup 的 radio（value 1k/2k/4k）。
-  if (ratio || resolution) {
+  if (ratio || resolution || count) {
     await p.evaluate(() => {
       const b = [...document.querySelectorAll("button")]
         .find((x) => /2K/.test(x.textContent || "")
@@ -250,6 +250,24 @@ async function generateUiCore({ prompt, model, resolution, ratio }) {
         if (radio) radio.click();
       }, String(resolution)).catch(() => {});
       await p.waitForTimeout(500);
+    }
+    // 🔴 2026-10-19：张数（"Images to generate"，1..8 的 radio-group）。
+    // 不选就按面板默认 4 张出图 —— 国际站 36/张，4 张 = 144，
+    // 调用方要 1 张时等于多花 3 倍。实测 DOM：
+    //   [class*='generate-count-field'] > .lv-radio-group（选项是叶子节点文本 1..8）
+    if (count) {
+      await p.evaluate((want) => {
+        const field = document.querySelector("[class*='generate-count-field']");
+        if (!field) return false;
+        const el = [...field.querySelectorAll("span,div,label")]
+          .find((e) => e.childElementCount === 0
+                       && (e.textContent || "").trim() === String(want)
+                       && e.getBoundingClientRect().width > 0);
+        if (!el) return false;
+        (el.closest("label") || el.closest("button") || el).click();
+        return true;
+      }, String(count)).catch(() => {});
+      await p.waitForTimeout(600);
     }
   }
   const comp = p.locator('[contenteditable="true"]').first();
