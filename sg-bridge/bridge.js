@@ -195,6 +195,9 @@ const HISTORY_QS = "aid=513641&device_platform=web&region=PH"
 async function generateUiCore({ prompt, model, resolution, ratio, count }) {
   const p0 = await ensureLogin();
   const p = p0.p;
+  // ⚠️ 2026-10-19：这里**不要**加 `goto` 兜底 —— 实测加完会让后续 UI 流程
+  // 卡住（任务一直 in_progress 到 TASK_TIMEOUT）。页面位置由
+  // `ensureLogin()` 的 START_URL 保证；模型选择器不可见时宁可**报错不提交**。
   // 🔴 模型/模式必须选 AI Image（默认 AI Agent 的提交不走
   // aigc_draft/generate）。用「locate 坐标 → 真鼠标点击」模式：
   // DOM 生命周期（React 重渲染）会让 locator.click 卡死，坐标不受影响。
@@ -408,7 +411,12 @@ async function withUiLock(fn) {
 // 🔱 异步入口（jimeng-service 派发线程用）：立即返回 handle，UI 流程后台跑。
 // 派发线程 20s+ 的 UI 流程会阻塞 WORKERS=1 的串行派发 —— 绝不能同步等。
 app.post("/generate-ui-async", async (req, res) => {
-  const { prompt, model, resolution, ratio } = req.body || {};
+  // 🔴 2026-10-19 事故：这里原来只解构 4 个字段，**漏了 `count`**
+  // ⇒ 服务的 `n` 在这一层被丢掉，`generateUiCore` 拿到 undefined，
+  // 直接跳过张数选择、按 UI 默认出 **4 张**（144 积分）。
+  // 同参数走同步端点 `/generate-ui` 是好的（那里全量 `Object.assign`），
+  // 所以"手工测通了"不等于"服务链路通"。
+  const { prompt, model, resolution, ratio, count } = req.body || {};
   if (!prompt) return res.status(400).json({ error: "prompt required" });
   const id = "h" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
   HANDLES.set(id, { state: "running", startedAt: Date.now() });
@@ -428,7 +436,7 @@ app.post("/generate-ui-async", async (req, res) => {
     p.on("request", onRequest);
     try {
       await withUiLock(() => generateUiCore({ prompt, model, resolution,
-        ratio }));
+        ratio, count }));
       const dl = Date.now() + 15000;
       while (!genSubmitId && Date.now() < dl) await p.waitForTimeout(300);
       if (!genSubmitId) throw new Error("no generate request observed");
