@@ -23,6 +23,10 @@ pgdata/
 
 # ---- Python ----
 __pycache__/
+
+# Node 依赖（sg-bridge 本地 npm install 产物，不进镜像也不进仓库）
+node_modules/
+package-lock.json
 *.py[cod]
 *.egg-info/
 .venv/

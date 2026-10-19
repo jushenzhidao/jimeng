@@ -69,6 +69,7 @@ from .observability import (
     should_log_path,
 )
 from .service import SYNC_WAIT_POLL_INTERVAL, Service, view
+from .sg_login import parse_account_token
 from .store import TaskRecord
 
 # ---------------------------------------------------------------------------
@@ -138,6 +139,33 @@ def _bearer(request: Request) -> str | None:
     return raw.strip() or None
 
 
+async def _sessionid(request: Request) -> str | None:
+    """本请求真正要用的**上游 sessionid**。
+
+    `Bearer` 有两种合法形态（2026-10-19 新增第二种）：
+
+      · `<sessionid>`  —— 原样透传（现状，绝大多数调用方走这条）；
+      · `<邮箱>|<密码>` —— 服务端调 CapCut passport 登录，换回 sessionid
+        （登录结果按 TTL 缓存，见 `app/sg_login.py`）。
+
+    🔴 为什么解析放在这里而不是 `bundle_for`：`bundle_for` 是**同步**的，
+    而登录是网络 IO（必须是 async，否则会堵死事件循环）。把它挡在
+    "进入 service 之前"还有两个好处：
+      · 下游（受理/派发/轮询/预审）**完全不知道**有两种形态；
+      · 任务行里落的 `upstream_sessionid` 是**真 sid**，站点探测/计费对账
+        的行为与透传完全一致。
+
+    ⚠️ 登录失败会抛 `AuthError`（401）/ `RiskControlError`（429）——
+    都在**建任务之前**，所以不会产生"垃圾任务行"。
+    """
+    raw = _bearer(request)
+    parsed = parse_account_token(raw)
+    if parsed is None:
+        return raw
+    svc: Service = request.app.state.service
+    return await svc.sessionid_for_account(*parsed)
+
+
 def require_key(request: Request) -> str:
     """校验调用方 Key，返回**凭证指纹**（不是明文）。
 
@@ -188,7 +216,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             yield
         finally:
             app.state.coordinator.stop()
-            app.state.service.close()
+            await app.state.service.aclose()
             # 短命进程必须显式 flush，否则退出时最后一批 span 直接丢
             OBS.flush()
             logger.info("jimeng-service 已停止")
@@ -559,7 +587,7 @@ def _install_routes(app: FastAPI) -> None:
         """
         svc: Service = request.app.state.service
         rec = svc.create(body.model_dump(), credential=credential,
-                         sessionid=_bearer(request))
+                         sessionid=await _sessionid(request))
 
         # 叫醒协调器：不然这条任务要等到下一个 tick 才被发现（默认最多白等 1s）。
         # 纯优化 —— 唤醒丢了也只是慢一个 tick，"该派发谁"始终由库里的状态决定。
@@ -622,7 +650,7 @@ def _install_routes(app: FastAPI) -> None:
                                    request.app.state.coordinator,
                                    request.app.state.settings,
                                    body.model_dump(), credential=credential,
-                                   sessionid=_bearer(request))
+                                   sessionid=await _sessionid(request))
 
         status_code, payload = view(
             rec, show_degradations=request.app.state.settings.show_degradations)
@@ -709,7 +737,7 @@ def _install_routes(app: FastAPI) -> None:
         rec = await _sync_generate(request.app.state.service,
                                    request.app.state.coordinator, settings,
                                    body, credential=credential,
-                                   sessionid=_bearer(request),
+                                   sessionid=await _sessionid(request),
                                    preset_degradations=degradations)
         status_code, payload = view(
             rec, show_degradations=request.app.state.settings.show_degradations)
@@ -789,7 +817,7 @@ def _install_routes(app: FastAPI) -> None:
         our, degradations = ark_translate(ark_body)
         svc: Service = request.app.state.service
         rec = svc.create(our, credential=credential,
-                         sessionid=_bearer(request), video=True,
+                         sessionid=await _sessionid(request), video=True,
                          preset_degradations=degradations,
                          ark_model=str(ark_body.get("model") or ""))
         request.app.state.coordinator.wake()
@@ -931,7 +959,7 @@ h2{{color:#7cb0ff}}a{{color:#7cb0ff}}td,th{{border-color:#1e2836}}}}</style></he
                                     "image": images}
         args = (request.app.state.service, request.app.state.coordinator,
                 request.app.state.settings, our_body)
-        kwargs = {"credential": credential, "sessionid": _bearer(request)}
+        kwargs = {"credential": credential, "sessionid": await _sessionid(request)}
 
         if body.get("stream"):
             # `_chat_sse` 现在是 **async 生成器**（`produce` 也是 async）⇒

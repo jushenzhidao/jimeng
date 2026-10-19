@@ -47,11 +47,33 @@ _ERROR_NOTES: dict[str, str] = {
 
 
 def _billing_of(item: dict) -> str:
-    """单价文案：`credits_measured` 是**实测值**，0 表示实测免费（不是没测过）。"""
+    """单价文案。
+
+    `credits_measured` 是**实测值**，0 表示实测免费（不是没测过）。
+    🔴 2026-10-19 起上游模型带 `credits_by_site`（两站不同价）——
+    有它就**按站列**，否则退回单值文案。国际站 Lite 2k 是 9.5/张
+    而国内是 0，只写一个数必然误导一侧。
+    """
+    by = item.get("credits_by_site") or {}
+    if by:
+        parts: list[str] = []
+        for site in ("cn", "sg"):
+            if site not in by:
+                continue
+            v = by[site]
+            label = "国内" if site == "cn" else "国际"
+            if v is None:
+                parts.append(f"{label}: 未实测")
+            elif v == 0:
+                parts.append(f"{label}: **0（实测免费）**")
+            else:
+                parts.append(f"{label}: {v:g} 积分/张")
+        if parts:
+            return "；".join(parts)
     c = item.get("credits_measured")
     if c is None:
         return "未知"
-    return "**0（实测免费）**" if c == 0 else f"{c} 积分/次（实测）"
+    return "**0（实测免费）**" if c == 0 else f"{c:g} 积分/次（实测）"
 
 
 def render(settings: Settings) -> str:
@@ -129,7 +151,7 @@ def render(settings: Settings) -> str:
             ark = m.get("ark_name")
             add(f"| `{m['key']}` | `{m['key']}` | {m.get('web_name') or '—'} | "
                 f"{('`' + ark + '`') if ark else '—'} | "
-                f"{_billing_of({'credits_measured': m.get('credits_measured')})} |")
+                f"{_billing_of(m)} |")
     if not seen:
         add("| — | — | — | — | — |")
     add("")

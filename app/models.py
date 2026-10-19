@@ -324,43 +324,71 @@ UPSTREAM_WEB_NAMES: dict[str, str] = {
     "jm_image_model_gg_bp_21": "Nano Banana 2.1",
 }
 
-#: 上游模型 → **实测**单价（积分/张）。`None` = 未实测（**不等于免费**）。
+#: 上游模型 → **站点** → 实测单价（积分/张）。`None` = 该站未实测（**不等于免费**）。
 #:
-#: 🔴 为什么必须与能力级 `Capability.credits_measured` **分开**：
-#: `jimeng-t2i` 的能力级实测价是 **0** —— 那是 **Lite 口径**；而同一个 t2i 端点
-#: 换模型就换价：Flash 实测 **3**、Pro 实测 **8**。把能力级的值抄给每个上游模型，
-#: 等于对 Flash 报"免费"（那是会让调用方算错成本的那种错）。
-UPSTREAM_MODEL_CREDITS: dict[str, int | None] = {
+#: 🔴 2026-10-19 **按站点分**（用户口径"按站点分"）：同一个上游 key 两站
+#: **不同价** —— 国际站 Lite 2k 实测 **9.5/张**（一次 4 张实扣 **38**，
+#: `submit_id=b42fca0f-4035-43c6-9c98-cc0d19753ee9`，UI 预告 `4 | 36/image`），
+#: 而国内同档是 **0**。单值表会把国际站的价报成"免费"，那是会让调用方
+#: 算错成本的那种错报 ⇒ 拆表。
+#:
+#: ⚠️ 两个口径要说清：
+#:   · 这里记的是**每张**；上游**按次结算**（一次固定出 4 张）⇒ 小 `n` 的
+#:     估算会被"4 张固定产出"放大（要 1 张也扣一次的价）。
+#:   · 没登记的站点 = 该模型在该站**不存在/未测**（不是"免费"）。
+#:     全部未测的（国际站 GPT 系 / Nano Banana 系）显式写 `None`。
+UPSTREAM_MODEL_CREDITS_BY_SITE: dict[str, dict[str, float | None]] = {
+    # ---- 国内（2026-09-20 ~ 10-02 实测）
     # 2026-10-02 实测：4 张实扣 **20**（=5/张）；提交包预扣 amount=1 只是档位标记
-    "jm_image_model_yc_mj82": 5,
-    "high_aes_general_v50_flash": 3,      # 2026-09-23 实跑（2k/1 张，三证吻合）
-    # 🔴 2026-10-02 更正：Lite **不是"免费"**，是**按分辨率档**收的：
+    "jm_image_model_yc_mj82": {"cn": 5},
+    "high_aes_general_v50_flash": {"cn": 3},   # 2026-09-23 实跑（2k/1 张，三证吻合）
+    # 🔴 Lite **不是"免费"**，是**按分辨率档**收的（国内口径）：
     # · **2k 实测 0**（2026-09-20 余额差分 + 消耗记录，长期未变）；
-    # · **4k 实测 4/张**（`submit_id=07144215…`，余额 5526→5522 +
-    #   消耗记录 `图片生成 amount=4` 两证吻合）。
-    # 服务端也这么声明：`blend` 段有**两条独立计费项**
-    # （2k = `image_basic_v5_2k` / 4k = `image_basic_v5_4k`，各 amount=1）。
-    # ⚠️ **这里只登记 2k 口径**（默认档、最常用、也是"免费"口碑的来源），
-    # `credits_measured` 是**单值**字段、表达不了"按档定价"——
-    # 调用方若拿它当"这个模型恒免费"就会在 4k 上踩坑。
-    # 4k 的真实单价见 docs/UPSTREAM.md 与 `service.create` 的分档留痕。
-    # 🔴 2026-10-12：**4k 请求默认会自动改走「2k 生成 + 超清」**（超清免费，
-    # 见 `Settings.upscale_4k_enabled`）⇒ 那笔 4/张在改道成立时**不再发生**；
-    # 只有改道不成立（开关关 / 能力表读不到 / 该比例无 2k 槽）才直出 4k。
-    "high_aes_general_v50": 0,
-    "high_aes_general_v50p_large": 8,     # 2026-09-20 实测（三尺寸同价）
-    "high_aes_general_v43": None,
-    "high_aes_general_v42": None,
-    "high_aes_general_v40l": None,
-    "high_aes_general_v41": None,
-    "high_aes_general_v40": None,
-    # ---- 国际版特有：**全部未实测**（credits 体系与国内不同，未对账；
-    # 建任务=计费的红线下不实跑）⇒ /v1/models 不报价。⚠️ 未实测 ≠ 免费。
-    "dreamina_gpt_image_2_5_flare": None,
-    "dreamina_gpt_image_2_5_sunburst": None,
-    "gpt_image_2": None,
-    "gemini_3_image_pro": None,
-    "jm_image_model_gg_bp_21": None,
+    # · **4k 实测 4/张**（`submit_id=07144215…`，余额 5526→5522）。
+    # ⚠️ 这里登记的是 **2k 默认档**；4k 直出才走 4/张，而 4k 默认改走
+    # 「2k 生成 + 超清」（超清免费）⇒ 那笔钱多数情况下不再发生。
+    # 国际站 2k **不免费**：一次 4 张实扣 38（≈9.5/张）。
+    "high_aes_general_v50": {"cn": 0, "sg": 9.5},
+    "high_aes_general_v50p_large": {"cn": 8},  # 2026-09-20 实测（三尺寸同价）
+    "high_aes_general_v43": {"cn": None},
+    "high_aes_general_v42": {"cn": None},
+    "high_aes_general_v40l": {"cn": None},
+    "high_aes_general_v41": {"cn": None},
+    "high_aes_general_v40": {"cn": None},
+    # ---- 国际版特有：**全部未实测**（credits 体系与国内不同，未对账）。
+    # ⚠️ 未实测 ≠ 免费；`/v1/models` 会照实给 `None`。
+    "dreamina_gpt_image_2_5_flare": {"sg": None},
+    "dreamina_gpt_image_2_5_sunburst": {"sg": None},
+    "gpt_image_2": {"sg": None},
+    "gemini_3_image_pro": {"sg": None},
+    "jm_image_model_gg_bp_21": {"sg": None},
+}
+
+
+def credits_by_site(key: str) -> dict[str, float | None]:
+    """某上游模型的**分站点**单价（返回副本，调用方改不到表）。"""
+    return dict(UPSTREAM_MODEL_CREDITS_BY_SITE.get(key, {}))
+
+
+def credits_measured(key: str) -> float | None:
+    """**单值**口径：只有"已登记站点全部同价"时才给值，否则 `None`。
+
+    🔴 为什么不同价必须给 `None`：`credits_measured` 是单值字段，两站价不同
+    时它**必然误导一侧**（Lite：cn=0 / sg=9.5）。宁可不给，让调用方看
+    `credits_by_site` —— 报一个错数比报"未知"更坏。
+
+    `None` 与"表里没有这个 key"在外层是同一件事（未实测/未登记），
+    调用方都应按"未知"处理（别当免费）。
+    """
+    vals = {v for v in UPSTREAM_MODEL_CREDITS_BY_SITE.get(key, {}).values()
+            if v is not None}
+    return vals.pop() if len(vals) == 1 else None
+
+
+#: 🔁 **派生视图**（保留旧名字给既有调用方/脚本）：单值口径，含义见
+#: `credits_measured()`。两站不同价的模型在这里是 `None`。
+UPSTREAM_MODEL_CREDITS: dict[str, float | None] = {
+    k: credits_measured(k) for k in UPSTREAM_MODEL_CREDITS_BY_SITE
 }
 
 #: 文生图族才吃上游模型 —— 目录里只给这一个能力挂 `upstream_models`。
@@ -1142,8 +1170,11 @@ def catalog() -> list[dict]:
                  "ark_name": UPSTREAM_ARK_NAMES.get(k),
                  "pass_as": passable_model_strings(k),
                  #: 🔴 用**按模型**的实测价，不是能力级的值 —— 见
-                 #: `UPSTREAM_MODEL_CREDITS` 的注释（能力级是 Lite 口径）
-                 "credits_measured": UPSTREAM_MODEL_CREDITS.get(k)}
+                 #: `UPSTREAM_MODEL_CREDITS_BY_SITE` 的注释（能力级是 Lite 口径）。
+                 #: `credits_measured` 只在两站同价时给值；跨站必看
+                 #: `credits_by_site`（2026-10-19 起）。
+                 "credits_measured": credits_measured(k),
+                 "credits_by_site": credits_by_site(k)}
                 for k in UPSTREAM_MODEL_KEYS
             ]
         out.append(item)
@@ -1158,6 +1189,7 @@ __all__ = [
     "Capability", "CAPABILITIES", "REGISTRY", "ALIASES", "catalog",
     "resolve", "is_placeholder", "DELIBERATE_ABSENCES",
     "DEFAULT_UPSTREAM_MODEL", "UPSTREAM_MODEL_KEYS", "PLACEHOLDER_MODELS",
+    "UPSTREAM_MODEL_CREDITS_BY_SITE", "credits_by_site", "credits_measured",
     "UPSTREAM_MODEL_ALIASES", "UNSUPPORTED_WEB_MODELS", "UPSTREAM_WEB_NAMES",
     "UPSTREAM_ARK_NAMES",
 ]

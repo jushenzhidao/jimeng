@@ -94,6 +94,20 @@ class Settings:
     #: shark 拒）。单实例部署形态：compose 内网 `http://sg-bridge:8300`。
     sg_bridge_url: str = ""
 
+    # ------------------------------------------------- 国际站账号登录（2026-10-19）
+    #: 🔴 用户口径："国际版即梦 增加鉴权方式 bearer 账号|密码"。
+    #: 开 ⇒ Bearer 允许 `邮箱|密码` 形态：服务端调 CapCut passport 登录，
+    #: 换回 sessionid 后走**原有全部链路**（对下游完全透明）。
+    #: 关 ⇒ 该形态一律 401，提示改用 sessionid（保留开关是为了
+    #: "密码进内存"这件事在合规上可一键关掉）。
+    sg_login_enabled: bool = True
+    #: 登录结果缓存 TTL（秒）。`0` = 用模块默认 12h。
+    #: 上游 sessionid 本身 60 天（Max-Age=5184000），但风控/改密会提前失效，
+    #: 缓存短一点换"自愈快"：最坏情况是每 12h 多一次登录往返。
+    sg_login_cache_ttl: int = 0
+    #: 缓存条目上限（LRU）。多账号部署可调大。
+    sg_login_cache_max: int = 64
+
     # ------------------------------------------------------------ 对外鉴权
     #:🔴 2026-10-03 起**不再参与鉴权**（sessionid 透传：Bearer 就是凭据）。
     #: 保留字段仅为不破坏现有 `.env`；这里刻意**加一处读取**（见
@@ -339,6 +353,9 @@ class Settings:
                 int(sgws) if (sgws := _s("JIMENG_SG_WORKSPACE_ID", "")) else None),
             show_degradations=_s("SHOW_DEGRADATIONS", "") in ("1", "true", "yes"),
             sg_bridge_url=_s("SG_BRIDGE_URL", "").rstrip("/"),
+            sg_login_enabled=_b("SG_LOGIN_ENABLED", True),
+            sg_login_cache_ttl=_i("SG_LOGIN_CACHE_TTL", 0),
+            sg_login_cache_max=_i("SG_LOGIN_CACHE_MAX", 64),
             api_keys=_csv("API_KEYS"),
             jm_concurrency=_i("JM_CONCURRENCY", 1),
             jm_min_interval=_f("JM_MIN_INTERVAL", 0.0),

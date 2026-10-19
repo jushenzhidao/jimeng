@@ -54,6 +54,7 @@ from .errors import (
 from .gate import UpstreamGate, build_gate
 from .media import Blob, load_images, load_one, normalize, reuse_image_uri
 from .observability import OBS
+from .sg_login import SgAccountLogin
 from .store import TaskRecord, TaskStore
 from .upstream.jimeng import (
     DEFAULT_MODEL,
@@ -80,7 +81,7 @@ from .upstream.jimeng import (
 from .upstream.jimeng.capabilities import ModelConfigCache
 from .upstream.jimeng.client import (BASE, CODES_SECURITY, is_security_key,
                                      is_text_policy_failure)
-from .upstream.jimeng.site import CN_SITE, SITES, SiteProfile, with_overrides
+from .upstream.jimeng.site import CN_SITE, SG_SITE, SITES, SiteProfile, with_overrides
 
 log = logging.getLogger(__name__)
 
@@ -518,6 +519,11 @@ class Service:
         #: `get_common_config`（零成本读，但仍是网络字节）—— 测试用
         #: MockTransport 接住它，守住"零真上游调用"纪律。
         self._upstream_transport = upstream_transport
+        #: 🔴 2026-10-19（用户口径"国际版即梦 增加鉴权方式 bearer 账号|密码"）：
+        #: `账号|密码` → sessionid 的登录器（缓存 / 并发去重 / 1015 自愈）。
+        #: 对下游**完全透明**：登录出来的就是一把普通 sessionid，
+        #: 站点探测、计费、属主校验全部复用原有链路。
+        self.sg_login = SgAccountLogin(settings)
 
     # ------------------------------------------------------- 透传：客户端池
 
@@ -601,7 +607,14 @@ class Service:
         #（会串行化所有请求）。
         uncertain: list[str] = []
         chosen: tuple | None = None
-        for site in SITES:
+        #: 🔴 2026-10-19：**已知归属就直接从它开始探**。
+        #: 两个来源：账号登录器（`sessionid_for_account` 写 SG）与上一次探测。
+        #: 不利用它的话，每个"账号|密码"换来的新 sessionid 都要先去国内站
+        #: 吃一次 1015（一次白跑的往返 + 一条容易误读的告警）。
+        known = self._site_cache.get(sessionid)
+        order = ((known,) + tuple(s for s in SITES if s.name != known.name)
+                 if known is not None else SITES)
+        for site in order:
             profile = self._profile_for(site)
             bundle = self._build_bundle(sessionid, profile)
             c = bundle[0]
@@ -709,6 +722,22 @@ class Service:
         """从任务行取回**原始** sessionid（明文；空 ⇒ 走默认凭据）。"""
         return getattr(rec, "upstream_sessionid", None) or None
 
+    def _note_auth_failure(self, exc: BaseException,
+                           sessionid: str | None) -> None:
+        """上游 1015 ⇒ 把该 sessionid 从**登录缓存**里踢掉。
+
+        为什么要这一层：账号密码换来的 sessionid 会因改密/风控提前失效，
+        而任务行里落的是**当时那把** sid（不是账号）。不清缓存的话，
+        失效的 sid 会被同账号的新请求反复命中，直到 TTL 到期为止。
+
+        ⚠️ 只对"账号密码换来的" sid 有效：缓存里没有的（调用方直接传的
+        sessionid）是**空操作** —— 不会把调用方自己的凭据误删（本来就
+        不存在于我们的缓存里）。
+        """
+        if isinstance(exc, JimengAuthError) and sessionid:
+            if self.sg_login.invalidate(sessionid):
+                log.info("上游 1015：已清除登录缓存，下一次同账号请求将重新登录")
+
     # ------------------------------------------------------------------ 能力表
 
     def refresh_blend_capability(self, cfg: Any | None = None) -> int:
@@ -763,11 +792,25 @@ class Service:
                 except Exception:  # noqa: BLE001, S110
                     pass
 
+    async def aclose(self) -> None:
+        """异步收尾：同步资源照旧 + 登录器的 AsyncClient。
+
+        为什么不能只靠 `close()`：`httpx.AsyncClient` 没有同步 close，
+        进程退出时未关闭会留下 "Unclosed client" 告警（且连接池里的
+        连接要等 GC 才断）。`main.py` 的 lifespan 走这个。
+        """
+        self.close()
+        await self.sg_login.aclose()
+
     def status(self) -> dict:
         return {
             "upstream_configured": self.settings.upstream_configured,
             "auth_enabled": self.settings.auth_enabled,
             "concurrency": self.settings.jm_concurrency,
+            #: 🔴 2026-10-19（`Bearer 账号|密码`）：登录缓存的命中/失败计数。
+            #: `misses` 涨 = 有新账号在登录；`failures` 涨 = 密码错或 passport
+            #: 抖动；`invalidations` 涨 = 上游 1015 触发了自愈。
+            "login": self.sg_login.stats(),
             "tasks": {"active": self.store.count_active(),
                       "total": self.store.count()},
             #: 🔴 2026-10-14："队列堵死"的**唯一先行指标**（此前没有任何出口）。
@@ -798,6 +841,21 @@ class Service:
 
     def credential_of(self, api_key: str | None) -> str:
         return credential_id(api_key, self._cred_secret)
+
+    async def sessionid_for_account(self, account: str, password: str) -> str:
+        """`账号|密码` → sessionid（登录结果按 TTL 缓存）。
+
+        🔴 **只对国际站（Dreamina SG）有意义**：登录走 CapCut passport，
+        换回来的 sessionid 天然属于 sg 站。因此这里**顺手把站点归属写进
+        `_site_cache`** —— 否则 `bundle_for` 首次会先拿它去探国内站，
+        那一趟必然 1015（纯浪费一次往返 + 一条误导性日志）。
+
+        ⚠️ 与 `bundle_for` 的分工：本方法**只**负责"拿到凭据"，
+        不建客户端、不提交任何生成任务 —— 计费动作仍在派发线程。
+        """
+        sid = await self.sg_login.sessionid_for(account, password)
+        self._site_cache[sid] = self._profile_for(SG_SITE)
+        return sid
 
     def create(self, body: dict[str, Any], *, credential: str,
                sessionid: str | None = None,
@@ -1745,6 +1803,7 @@ class Service:
             self._on_dispatch_error(rec, e)
             return
         except JimengError as e:
+            self._note_auth_failure(e, self.sessionid_of(rec))
             self._on_dispatch_error(rec, to_adapter_error(e))
             return
         except Exception as e:
@@ -1866,6 +1925,7 @@ class Service:
             try:
                 states = cli.fetch_many(ids)
             except JimengError as e:
+                self._note_auth_failure(e, sid)
                 err = to_adapter_error(e)
                 for rec in bucket:
                     if err.retryable:

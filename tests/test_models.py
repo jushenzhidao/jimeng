@@ -651,15 +651,25 @@ def test_upstream_model_credits_table_does_not_drift():
     而同一个端点换模型就换价 —— Flash 实测 3、Pro 实测 8。
     把能力级的值抄给每个上游模型 = 对 Flash 报"免费"，调用方会算错成本。
     """
-    from app.models import (UPSTREAM_MODEL_CREDITS, UPSTREAM_MODEL_KEYS,
-                            UPSTREAM_WEB_NAMES)
+    from app.models import (UPSTREAM_MODEL_CREDITS,
+                            UPSTREAM_MODEL_CREDITS_BY_SITE,
+                            UPSTREAM_MODEL_KEYS, UPSTREAM_WEB_NAMES)
 
+    assert set(UPSTREAM_MODEL_CREDITS_BY_SITE) == set(UPSTREAM_MODEL_KEYS)
     assert set(UPSTREAM_MODEL_CREDITS) == set(UPSTREAM_MODEL_KEYS)
     assert set(UPSTREAM_WEB_NAMES) == set(UPSTREAM_MODEL_KEYS)
-    for key, cost in UPSTREAM_MODEL_CREDITS.items():
-        assert cost is None or cost >= 0, key
-    assert UPSTREAM_MODEL_CREDITS["high_aes_general_v50"] == 0, "Lite 实测免费"
-    assert UPSTREAM_MODEL_CREDITS["high_aes_general_v50_flash"] == 3, \
+    for key, per_site in UPSTREAM_MODEL_CREDITS_BY_SITE.items():
+        assert per_site, f"{key} 至少要登记一个站点"
+        for site, cost in per_site.items():
+            assert site in ("cn", "sg"), f"{key} 的站点名 {site!r} 不认识"
+            assert cost is None or cost >= 0, (key, site)
+    # 🔴 2026-10-19 按站点分：Lite **两站不同价** —— 国内 2k 免费，
+    # 国际站 4 张实扣 38（≈9.5/张）。单值口径因此必须是 None（不许报 0）。
+    assert UPSTREAM_MODEL_CREDITS_BY_SITE["high_aes_general_v50"]["cn"] == 0
+    assert UPSTREAM_MODEL_CREDITS_BY_SITE["high_aes_general_v50"]["sg"] == 9.5
+    assert UPSTREAM_MODEL_CREDITS["high_aes_general_v50"] is None, \
+        "两站不同价 ⇒ 单值必须 None（报 0 就等于对国际站说'免费'）"
+    assert UPSTREAM_MODEL_CREDITS_BY_SITE["high_aes_general_v50_flash"]["cn"] == 3, \
         "Flash 2026-09-23 实跑实扣 3（2k/1 张）"
 
 
@@ -670,8 +680,9 @@ def test_catalog_exposes_upstream_models_for_t2i_and_i2i():
     哪些模型（比如 mj82），只挂 t2i 等于把 i2i 的可选项藏起来了。
     其余能力（视频/审计…）仍然不该有这个维度。
     """
-    from app.models import (UPSTREAM_MODEL_CREDITS, UPSTREAM_MODEL_KEYS,
-                            passable_model_strings)
+    from app.models import (UPSTREAM_MODEL_CREDITS,
+                            UPSTREAM_MODEL_CREDITS_BY_SITE,
+                            UPSTREAM_MODEL_KEYS, passable_model_strings)
 
     for m in catalog():
         if m["id"] in ("jimeng-t2i", "jimeng-i2i"):
@@ -680,6 +691,9 @@ def test_catalog_exposes_upstream_models_for_t2i_and_i2i():
                 "面板名不许为空 —— 空说明门禁没跟上"
             for u in m["upstream_models"]:
                 assert u["credits_measured"] == UPSTREAM_MODEL_CREDITS[u["key"]], u
+                # 🔴 2026-10-19：分站点单价必须出现在清单里 ——
+                # 只给单值会让国际站调用方把 Lite(9.5/张) 当免费。
+                assert u["credits_by_site"] == UPSTREAM_MODEL_CREDITS_BY_SITE[u["key"]], u
                 # 🔴 `pass_as` = 全部可传写法，必须包含 key 本身 + 指向它的每个别名
                 expect = passable_model_strings(u["key"])
                 assert u["pass_as"] == expect, u["key"]
@@ -904,10 +918,10 @@ def test_lite_is_free_at_2k_but_charged_at_4k():
     人（和调用方）极易把 0 读成"这个模型恒免费"⇒ 传 4k 时被静默扣钱。
     所以除了登记口径，还必须**在受理层留痕**（下一条门禁）。
     """
-    from app.models import UPSTREAM_MODEL_CREDITS
+    from app.models import UPSTREAM_MODEL_CREDITS_BY_SITE
 
-    assert UPSTREAM_MODEL_CREDITS["high_aes_general_v50"] == 0, \
-        "登记表填的仍是 2k 口径（0）；若默认值变了请同步实测"
+    assert UPSTREAM_MODEL_CREDITS_BY_SITE["high_aes_general_v50"]["cn"] == 0, \
+        "国内 2k 口径仍是 0；若默认值变了请同步实测"
     # 真跑凭据
     from pathlib import Path
     text = (Path(__file__).resolve().parent.parent / "docs" / "UPSTREAM.md"

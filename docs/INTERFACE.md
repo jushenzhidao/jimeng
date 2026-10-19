@@ -31,6 +31,32 @@
 
 ### 0.3 鉴权：**所有业务端点都要 Bearer**（2026-09-23 收紧）
 
+> **现状（2026-10-03 起）**：`API_KEYS` 白名单**已不参与校验**（字段保留只为
+> 不破坏现有 `.env`）。`Bearer` 本身就是**调用方自己的即梦凭据** —— 服务不持有、
+> 不分发、不代付。下面这段"白名单比对"是历史口径，保留作背景。
+
+**`Bearer` 的两种合法形态**（2026-10-19 新增第二种）：
+
+| 形态 | 适用 | 行为 |
+|---|---|---|
+| `<sessionid>` | 两站 | 原样透传（绝大多数调用方走这条） |
+| `<邮箱>\|<密码>` | **仅国际站** | 服务端调 CapCut passport 登录换 sessionid；缓存 12h（`SG_LOGIN_CACHE_TTL` 可调），`SG_LOGIN_ENABLED=0` 整体关闭 |
+
+账号密码形态的失败语义（都在**建任务之前**返回，不留垃圾任务行）：
+
+| 情况 | 状态码 | `code` |
+|---|---|---|
+| 账号或密码错 | `401` | `upstream_login_failed` |
+| passport 要求人机验证 | `429` | `risk_control_challenge` |
+| passport 端点不可达 | `502` | `upstream_unavailable` |
+| 本部署关闭了该形态 | `401` | `invalid_api_key` |
+
+实现与抓包事实见 `app/sg_login.py`；登录计数在 `GET /stats` 的 `login` 段。
+
+⚠️ **同一账号的两种形态算两个属主**：任务归属按 `Bearer` 原文的 HMAC 指纹算，
+`邮箱|密码` 与它登录得到的 `sessionid` 是两个不同指纹 ⇒ 跨形态查不到彼此的任务。
+要长期共享同一批任务，请固定用一种形态。
+
 `Authorization: Bearer <key>`，与 `API_KEYS`（逗号分隔）白名单比对；比对通过后
 只保留 **Key 的 HMAC 指纹**（明文永不落库）。`API_KEYS` 为空 ⇒ 鉴权整体关闭
 （仅限内网，启动打 WARNING）。
@@ -600,16 +626,21 @@ Authorization: Bearer <key>
        **绝不静默退回** 2k（那会"以为买了 4k、实际按 2k 计费"）。
 
 `GET /v1/models` 的 **`jimeng-t2i`** 条目里带 `upstream_models`，
-逐项给出 `{key, web_name, ark_name, credits_measured}` —— 调用方不必去别处对照名字。
-（`credits_measured` 是**按模型**的实测值，不是能力级单价；`ark_name` 是可原样传的
-**火山方舟模型名**，该档位没有方舟对应名时为 `null`。）
+逐项给出 `{key, web_name, ark_name, credits_measured, credits_by_site}` ——
+调用方不必去别处对照名字。
+
+- `credits_by_site`（2026-10-19 起）：**按站点**的实测单价，如
+  `{"cn": 0, "sg": 9.5}`。跨站调用方**只认它**。
+- `credits_measured`：**单值**，只在"所有已登记站点同价"时给数；
+  两站不同价时为 `null`（宁可不给，也不报一个只对一侧成立的数）。
+- `ark_name`：可原样传的**火山方舟模型名**，该档位没有方舟对应名时为 `null`。
 
 **上游模型 key —— 已登记的 8 个**（可直接当 `model` 传，等价于 `jimeng-t2i` + 该模型）：
 
-| `model` 传这个 key | 上游名字 | 方舟对应名 | 张数选项 | 实测单价 |
+| `model` 传这个 key | 上游名字 | 方舟对应名 | 张数选项 | 实测单价（按站点） |
 |---|---|---|---|---|
 | `high_aes_general_v50_flash` | **Seedream 5.0 Flash** | `doubao-seedream-5-0-flash-260915` | **1..4** | **3/张** |
-| `high_aes_general_v50`（**默认**） | Seedream 5.0 **Lite** | — | 1..8 | **0（免费）** |
+| `high_aes_general_v50`（**默认**） | Seedream 5.0 **Lite** | — | 1..8 | **国内 0 / 国际 9.5 每张**（国际站一次 4 张实扣 38） |
 | `high_aes_general_v50p_large` | **Seedream 5.0 Pro** | — | **1..4** | **8/张** |
 | `high_aes_general_v43` | Seedream 4.7 | — | 1..8 | 未测 |
 | `high_aes_general_v42` | Seedream 4.6 | — | 1..8 | 未测 |
