@@ -640,7 +640,7 @@ Authorization: Bearer <key>
 | `model` 传这个 key | 上游名字 | 方舟对应名 | 张数选项 | 实测单价（按站点） |
 |---|---|---|---|---|
 | `high_aes_general_v50_flash` | **Seedream 5.0 Flash** | `doubao-seedream-5-0-flash-260915` | **1..4** | **3/张** |
-| `high_aes_general_v50`（**默认**） | Seedream 5.0 **Lite** | — | 1..8 | **国内 0 / 国际 144 每次**（Lite 固定 4 张，折 36/张；**`n` 不降本**，2026-10-19 线上实测） |
+| `high_aes_general_v50`（**默认**） | Seedream 5.0 **Lite** | — | 1..8 | **国内 0 / 国际 36 每张**（`user_credit_history`：`n=1` 扣 36、`n=4` 扣 144；2026-10-19 线上两轮复现） |
 | `high_aes_general_v50p_large` | **Seedream 5.0 Pro** | — | **1..4** | **8/张** |
 | `high_aes_general_v43` | Seedream 4.7 | — | 1..8 | 未测 |
 | `high_aes_general_v42` | Seedream 4.6 | — | 1..8 | 未测 |

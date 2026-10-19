@@ -2995,8 +2995,13 @@ class Service:
         # 张数**必须传**给 bridge —— UI 参数面板里有 "Images to generate"（1..8），
         # 不传就按面板默认 4 张出图。国际站 36/张，4 张 = 144，
         # 也就是"调用方要 1 张、我们却花了 4 倍的钱"。
+        #: 🔴 **不传 `resolution`**（2026-10-19 实测）：
+        #: 国际站 UI 的默认档就是 2K（`resolution_type=2k` / 2048×2048），
+        #: 而**点 2K 的 radio 会触发重渲染、把张数重置回 4**
+        #: ⇒ `n=1` 被吃掉，出 4 张、扣 144（三条实测全部复现）。
+        #: 不碰档位时 `count=1` 能稳定生效（同一条链路实测 1 张 / 36 / 2048²）。
+        #: 若将来默认档变成 4K，再改成"改档 + 重选张数"，别直接传 2k。
         body = {"prompt": rec.prompt, "model": display,
-                "resolution": "2k",
                 "ratio": self._nearest_ui_ratio(w, h),
                 "count": int(rec.n or 1)}
         r = _httpx.post(f"{self.settings.sg_bridge_url}/generate-ui-async",

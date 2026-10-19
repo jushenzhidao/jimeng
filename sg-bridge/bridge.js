@@ -317,6 +317,16 @@ async function generateUiCore({ prompt, model, resolution, ratio, count }) {
       if (!pos) throw new Error(`张数控件找不到 ${count}`);
       await p.mouse.click(pos.x, pos.y);
       await p.waitForTimeout(600);
+      // 档位/模型的重渲染可能把张数冲掉 ⇒ 读回不符就再点一次（最多 3 轮）
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const cur = await p.evaluate(() => {
+          const el = document.querySelector("[class*='generate-count-content']");
+          return el ? (el.textContent || "").trim() : "";
+        }).catch(() => "");
+        if (cur === String(count)) break;
+        await p.mouse.click(pos.x, pos.y);
+        await p.waitForTimeout(700);
+      }
       // 🔴 读回校验：张数没选上就**别提交**（UI 默认 4 张 = 3 倍成本）
       const gotCount = await p.evaluate(() => {
         const el = document.querySelector("[class*='generate-count-content']");
