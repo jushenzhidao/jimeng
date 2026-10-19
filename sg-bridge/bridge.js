@@ -73,7 +73,10 @@ async function ensurePage() {
                                   timeout: NAV_TIMEOUT }).catch(() => {});
       return page;
     })();
-    starting.catch(() => { starting = null; });
+    // 🔴 成功也要清：否则 page 被关掉后，这里永远返回**旧的** promise
+    //（里面是已 closed 的 page）⇒ 后续 evaluate 直接崩进程。
+    starting.finally(() => { starting = null; }).catch(() => {});
+    // （额外 catch：避免 finally 返回的 promise 成为 unhandled rejection）
   }
   return starting;
 }
@@ -206,6 +209,7 @@ async function generateUiCore({ prompt, model, resolution, ratio, count }) {
       const ctx = p.context();
       await p.close().catch(() => {});
       p = await ctx.newPage();
+      page = p;                       // ← 关键：全局也要指向新 page
       await p.goto("https://dreamina.capcut.com/ai-tool/image",
                    { waitUntil: "domcontentloaded", timeout: 60000 }).catch(() => {});
       // 等**模型选择器真的出现**再返回（固定 4s 不够：实测点 click 会 5s 超时）
@@ -464,7 +468,9 @@ app.post("/generate-ui-async", async (req, res) => {
       await withUiLock(() => generateUiCore({ prompt, model, resolution,
         ratio, count }));
       const dl = Date.now() + 15000;
-      while (!genSubmitId && Date.now() < dl) await p.waitForTimeout(300);
+      // 🔴 不能用 `p.waitForTimeout`：`generateUiCore` 可能已把旧 page 关掉换新，
+      // 这里只是**等时间**，用 setTimeout 才不依赖 page 存活。
+      while (!genSubmitId && Date.now() < dl) await new Promise((r) => setTimeout(r, 300));
       if (!genSubmitId) throw new Error("no generate request observed");
       HANDLES.set(id, { state: "done", submit_id: genSubmitId,
                         startedAt: HANDLES.get(id).startedAt });
@@ -749,7 +755,9 @@ app.post("/upscale-ui-async", async (req, res) => {
     try {
       await withUiLock(() => upscaleUiCore({ session }));
       const dl = Date.now() + 15000;
-      while (!upSubmitId && Date.now() < dl) await p.waitForTimeout(300);
+      // 🔴 不能用 `p.waitForTimeout`：`generateUiCore` 可能已把旧 page 关掉换新，
+      // 这里只是**等时间**，用 setTimeout 才不依赖 page 存活。
+      while (!upSubmitId && Date.now() < dl) await new Promise((r) => setTimeout(r, 300));
       if (!upSubmitId) throw new Error("no normal_hd request observed");
       HANDLES.set(id, { state: "done", submit_id: upSubmitId,
                         startedAt: HANDLES.get(id).startedAt });
