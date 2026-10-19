@@ -20,10 +20,15 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 def test_service_forwards_count_to_bridge():
-    """`_submit_via_bridge` 的 body 必须带 `count`（来自任务行的 `rec.n`）。"""
+    """国际站**恒按 1 张出图**（2026-10-19 用户口径"张数全部固定死了 1"）。
+
+    国际站 36/张（n=4 = 144）⇒ 成本控制；并要求"少出图留痕"。
+    国内站不受影响（直出路径仍按 n）。
+    """
     src = inspect.getsource(Service._submit_via_bridge)
-    assert '"count"' in src, "bridge body 少了 count ⇒ UI 按默认 4 张出图"
-    assert "rec.n" in src, "count 必须来自任务行，不能写死"
+    assert "count = 1" in src, "国际站必须固定 1 张"
+    assert '"count": count' in src, "body 必须用固定值"
+    assert "固定按 1 张出图" in src, "请求 n≠1 时必须留痕"
 
 
 def test_bridge_js_can_pick_image_count():

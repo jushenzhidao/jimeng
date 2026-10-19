@@ -3001,9 +3001,25 @@ class Service:
         #: ⇒ `n=1` 被吃掉，出 4 张、扣 144（三条实测全部复现）。
         #: 不碰档位时 `count=1` 能稳定生效（同一条链路实测 1 张 / 36 / 2048²）。
         #: 若将来默认档变成 4K，再改成"改档 + 重选张数"，别直接传 2k。
+        #: 🔴 2026-10-19 用户口径："**张数全部固定死了 1，针对所有模型**"。
+        #: 国际站 36/张（n=4 = 144）⇒ bridge 路径**恒按 1 张出图**；
+        #: 只有即梦自己对该模型不认 1 张时才会按它的（那种情况 UI 会重置，
+        #: 由 bridge 的读回校验兜住）。
+        count = 1
+        if (rec.n or 1) != count:
+            # 少出图必须**留痕**：对外默认不展示 degradations（2026-10-15 口径），
+            # 但库里得有这笔账，否则"要 4 张只给 1 张"会被当成缺件。
+            try:
+                self.store.patch(rec.task_id, degradations=[
+                    *rec.degradations,
+                    f"国际站固定按 1 张出图（请求 n={rec.n}，成本控制）",
+                ])
+                rec = self.store.get(rec.task_id) or rec
+            except Exception:  # noqa: BLE001 —— 留痕失败不该挡住派发
+                log.warning("降级留痕失败（不影响派发）task=%s", rec.task_id)
         body = {"prompt": rec.prompt, "model": display,
                 "ratio": self._nearest_ui_ratio(w, h),
-                "count": int(rec.n or 1)}
+                "count": count}
         r = _httpx.post(f"{self.settings.sg_bridge_url}/generate-ui-async",
                         json=body, timeout=30.0, trust_env=False)
         r.raise_for_status()
