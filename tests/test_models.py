@@ -664,8 +664,9 @@ def test_upstream_model_credits_table_does_not_drift():
             assert site in ("cn", "sg"), f"{key} 的站点名 {site!r} 不认识"
             assert cost is None or cost >= 0, (key, site)
     # 🔴 2026-10-19 按站点分：Lite **两站不同价** —— 国内 2k 免费，
-    # 国际站 **36/张**（1 张 36、4 张 144，`user_credit_history` 两证）。
-    # 单值口径因此必须是 None（不许报 0）。
+    # 国际站 **36/张**（`user_credit_history`：4 张 144）。
+    # ⚠️ 线上经 bridge 提交时 Lite 固定 4 张、`n` 不降本（n=1 也扣 144，
+    # 2026-10-19 实测）。单值口径因此必须是 None（不许报 0）。
     assert UPSTREAM_MODEL_CREDITS_BY_SITE["high_aes_general_v50"]["cn"] == 0
     assert UPSTREAM_MODEL_CREDITS_BY_SITE["high_aes_general_v50"]["sg"] == 36
     assert UPSTREAM_MODEL_CREDITS["high_aes_general_v50"] is None, \

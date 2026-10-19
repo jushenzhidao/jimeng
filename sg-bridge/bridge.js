@@ -211,17 +211,41 @@ async function generateUiCore({ prompt, model, resolution, ratio, count }) {
     await p.mouse.click(tabPos.x, tabPos.y);
     await p.waitForTimeout(800);
   }
-  // 🔴 模型选择（可选）：参数行 combobox（当前值如 "GPT Image 2.5 Sunburst"）。
+  // 🔴 参数面板**必须先打开**：模型选择器也在面板里 —— 面板折叠时它不可见，
+  // 旧代码的 `if (await combo.isVisible())` 会直接跳过 ⇒ 模型根本没换。
+  // 这是 2026-10-19 线上事故的**第二个成因**（第一个是 body 里 model 为空）。
+  // 面板可能是"已开"状态（上次任务留下的），再点一次会**关掉**它 ⇒ 先判。
+  const ensurePanel = async () => {
+    const open = await p.evaluate(() => {
+      const f = document.querySelector("[class*='generate-count-field']");
+      return !!(f && f.getBoundingClientRect().width > 0);
+    }).catch(() => false);
+    if (open) return;
+    await p.evaluate(() => {
+      const b = [...document.querySelectorAll("button")]
+        .find((x) => /2K/.test(x.textContent || "")
+                      && x.getBoundingClientRect().width > 0);
+      if (b) b.click();
+    });
+    await p.waitForTimeout(900);
+  };
+  if (ratio || resolution || count || model) {
+    await ensurePanel();
+  }
+  // 🔴 模型选择：参数行 combobox（当前值如 "GPT Image 2.5 Sunburst"）。
   //
   // 🔴 2026-10-19 实测事故：原来用 `p.getByText(model)` **全局**找选项 ——
   // 它会命中页面上任意同名文本（模型介绍卡、历史记录…），点完下拉直接关掉，
   // 模型**没换**。线上 n=1 测试就这么静默跑了 `dreamina_gpt_image_2_5_flare`
   // （实扣 51/张），而调用方以为在用 Lite（36/张）。
-  // ⇒ 两条修正：① 只在**下拉弹层内**找选项；② 选完**读回校验**，
-  //    不一致就抛错（没提交 = 不花钱，比"用错模型扣钱"好得多）。
+  // ⇒ 三条修正：① 面板先打开；② 只在**下拉弹层内**找选项；③ 选完**读回校验**，
+  //    对不上就抛错（没提交 = 不花钱，比"用错模型扣钱"好得多）。
   if (model) {
     const combo = p.locator("[role=combobox]").first();
-    if (await combo.isVisible().catch(() => false)) {
+    if (!(await combo.isVisible().catch(() => false))) {
+      throw new Error(`模型选择器不可见（want=${model}）—— 拒绝在未知模型下提交`);
+    }
+    {
       await combo.click({ force: true, timeout: 5000 });
       await p.waitForTimeout(900);
       const picked = await p.evaluate((want) => {
@@ -250,13 +274,10 @@ async function generateUiCore({ prompt, model, resolution, ratio, count }) {
   // 面板不开时控件不在 DOM）。比例 = 面板顶部格子（SPAN 叶子，文本
   // "1:1"/"16:9"/…）；档位 = radiogroup 的 radio（value 1k/2k/4k）。
   if (ratio || resolution || count) {
-    await p.evaluate(() => {
-      const b = [...document.querySelectorAll("button")]
-        .find((x) => /2K/.test(x.textContent || "")
-                      && x.getBoundingClientRect().width > 0);
-      if (b) b.click();
-    });
-    await p.waitForTimeout(700);
+    // 🔴 选模型会让参数面板重渲染/关闭 ⇒ 这里必须再确保一次打开，
+    // 否则比例/档位/张数全在"面板不在 DOM"的状态下静默失败
+    //（2026-10-19 实测：模型选对了、张数没选上，出了 4 张 = 144）。
+    await ensurePanel();
     if (ratio) {
       await p.evaluate((want) => {
         const span = [...document.querySelectorAll("span")]
@@ -279,18 +300,31 @@ async function generateUiCore({ prompt, model, resolution, ratio, count }) {
     // 调用方要 1 张时等于多花 3 倍。实测 DOM：
     //   [class*='generate-count-field'] > .lv-radio-group（选项是叶子节点文本 1..8）
     if (count) {
-      await p.evaluate((want) => {
+      // 🔴 必须用**真实鼠标点击**（坐标），不能用 `el.click()`：
+      // 这是受控的 radio-group，`.click()` 只改视觉、不改 React state
+      // —— 实测现象：读回显示已变 1，提交出去的 `gen_count` 仍是 4。
+      const pos = await p.evaluate((want) => {
         const field = document.querySelector("[class*='generate-count-field']");
-        if (!field) return false;
+        if (!field) return null;
         const el = [...field.querySelectorAll("span,div,label")]
           .find((e) => e.childElementCount === 0
                        && (e.textContent || "").trim() === String(want)
                        && e.getBoundingClientRect().width > 0);
-        if (!el) return false;
-        (el.closest("label") || el.closest("button") || el).click();
-        return true;
-      }, String(count)).catch(() => {});
+        if (!el) return null;
+        const r = el.getBoundingClientRect();
+        return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+      }, String(count)).catch(() => null);
+      if (!pos) throw new Error(`张数控件找不到 ${count}`);
+      await p.mouse.click(pos.x, pos.y);
       await p.waitForTimeout(600);
+      // 🔴 读回校验：张数没选上就**别提交**（UI 默认 4 张 = 3 倍成本）
+      const gotCount = await p.evaluate(() => {
+        const el = document.querySelector("[class*='generate-count-content']");
+        return el ? (el.textContent || "").trim() : "";
+      }).catch(() => "");
+      if (gotCount !== String(count)) {
+        throw new Error(`张数选择失败：want=${count} got=${gotCount || "?"}`);
+      }
     }
   }
   const comp = p.locator('[contenteditable="true"]').first();
