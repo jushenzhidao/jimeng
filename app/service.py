@@ -2714,6 +2714,16 @@ class Service:
         可复用的与需要搬运的可以混在一批里，**顺序照旧按 `image_refs` 回填**。
         """
         assert self.uploader is not None
+        #: 🔴 2026-10-19：**这里才是真正的入口** —— 垫图上传发生在 `_submit`
+        #: 之前，所以 `_submit` 里那道检查根本走不到（实测仍会白等 5.4s
+        #: 才收到 `ApplyImageUpload 失败 SignatureDoesNotMatch`）。
+        #: 国际站的上传必然被拒（AWS4 签名），在这里当场拒绝。
+        _prof = getattr(self.client, "profile", None)
+        if _prof is not None and getattr(_prof, "name", "") == "sg":
+            raise InvalidParameterError(
+                "国际站（Dreamina SG）暂不支持图生图：上游图片上传被拒"
+                "（SignatureDoesNotMatch）。请改用文生图，或使用国内站凭据。",
+                param="image")
         started = time.monotonic()
         reused = [reuse_image_uri(r) for r in rec.image_refs]
         pending = [r for r, u in zip(rec.image_refs, reused) if u is None]

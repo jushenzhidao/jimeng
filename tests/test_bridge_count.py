@@ -75,6 +75,11 @@ def test_sg_rejects_i2i_upfront():
     assert '"sg"' in submit_src and "image_uris" in submit_src, \
         "判据必须是「站点=sg」且「有垫图」"
 
+    # 🔴 真正的入口是**上传**（在 `_submit` 之前）—— 只在 `_submit` 拦会走不到
+    prep_src = inspect.getsource(Service._prepare_input_images)
+    assert "暂不支持图生图" in prep_src, \
+        "垫图上传入口必须也拒绝（否则会白等 5s 才拿到 SignatureDoesNotMatch）"
+
     sync_src = inspect.getsource(_sync_generate)
     assert "InvalidParameterError.err_type" in sync_src, \
         "同步链要把它转成 400，而不是回 200 + failure 体"
