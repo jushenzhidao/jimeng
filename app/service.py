@@ -883,6 +883,14 @@ class Service:
         """
         if not isinstance(body, dict):
             raise InvalidParameterError("请求体必须是 JSON 对象")
+        #: 🔴 2026-10-19 实测发现：`dry_run` 一直是**假参数** —— `create()` 收了
+        #: 它却没有任何逻辑，请求照常建任务、照常提交上游（**照常扣费**）。
+        #: 而 `/llms.txt` 还在宣传"想零成本预演就传 dry_run"⇒ 会让人真花钱。
+        #: 在实现之前，**显式拒绝**比静默扣费好。
+        if dry_run:
+            raise InvalidParameterError(
+                "dry_run 暂未实现：该参数不会跳过建任务，请求仍会真实提交并计费。"
+                "请勿依赖它做零成本预演。", param="dry_run")
 
         #: 🔴 2026-10-14（"队列堵死"根治）：**入队背压**。
         #: 队列此前**没有任何上限** ⇒ 一个调用方灌一批（实测 181 条）就把并发位

@@ -208,7 +208,9 @@ async function generateUiCore({ prompt, model, resolution, ratio, count }) {
       p = await ctx.newPage();
       await p.goto("https://dreamina.capcut.com/ai-tool/image",
                    { waitUntil: "domcontentloaded", timeout: 60000 }).catch(() => {});
-      await p.waitForTimeout(4000);
+      // 等**模型选择器真的出现**再返回（固定 4s 不够：实测点 click 会 5s 超时）
+      await p.waitForSelector("[role=combobox]", { timeout: 30000 }).catch(() => {});
+      await p.waitForTimeout(1500);
     }
   }
   // ⚠️ 2026-10-19：这里**不要**加 `goto` 兜底 —— 实测加完会让后续 UI 流程
@@ -273,7 +275,7 @@ async function generateUiCore({ prompt, model, resolution, ratio, count }) {
       throw new Error(`模型选择器不可见（want=${model}）—— 拒绝在未知模型下提交`);
     }
     {
-      await combo.click({ force: true, timeout: 5000 });
+      await combo.click({ force: true, timeout: 15000 });
       await p.waitForTimeout(900);
       const picked = await p.evaluate((want) => {
         const lb = document.querySelector("[role=listbox]")
