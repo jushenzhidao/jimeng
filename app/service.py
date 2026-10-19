@@ -887,7 +887,10 @@ class Service:
         #: 它却没有任何逻辑，请求照常建任务、照常提交上游（**照常扣费**）。
         #: 而 `/llms.txt` 还在宣传"想零成本预演就传 dry_run"⇒ 会让人真花钱。
         #: 在实现之前，**显式拒绝**比静默扣费好。
-        if dry_run:
+        #: ⚠️ 还要看 **body 里的字段**：同步端点 `_sync_generate` 调 `create()`
+        #: 时**没有**把 `dry_run` 作为实参传进来（只有异步端点传）——
+        #: 只判形参的话，`/v1/images/generations` 带 `dry_run:true` 依然会建任务。
+        if dry_run or body.get("dry_run"):
             raise InvalidParameterError(
                 "dry_run 暂未实现：该参数不会跳过建任务，请求仍会真实提交并计费。"
                 "请勿依赖它做零成本预演。", param="dry_run")
