@@ -3010,7 +3010,11 @@ class Service:
             # 少出图必须**留痕**：对外默认不展示 degradations（2026-10-15 口径），
             # 但库里得有这笔账，否则"要 4 张只给 1 张"会被当成缺件。
             try:
-                self.store.patch(rec.task_id, degradations=[
+                #: 🔴 **`n` 也要一起落成 1**：少出图判据是"交付 < 请求 n"，
+                #: 只改 bridge 的 count 而库里仍是 4 ⇒ 上游出 1 张、
+                #: 服务的"补齐"逻辑会拿同一张图填满 4 条（实测：扣 36，
+                #: 但 `usage.images=4`、3 条重复）。n 落成 1 才是真的一张。
+                self.store.patch(rec.task_id, n=count, degradations=[
                     *rec.degradations,
                     f"国际站固定按 1 张出图（请求 n={rec.n}，成本控制）",
                 ])
