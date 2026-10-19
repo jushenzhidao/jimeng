@@ -194,7 +194,23 @@ const HISTORY_QS = "aid=513641&device_platform=web&region=PH"
 // 返回 submit_id。终态轮询由调用方直连读接口完成（读接口不受 shark 影响）。
 async function generateUiCore({ prompt, model, resolution, ratio, count }) {
   const p0 = await ensureLogin();
-  const p = p0.p;
+  // 🔴 2026-10-19：提交成功后页面会跳到 `/ai-tool/generate`（结果页），
+  // **那里没有参数行/模型选择器**，点击 "AI Image" 的文本也不存在 ⇒
+  // 三条路（点 tab / 重试 / goto）都走不通，只能**换一个干净标签页**
+  //（cookie 在 context 上，新 page 天然是登录态）。
+  let p = p0.p;
+  {
+    const hasCombo = await p.locator("[role=combobox]").first()
+      .isVisible().catch(() => false);
+    if (!hasCombo) {
+      const ctx = p.context();
+      await p.close().catch(() => {});
+      p = await ctx.newPage();
+      await p.goto("https://dreamina.capcut.com/ai-tool/image",
+                   { waitUntil: "domcontentloaded", timeout: 60000 }).catch(() => {});
+      await p.waitForTimeout(4000);
+    }
+  }
   // ⚠️ 2026-10-19：这里**不要**加 `goto` 兜底 —— 实测加完会让后续 UI 流程
   // 卡住（任务一直 in_progress 到 TASK_TIMEOUT）。页面位置由
   // `ensureLogin()` 的 START_URL 保证；模型选择器不可见时宁可**报错不提交**。
