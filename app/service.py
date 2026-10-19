@@ -2979,8 +2979,14 @@ class Service:
         bridge 路径按请求档 UI 直出（超分腿的 UI 自动化未做）。
         """
         import httpx as _httpx  # noqa: PLC0415 —— 局部引入避免模块级依赖
-        model = rec.upstream_model or ""
-        display = models.UPSTREAM_WEB_NAMES.get(model, model)
+        # 🔴 2026-10-19 线上实测事故：`rec.upstream_model` **常常是空**
+        # （默认模型只在派发时推导、未落库），这里原来写成 `or ""` ⇒
+        # `display=""` ⇒ bridge 的 `if (model)` 为假 ⇒ **不选模型**，
+        # UI 用了它自己的默认档（实测是 `dreamina_gpt_image_2_5_flare`，
+        # **51 积分/张**），而调用方以为在用 Lite（36）。
+        # 直出路径一直是 `or DEFAULT_MODEL`，这里对齐。
+        model = rec.upstream_model or DEFAULT_MODEL
+        display = models.UPSTREAM_WEB_NAMES.get(model, model) or model
         w, h = (int(x) for x in (rec.size or "2048x2048").split("x"))
         # 🔴 bridge 生成腿**恒 2k 直出**（2026-10-16 口径"1-2k 定向到2k
         # 即可"）：1k/2k 请求都按 2k 交付（1k 档 UI 自动化的坑就此绕开）；

@@ -39,3 +39,16 @@ def test_bridge_js_can_pick_image_count():
         "generateUiCore 的入参少了 count"
     assert "ratio || resolution || count" in src, \
         "只传 count 时也必须打开参数面板，否则控件不在 DOM 里"
+
+
+def test_bridge_submit_falls_back_to_default_model():
+    """`rec.upstream_model` 为空时必须兜底默认模型。
+
+    2026-10-19 线上实测事故：原来写 `rec.upstream_model or ""` ⇒ body 的
+    `model` 为空串 ⇒ bridge 的 `if (model)` 为假 ⇒ **不选模型** ⇒ UI 用
+    它自己的默认档（实测 `dreamina_gpt_image_2_5_flare`，**51 积分/张**），
+    而调用方以为在用 Lite（36/张）。**静默换模型 = 静默多花钱**。
+    """
+    src = inspect.getsource(Service._submit_via_bridge)
+    assert "rec.upstream_model or DEFAULT_MODEL" in src, \
+        "必须兜底：跑 bridge 的 body 里 model 不能是空串"

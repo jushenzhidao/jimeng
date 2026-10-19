@@ -211,16 +211,39 @@ async function generateUiCore({ prompt, model, resolution, ratio, count }) {
     await p.mouse.click(tabPos.x, tabPos.y);
     await p.waitForTimeout(800);
   }
-  // 🔴 模型选择（可选）：参数行 combobox（当前值如 "GPT Image 2.5 Sunburst"）
-  // —— 点开下拉 → 点目标模型文本
+  // 🔴 模型选择（可选）：参数行 combobox（当前值如 "GPT Image 2.5 Sunburst"）。
+  //
+  // 🔴 2026-10-19 实测事故：原来用 `p.getByText(model)` **全局**找选项 ——
+  // 它会命中页面上任意同名文本（模型介绍卡、历史记录…），点完下拉直接关掉，
+  // 模型**没换**。线上 n=1 测试就这么静默跑了 `dreamina_gpt_image_2_5_flare`
+  // （实扣 51/张），而调用方以为在用 Lite（36/张）。
+  // ⇒ 两条修正：① 只在**下拉弹层内**找选项；② 选完**读回校验**，
+  //    不一致就抛错（没提交 = 不花钱，比"用错模型扣钱"好得多）。
   if (model) {
     const combo = p.locator("[role=combobox]").first();
     if (await combo.isVisible().catch(() => false)) {
       await combo.click({ force: true, timeout: 5000 });
-      await p.waitForTimeout(800);
-      const opt = p.getByText(String(model), { exact: false }).first();
-      await opt.click({ force: true, timeout: 5000 }).catch(() => {});
-      await p.waitForTimeout(600);
+      await p.waitForTimeout(900);
+      const picked = await p.evaluate((want) => {
+        const lb = document.querySelector("[role=listbox]")
+          || document.querySelector("[class*='lv-select-popup']")
+          || document.querySelector("[class*='select-popup']");
+        const root = lb || document;
+        const nodes = [...root.querySelectorAll("[role=option],li,div,span")]
+          .filter((e) => e.childElementCount === 0
+                         && e.getBoundingClientRect().width > 0);
+        const el = nodes.find((e) => (e.textContent || "").trim() === want)
+          || nodes.find((e) => (e.textContent || "").includes(want));
+        if (!el) return false;
+        el.click();
+        return true;
+      }, String(model));
+      await p.waitForTimeout(700);
+      const now = (await combo.innerText().catch(() => "")) || "";
+      if (!now.includes(String(model))) {
+        throw new Error(
+          `模型选择失败：want=${model} got=${now.trim().slice(0, 60)} picked=${picked}`);
+      }
     }
   }
   // 🔴 比例/档位都在**参数面板**里（点参数行的档位按钮才渲染——实测
