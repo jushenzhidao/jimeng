@@ -202,17 +202,25 @@ async function generateUiCore({ prompt, model, resolution, ratio, count }) {
   // aigc_draft/generate）。用「locate 坐标 → 真鼠标点击」模式：
   // DOM 生命周期（React 重渲染）会让 locator.click 卡死，坐标不受影响。
   await p.waitForSelector('[contenteditable="true"]', { timeout: 30000 });
-  const tabPos = await p.evaluate(() => {
-    const span = [...document.querySelectorAll("span,div")]
-      .find((e) => e.childElementCount === 0
-                    && e.textContent.trim() === "AI Image");
-    if (!span) return null;
-    const r = span.getBoundingClientRect();
-    return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
-  });
-  if (tabPos) {
-    await p.mouse.click(tabPos.x, tabPos.y);
-    await p.waitForTimeout(800);
+  // 🔴 2026-10-19：单次点击不可靠 —— 上一轮结束后页面停在 `/ai-tool/home`，
+  // 那里**没有模型选择器**；点一次 "AI Image" 有时不生效（渲染慢/被遮挡），
+  // 后面就报"模型选择器不可见"。改成**点 → 校验 → 重试**（最多 3 次）。
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const ready = await p.locator("[role=combobox]").first()
+      .isVisible().catch(() => false);
+    if (ready) break;
+    const tabPos = await p.evaluate(() => {
+      const span = [...document.querySelectorAll("span,div")]
+        .find((e) => e.childElementCount === 0
+                      && e.textContent.trim() === "AI Image");
+      if (!span) return null;
+      const r = span.getBoundingClientRect();
+      return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+    });
+    if (tabPos) {
+      await p.mouse.click(tabPos.x, tabPos.y);
+    }
+    await p.waitForTimeout(1500);
   }
   // 🔴 参数面板**必须先打开**：模型选择器也在面板里 —— 面板折叠时它不可见，
   // 旧代码的 `if (await combo.isVisible())` 会直接跳过 ⇒ 模型根本没换。
