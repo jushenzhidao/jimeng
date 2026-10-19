@@ -530,6 +530,13 @@ async def _sync_generate(svc: Service, coordinator: Any, settings: Settings,
             raise EmptyResultError(
                 stored.get("message") or "上游报成功但零产物",
                 **(stored.get("detail") or {}))
+        #: 🔴 2026-10-19：参数/形态类的失败要**转成 4xx**。
+        #: 现场：国际站 i2i 走到底才失败，同步端点原本回 `200 + failure 体`
+        #: ⇒ 调用方误判成功（它只看 HTTP）。同口径的 451 已在上面两条钉过。
+        if etype == InvalidParameterError.err_type:
+            raise InvalidParameterError(
+                stored.get("message") or "参数不合法",
+                **(stored.get("detail") or {}))
         return rec
 
     # 🔴 **同步接口不交付"空的成功"**（2026-10-15 用户口径："同步接口返回空图请报错"）。

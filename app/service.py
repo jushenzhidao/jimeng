@@ -3106,6 +3106,16 @@ class Service:
         #: 之前**拦死（JimengParamError = 不可重试，直落失败终态），
         #: 而不是发给上游吃一个未知模型错误（可能计费）。
         self._check_site_of_record(rec, cap)
+        #: 🔴 2026-10-19：国际站的**图片上传**被拒（AWS4 签名不匹配：
+        #: `ApplyImageUpload 失败 SignatureDoesNotMatch`）⇒ i2i 必然失败。
+        #: 更糟的是上游给的是 **HTTP 200 + 错误体**，同步调用方会**误判成功**，
+        #: 还要白等 7 秒。在这里前置拒绝：既不计费，也不让调用方等。
+        prof0 = getattr(self.client, "profile", None)
+        if image_uris and prof0 is not None and getattr(prof0, "name", "") == "sg":
+            raise InvalidParameterError(
+                "国际站（Dreamina SG）暂不支持图生图：上游图片上传被拒"
+                "（SignatureDoesNotMatch）。请改用文生图，或使用国内站凭据。",
+                param="image")
         # 🔴 SG bridge 模式（2026-10-15）：国际站写接口被 shark 风控拦
         # （纯 HTTP 全组合 -6）⇒ t2i 的提交经 sg-bridge 的 UI 驱动完成。
         # 返回值是 **bridge handle**（带 `bridge:` 前缀，不是上游

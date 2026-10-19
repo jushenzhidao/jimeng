@@ -14,6 +14,7 @@ from __future__ import annotations
 import inspect
 from pathlib import Path
 
+from app.main import _sync_generate
 from app.service import Service
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -57,3 +58,23 @@ def test_bridge_submit_falls_back_to_default_model():
     src = inspect.getsource(Service._submit_via_bridge)
     assert "rec.upstream_model or DEFAULT_MODEL" in src, \
         "必须兜底：跑 bridge 的 body 里 model 不能是空串"
+
+
+def test_sg_rejects_i2i_upfront():
+    """国际站的图生图**必须在派发期拒绝**（2026-10-19）。
+
+    国际站图片上传被拒（AWS4 签名不匹配：`ApplyImageUpload 失败
+    SignatureDoesNotMatch`）⇒ i2i 必然失败；而且上游给的是
+    **HTTP 200 + 错误体**，同步调用方会误判成功、还要白等 7 秒。
+
+    门禁钉两件事：① 派发期有前置拒绝；② 同步链把 `invalid_parameter`
+    的失败转成 4xx（不再 200 + failure 体）。
+    """
+    submit_src = inspect.getsource(Service._submit)
+    assert "暂不支持图生图" in submit_src, "国际站 i2i 必须前置拒绝"
+    assert '"sg"' in submit_src and "image_uris" in submit_src, \
+        "判据必须是「站点=sg」且「有垫图」"
+
+    sync_src = inspect.getsource(_sync_generate)
+    assert "InvalidParameterError.err_type" in sync_src, \
+        "同步链要把它转成 400，而不是回 200 + failure 体"
