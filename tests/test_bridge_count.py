@@ -123,3 +123,9 @@ def test_sg_submit_routes_through_bridge_page_fetch(monkeypatch):
     assert out["ret"] == "0"
     assert seen["url"].endswith("/fetch"), "必须打桥的 /fetch"
     assert seen["payload"]["body"] == {"draft_content": "{}"}, "body 必须原样转发"
+    #: 🔴 只转协议头：浏览器指纹头转发给页内 fetch 会让 SDK 包装器崩
+    #: （2026-10-20 实测 `TypeError: Cannot read properties of undefined`）。
+    fwd = {k.lower() for k in seen["payload"]["headers"]}
+    assert "sign" in fwd and "content-type" in fwd, "协议头必须带上"
+    for bad_h in ("user-agent", "origin", "referer", "priority"):
+        assert bad_h not in fwd, f"不许转发指纹头 {bad_h}"

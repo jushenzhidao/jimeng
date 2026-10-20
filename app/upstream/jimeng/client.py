@@ -62,6 +62,17 @@ from .site import CN_SITE, SiteProfile
 
 BASE = "https://jimeng.jianying.com"
 PATH_SUBMIT = "/mweb/v1/aigc_draft/generate"
+
+#: 经 sg-bridge 页面上下文代发时**允许**转发的头（其余一律丢）。
+#: 判据：这些是即梦 API 真正读的协议字段；浏览器指纹类头（user-agent /
+#: sec-ch-ua* / sec-fetch-* / origin / referer / priority / accept*）由页面
+#: 自己的 fetch 提供 —— 转发它们会让页内 fetch 包装器崩溃
+#: （2026-10-20 实测 `TypeError: Cannot read properties of undefined`）。
+BRIDGE_FORWARD_HEADERS = frozenset({
+    "content-type", "sign", "sign-ver", "appid", "appvr", "pf", "lan", "loc",
+    "device-time", "store-country-code", "store-country-code-src", "tdid",
+    "did", "app-sdk-version",
+})
 PATH_HISTORY = "/mweb/v1/get_history_by_ids"
 PATH_HISTORY_LIST = "/mweb/v1/get_history"
 PATH_IMAGE_BY_URI = "/mweb/v1/get_image_by_uri"
@@ -1674,9 +1685,17 @@ class JimengClient:
         「URL / 头 / 体」。
         """
         bridge = (self.bridge_url or "").rstrip("/")
+        #: 🔴 只转发**协议头**，绝不转发浏览器指纹头（user-agent / sec-ch-ua* /
+        #: sec-fetch-* / origin / referer / priority / accept*）——
+        #: 2026-10-20 实测：把整套头塞给页面内 `fetch`，`page.evaluate` 当场
+        #: 抛 `TypeError: Cannot read properties of undefined (reading 'text')`
+        #: （页面的 fetch 被站内 SDK 包过，对这套头直接返回 undefined）。
+        #: 页面里的 fetch 本来就会自动带浏览器自己的指纹头与 cookie。
         payload = {
             "url": self._url(path, extra_q), "method": "POST",
-            "headers": self._headers(path), "body": body,
+            "headers": {k: v for k, v in self._headers(path).items()
+                        if k.lower() in BRIDGE_FORWARD_HEADERS},
+            "body": body,
         }
         last: str = ""
         #: 桥侧 `page.evaluate` 偶发 "Execution context destroyed"（页面在跳转
