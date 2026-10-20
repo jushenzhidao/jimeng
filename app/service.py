@@ -2714,16 +2714,6 @@ class Service:
         可复用的与需要搬运的可以混在一批里，**顺序照旧按 `image_refs` 回填**。
         """
         assert self.uploader is not None
-        #: 🔴 2026-10-19：**这里才是真正的入口** —— 垫图上传发生在 `_submit`
-        #: 之前，所以 `_submit` 里那道检查根本走不到（实测仍会白等 5.4s
-        #: 才收到 `ApplyImageUpload 失败 SignatureDoesNotMatch`）。
-        #: 国际站的上传必然被拒（AWS4 签名），在这里当场拒绝。
-        _prof = getattr(self.client, "profile", None)
-        if _prof is not None and getattr(_prof, "name", "") == "sg":
-            raise InvalidParameterError(
-                "国际站（Dreamina SG）暂不支持图生图：上游图片上传被拒"
-                "（SignatureDoesNotMatch）。请改用文生图，或使用国内站凭据。",
-                param="image")
         started = time.monotonic()
         reused = [reuse_image_uri(r) for r in rec.image_refs]
         pending = [r for r, u in zip(rec.image_refs, reused) if u is None]
@@ -3116,16 +3106,6 @@ class Service:
         #: 之前**拦死（JimengParamError = 不可重试，直落失败终态），
         #: 而不是发给上游吃一个未知模型错误（可能计费）。
         self._check_site_of_record(rec, cap)
-        #: 🔴 2026-10-19：国际站的**图片上传**被拒（AWS4 签名不匹配：
-        #: `ApplyImageUpload 失败 SignatureDoesNotMatch`）⇒ i2i 必然失败。
-        #: 更糟的是上游给的是 **HTTP 200 + 错误体**，同步调用方会**误判成功**，
-        #: 还要白等 7 秒。在这里前置拒绝：既不计费，也不让调用方等。
-        prof0 = getattr(self.client, "profile", None)
-        if image_uris and prof0 is not None and getattr(prof0, "name", "") == "sg":
-            raise InvalidParameterError(
-                "国际站（Dreamina SG）暂不支持图生图：上游图片上传被拒"
-                "（SignatureDoesNotMatch）。请改用文生图，或使用国内站凭据。",
-                param="image")
         # 🔴 SG bridge 模式（2026-10-15）：国际站写接口被 shark 风控拦
         # （纯 HTTP 全组合 -6）⇒ t2i 的提交经 sg-bridge 的 UI 驱动完成。
         # 返回值是 **bridge handle**（带 `bridge:` 前缀，不是上游

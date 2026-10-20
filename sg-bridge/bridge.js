@@ -440,6 +440,60 @@ async function withUiLock(fn) {
 
 // 🔱 异步入口（jimeng-service 派发线程用）：立即返回 handle，UI 流程后台跑。
 // 派发线程 20s+ 的 UI 流程会阻塞 WORKERS=1 的串行派发 —— 绝不能同步等。
+app.post("/debug/upload-probe", async (req, res) => {
+  // 临时诊断端点：在真实页面里上传一张图，抓 `apply/upload` 类请求的完整形状
+  //（这是"国际站上传到底怎么签"的唯一可靠来源 —— UI 能传成功）。
+  const b64 = String((req.body || {}).png_b64 || "");
+  if (!b64) return res.status(400).json({ error: "png_b64 required" });
+  const buf = Buffer.from(b64.replace(/^data:[^,]+,/, ""), "base64");
+  const p = (await ensureLogin()).p;
+  const calls = [];
+  const onReq = (rq) => {
+    const u = rq.url();
+    if (!/apply|upload|imagex|vod|tos-|\/space\//i.test(u)) return;
+    let body = "";
+    try { body = (rq.postData() || "").slice(0, 1200); } catch (e) { /* 二进制帧 */ }
+    calls.push({ method: rq.method(), url: u.slice(0, 500),
+                 headers: rq.headers(), body });
+  };
+  p.on("request", onReq);
+  try {
+    // 页面**没有** `input[type=file]`（实测）⇒ 即梦的上传是「粘贴/拖放」。
+    // 先试 paste，再试 dragover+drop，两条都打不出来才算探针失败。
+    const fired = [];
+    for (const kind of ["paste", "drop"]) {
+      const ok = await p.evaluate(({ b64, kind }) => {
+        const bin = atob(b64);
+        const arr = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+        const file = new File([arr], "probe.png", { type: "image/png" });
+        const dt = new DataTransfer();
+        dt.items.add(file);
+        const target = document.querySelector('[contenteditable="true"]')
+          || document.body;
+        if (!target) return false;
+        if (kind === "paste") {
+          target.dispatchEvent(new ClipboardEvent("paste", {
+            clipboardData: dt, bubbles: true, cancelable: true }));
+        } else {
+          target.dispatchEvent(new DragEvent("dragover", {
+            dataTransfer: dt, bubbles: true, cancelable: true }));
+          target.dispatchEvent(new DragEvent("drop", {
+            dataTransfer: dt, bubbles: true, cancelable: true }));
+        }
+        return true;
+      }, { b64: b64.replace(/^data:[^,]+,/, ""), kind }).catch(() => false);
+      fired.push({ kind, ok });
+      await p.waitForTimeout(6000);
+    }
+    return res.json({ ok: calls.length > 0, fired, n: calls.length, calls });
+  } catch (e) {
+    return res.json({ ok: false, reason: String(e).slice(0, 200), calls });
+  } finally {
+    p.off("request", onReq);
+  }
+});
+
 app.post("/generate-ui-async", async (req, res) => {
   // 🔴 2026-10-19 事故：这里原来只解构 4 个字段，**漏了 `count`**
   // ⇒ 服务的 `n` 在这一层被丢掉，`generateUiCore` 拿到 undefined，

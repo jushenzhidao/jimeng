@@ -60,26 +60,19 @@ def test_bridge_submit_falls_back_to_default_model():
         "必须兜底：跑 bridge 的 body 里 model 不能是空串"
 
 
-def test_sg_rejects_i2i_upfront():
-    """国际站的图生图**必须在派发期拒绝**（2026-10-19）。
+def test_sg_i2i_upload_signs_with_passed_region():
+    """国际站上传的 AWS4 **密钥推导**必须用传入的 region（2026-10-19）。
 
-    国际站图片上传被拒（AWS4 签名不匹配：`ApplyImageUpload 失败
-    SignatureDoesNotMatch`）⇒ i2i 必然失败；而且上游给的是
-    **HTTP 200 + 错误体**，同步调用方会误判成功、还要白等 7 秒。
+    浏览器抓包对照后发现：scope 写 `ap-singapore-1`、kDate 却按模块常量
+    `REGION`（cn-north-1）推导 ⇒ 恒 `SignatureDoesNotMatch`(100010)。
+    改 `_hmac(k, region)` 后国际站上传成功（返回 `tos-alisg-i-.../xxx`）。
 
-    门禁钉两件事：① 派发期有前置拒绝；② 同步链把 `invalid_parameter`
-    的失败转成 4xx（不再 200 + failure 体）。
+    🔴 同一类错误在 `service` 段已经踩过一次（scope 改 vod、推导仍用 imagex）
+    —— 这条门禁把 region 维度的坑也钉住。
     """
-    submit_src = inspect.getsource(Service._submit)
-    assert "暂不支持图生图" in submit_src, "国际站 i2i 必须前置拒绝"
-    assert '"sg"' in submit_src and "image_uris" in submit_src, \
-        "判据必须是「站点=sg」且「有垫图」"
+    import inspect as _inspect
+    from app.upstream.jimeng import upload as up
 
-    # 🔴 真正的入口是**上传**（在 `_submit` 之前）—— 只在 `_submit` 拦会走不到
-    prep_src = inspect.getsource(Service._prepare_input_images)
-    assert "暂不支持图生图" in prep_src, \
-        "垫图上传入口必须也拒绝（否则会白等 5s 才拿到 SignatureDoesNotMatch）"
-
-    sync_src = inspect.getsource(_sync_generate)
-    assert "InvalidParameterError.err_type" in sync_src, \
-        "同步链要把它转成 400，而不是回 200 + failure 体"
+    fn_src = _inspect.getsource(up)
+    assert "_hmac(k, region)" in fn_src, "kDate 必须用传入的 region"
+    assert "_hmac(k, REGION)" not in fn_src, "不许再用模块常量 REGION 推导"
