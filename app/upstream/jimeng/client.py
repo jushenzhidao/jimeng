@@ -1678,21 +1678,24 @@ class JimengClient:
             "url": self._url(path, extra_q), "method": "POST",
             "headers": self._headers(path), "body": body,
         }
-        try:
-            r = httpx.post(f"{bridge}/fetch", json=payload,
-                           timeout=max(self.timeout, 90.0))
-            r.raise_for_status()
-            out = r.json()
-        except (httpx.HTTPError, ValueError) as e:
-            raise JimengError(
-                f"经 sg-bridge 代发失败：{e}", retryable=True) from e
-        data = out.get("json")
-        if not isinstance(data, dict):
-            st, txt = out.get("status"), str(out.get("text"))[:200]
-            raise JimengError(
-                f"经 sg-bridge 代发返回非 JSON（HTTP {st}）：{txt!r}",
-                retryable=True)
-        return data
+        last: str = ""
+        #: 桥侧 `page.evaluate` 偶发 "Execution context destroyed"（页面在跳转
+        #: 时被销毁）—— 这是**通道**抖动，不是上游结论，重试一次即可。
+        for attempt in range(2):
+            try:
+                r = httpx.post(f"{bridge}/fetch", json=payload,
+                               timeout=max(self.timeout, 90.0))
+                out = r.json()
+            except (httpx.HTTPError, ValueError) as e:
+                last = f"{type(e).__name__}: {e}"
+                continue
+            if r.status_code >= 400 or not isinstance(out.get("json"), dict):
+                # 桥把页面内异常包成 `{"error": "..."}` —— 原样带出来，
+                # 否则只剩一个 502，排障方向全错。
+                last = str(out.get("error") or out.get("text") or out)[:300]
+                continue
+            return out["json"]
+        raise JimengError(f"经 sg-bridge 代发失败：{last}", retryable=True)
 
     def _report(self, path: str, body: dict, resp: Any, status: int | None,
                 duration_ms: float, ok: bool) -> None:
