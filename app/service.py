@@ -556,6 +556,13 @@ class Service:
             profile=profile,
             transport=self._upstream_transport,
         )
+        # 🔴 2026-10-20：国际站的**写接口**（`aigc_draft/generate`）直连恒
+        # `ret=-6 shark not pass reject` —— shark 验的是 secsdk 运行时会话，
+        # 只有浏览器页面上下文能过。这里把桥地址挂到 client 上：它会把
+        # **提交流量**经 `/fetch` 代发（读接口/STS 仍直连，不受影响）。
+        # cn 站不挂（国内没有 shark，直连更快也不引入桥的可用性依赖）。
+        if profile.name == "sg" and st.sg_bridge_url:
+            c.bridge_url = st.sg_bridge_url
         up = ImageXUploader(c)
         cfg2 = ModelConfigCache(c)
         return (c, up, VodUploader(c, imagex=up), cfg2)

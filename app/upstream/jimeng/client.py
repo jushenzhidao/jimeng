@@ -1548,6 +1548,12 @@ class JimengClient:
         self.ua = user_agent or (
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36")
+        #: 🔴 2026-10-20：**提交流量走 sg-bridge 的页面上下文**（URL 前缀）。
+        #: 国际站写接口被 shark 风控拦（直连恒 `ret=-6 shark not pass reject`），
+        #: 唯一过 shark 的环境是**浏览器页面上下文**（page-fetch 也过）。
+        #: 只对 `PATH_SUBMIT` 生效：读接口/STS 直连更快、也不受 shark 影响。
+        #: 由 `Service._build_bundle` 按「站点=sg + 配了 SG_BRIDGE_URL」注入。
+        self.bridge_url: str | None = None
 
     # ------------------------------------------------------------ 生命周期
 
@@ -1624,6 +1630,17 @@ class JimengClient:
         status_code: int | None = None
         resp_body: dict | Any = None
         try:
+            # 🔴 国际站写接口：经 sg-bridge 的**页面上下文**代发（过 shark）。
+            # 只拦 `PATH_SUBMIT` —— 读接口/STS 不受 shark 影响，直连更快。
+            if self.bridge_url and path == PATH_SUBMIT:
+                data = self._post_via_bridge(path, body, extra_q)
+                status_code = 200
+                resp_body = data
+                ret = data.get("ret")
+                if str(ret) != "0":
+                    raise_for_ret(ret, data)
+                ok = True
+                return data
             r = self._client.post(
                 self._url(path, extra_q), headers=self._headers(path),
                 content=json.dumps(body, ensure_ascii=False).encode())
@@ -1645,6 +1662,37 @@ class JimengClient:
         finally:
             self._report(path, body, resp_body, status_code,
                          round((time.perf_counter() - started) * 1000, 2), ok)
+
+    def _post_via_bridge(self, path: str, body: dict,
+                         extra_q: dict[str, str] | None) -> dict:
+        """把写请求塞进 **sg-bridge 的页面上下文**代发（过 shark）。
+
+        🔴 依据（2026-10-20 实测）：直连 `aigc_draft/generate` 恒
+        `ret=-6 shark not pass reject`；同一个请求在页面里 `fetch` 就过 ——
+        shark 验的是 **secsdk 运行时会话**，不是签名参数。因此复用桥的
+        `/fetch` 端点（页面内 fetch + credentials:include）原样转发
+        「URL / 头 / 体」。
+        """
+        bridge = (self.bridge_url or "").rstrip("/")
+        payload = {
+            "url": self._url(path, extra_q), "method": "POST",
+            "headers": self._headers(path), "body": body,
+        }
+        try:
+            r = httpx.post(f"{bridge}/fetch", json=payload,
+                           timeout=max(self.timeout, 90.0))
+            r.raise_for_status()
+            out = r.json()
+        except (httpx.HTTPError, ValueError) as e:
+            raise JimengError(
+                f"经 sg-bridge 代发失败：{e}", retryable=True) from e
+        data = out.get("json")
+        if not isinstance(data, dict):
+            st, txt = out.get("status"), str(out.get("text"))[:200]
+            raise JimengError(
+                f"经 sg-bridge 代发返回非 JSON（HTTP {st}）：{txt!r}",
+                retryable=True)
+        return data
 
     def _report(self, path: str, body: dict, resp: Any, status: int | None,
                 duration_ms: float, ok: bool) -> None:

@@ -75,3 +75,51 @@ def test_sg_i2i_upload_signs_with_passed_region():
     fn_src = _inspect.getsource(up)
     assert "_hmac(k, region)" in fn_src, "kDate 必须用传入的 region"
     assert "_hmac(k, REGION)" not in fn_src, "不许再用模块常量 REGION 推导"
+
+
+def test_sg_submit_routes_through_bridge_page_fetch(monkeypatch):
+    """国际站的**写接口**必须经桥的页面上下文代发（2026-10-20 实测）。
+
+    直连 `aigc_draft/generate` 恒 `ret=-6 shark not pass reject`（shark 验
+    secsdk 运行时会话）；同一个请求在页面里 `fetch` 就通过 ⇒ 提交流量改走
+    `sg-bridge` 的 `/fetch`。门禁钉三件事：
+      ① `_build_bundle` 给 sg 客户端挂 `bridge_url`（漏接 = 静默直连被拦）；
+      ② `_post` 只对 `PATH_SUBMIT` 走桥（读接口/STS 不该被拖慢）；
+      ③ 转发的 body/URL 原样（桥只是通道，不做改写）。
+    """
+    from app.upstream.jimeng import client as cmod
+    from app.upstream.jimeng.site import SG_SITE
+
+    src = inspect.getsource(Service._build_bundle)
+    assert "c.bridge_url" in src and '"sg"' in src, "sg 客户端必须挂 bridge_url"
+    post_src = inspect.getsource(cmod.JimengClient._post)
+    assert "PATH_SUBMIT" in post_src and "_post_via_bridge" in post_src, \
+        "提交流量必须改走桥"
+
+    seen: dict = {}
+
+    class _R:
+        status_code = 200
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {"status": 200, "json": {"ret": "0", "data": {"ok": 1}}}
+
+    def _fake_post(url, **kw):
+        seen["url"] = url
+        seen["payload"] = kw["json"]
+        return _R()
+
+    monkeypatch.setattr(cmod.httpx, "post", _fake_post)
+    c = cmod.JimengClient(sessionid="a" * 32, profile=SG_SITE,
+                          capture_upstream=False)
+    try:
+        c.bridge_url = "http://sg-bridge:8300"
+        out = c._post(cmod.PATH_SUBMIT, {"draft_content": "{}"})
+    finally:
+        c.close()
+    assert out["ret"] == "0"
+    assert seen["url"].endswith("/fetch"), "必须打桥的 /fetch"
+    assert seen["payload"]["body"] == {"draft_content": "{}"}, "body 必须原样转发"
