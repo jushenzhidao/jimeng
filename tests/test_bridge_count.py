@@ -14,7 +14,6 @@ from __future__ import annotations
 import inspect
 from pathlib import Path
 
-from app.main import _sync_generate
 from app.service import Service
 
 ROOT = Path(__file__).resolve().parent.parent
