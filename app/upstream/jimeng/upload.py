@@ -79,21 +79,28 @@ class ImageXError(JimengError):
     """上传链路失败（与生成无关，不消耗积分）。"""
 
 
+#: token 下发的 `region` 是**站点别名**不是 AWS region —— 必须归一：
+#: 🔴 2026-10-20 实锤：国内站 token 开始下发 `region='cn'`，直接采信会把
+#: scope 签成 `.../cn/imagex/...`，而服务端只认 `cn-north-1` ⇒
+#: ApplyImageUpload 100% `SignatureDoesNotMatch`（i2i 全挂）。
+#: 对照探针：同一把 STS，`cn` 恒拒、`cn-north-1` 通过。
+REGION_ALIAS = {"cn": "cn-north-1"}
+
+
 def _aws_region(t: dict, host: str) -> str:
     """AWS4 scope 的 region 取值 —— 顺序刻意，别调换：
 
-    1. **token 下发的 `region`**（服务端数据优先）。国际版实测 `region='sg'`。
-       ⚠️ 2026-10-15：以 `sg` 与 `ap-singapore-1` 签名**都被拒**
-       （`SignatureDoesNotMatch`）⇒ 国际上传链路当前**不可用**（签名细节
-       未定位，等真实抓包），本函数只保证"服务端给了就优先用它"的顺序，
-       **不代表国际站能传**。
+    1. **token 下发的 `region`**（服务端数据优先）—— 但它可能是站点别名
+       （`cn`/`sg`），先过 `REGION_ALIAS` 归一成 AWS region 名。国际版实测
+       `region='sg'`（⚠️ 2026-10-15：以 `sg` 与 `ap-singapore-1` 签名**都被拒**
+       ⇒ 国际上传链路当前不可用，等真实抓包，本函数只管顺序语义）。
     2. 域名首段推导（`imagex-<region>.…` → `<region>`）：token 没带 region
        时的兜底（国内老 token 形态）。
     3. 国内常量 `cn-north-1`（`imagex.bytedanceapi.com` 无 region 段）。
     """
     r = t.get("region")
     if r:
-        return str(r)
+        return REGION_ALIAS.get(str(r), str(r))
     first = (host or "").split(".")[0]
     if first.startswith("imagex-") and first != "imagex-":
         return first[len("imagex-"):]
@@ -125,13 +132,9 @@ def aws4_sign(*, method: str, host: str, path: str, query: dict[str, str],
     （2026-09-20 实抓：Credential=`.../cn-north-1/vod/aws4_request`）。
 
     `region`：AWS4 scope 的 region 段。国内 = `cn-north-1`（抓包钉死）。
-    国际版（2026-10-15）：token 下发 `region='sg'`、`upload_domain` 首段是
-    `imagex-ap-singapore-1` —— **两个候选都以 `SignatureDoesNotMatch`(100010)
-    被拒**（`scripts/probe_sg_upload.py` 实跑）：国际上传的签名细节与国内
-    存在未定位差异（候选：签名头名/STS 参与方式/payload 规则），缺一份
-    真实浏览器上传抓包做参照，**不盲试**。⇒ 国际站 i2i（依赖上传）首期
-    **不开放**；待抓包对差后再钉死。`_aws_region` 只收拢"取值顺序"，
-    不承诺国际站可用。
+    国际版（2026-10-19 浏览器抓包对照后钉死）：**`ap-singapore-1`**，
+    且**密钥推导必须用同一个 region** —— 此前 kDate 误用常量 `REGION`
+    （cn-north-1）导致恒 100010，与"sign/ste"无关。
     """
     now = now or _dt.datetime.now(_dt.timezone.utc)
     amz_date = now.strftime("%Y%m%dT%H%M%SZ")
@@ -160,7 +163,11 @@ def aws4_sign(*, method: str, host: str, path: str, query: dict[str, str],
     # 🔴 密钥推导必须用**传入的 service**（不是模块常量 SERVICE）——
     # 这里曾经踩过：scope 行改了 vod、推导还在用 imagex ⇒ 签名永远不匹配。
     k = _hmac(("AWS4" + secret_key).encode(), date)
-    k = _hmac(k, REGION)
+    #: 🔴 **必须用传入的 region**，不是模块常量 `REGION`（= cn-north-1）。
+    #: 这里和下面 scope 行是同一条链：scope 写 `ap-singapore-1`、kDate 却按
+    #: `cn-north-1` 推导 ⇒ 国际站恒 `SignatureDoesNotMatch`(100010)。
+    #: 2026-10-19 浏览器抓包对照后定位（此前 service 维度踩过同一坑）。
+    k = _hmac(k, region)
     k = _hmac(k, service)
     k = _hmac(k, "aws4_request")
     sig = hmac.new(k, string_to_sign.encode(), hashlib.sha256).hexdigest()

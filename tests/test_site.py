@@ -373,6 +373,14 @@ def test_aws_region_order_token_first_then_domain_then_default():
     assert _aws_region({}, "") == "cn-north-1"
 
 
+def test_aws_region_token_alias_cn_normalized():
+    """2026-10-20 线上实锤：国内站 token 下发 `region='cn'`（站点别名不是
+    AWS region），直接采信 ⇒ scope 签成 `cn` ⇒ ApplyImageUpload 100%
+    SignatureDoesNotMatch（i2i 全挂）。同一把 STS 对照探针：`cn` 恒拒、
+    `cn-north-1` 通过。别名必须归一。"""
+    assert _aws_region({"region": "cn"}, "imagex.bytedanceapi.com") == "cn-north-1"
+
+
 # ---------------------------------------------------------------------------
 # ⑥ 配置：SG 三项从 env 读
 # ---------------------------------------------------------------------------
