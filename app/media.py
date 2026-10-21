@@ -63,6 +63,15 @@ def reuse_image_uri(ref: str) -> str | None:
       对象不存在的话会在**建任务**那一步暴露（上游拒绝或任务失败）。
     """
     text = (ref or "").strip()
+    #: 🔴 2026-10-21：**裸 `image_uri` 也必须认**。`task.image_refs` 现在会在
+    #: 首次派发成功后替换成上传回执里的 `tos-cn-i-<space>/<key>`（见
+    #: `Service._prepare_input_images`）—— 那是一条**没有 host 的裸路径**。
+    #: 改动前这里只认 `http(s)://…byteimg.com/…`，于是重试时会把裸 uri 当外链
+    #: 去下载 ⇒ 直接失败 ⇒ **把一次可重试的失败变成必然失败**。
+    #: 守卫不变（同一份 `_TOS_ASSET_RE`：限定 `tos-cn-i-<space>/<16+ hex>`）。
+    if text.lower().startswith("tos-"):
+        m = _TOS_ASSET_RE.match(text)
+        return m.group("uri") if m else None
     if not text.lower().startswith(("http://", "https://")):
         return None
     parsed = urlsplit(text)

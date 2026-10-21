@@ -339,6 +339,16 @@ def empty_result_error() -> EmptyResultError:
 # ---------------------------------------------------------------------------
 
 
+#: 输入图**内容摘要**的前缀（`input_digests` 里的形态）。
+#:
+#: 🔴 2026-10-21：`image_refs` 会在首次派发成功后**被替换成上游 `image_uri`**
+#: （`tos-cn-i-…`，几十字节），而受理去重指纹必须跨这个替换保持不变 ——
+#: 否则"同一次请求的重试"在前一条已派发后就不再被认成重复。
+#: 前缀让"摘要"与"URL / data URI"在同一个字段里一眼可分，
+#: 也让 `_image_digest` 见到它时**直接返回**（不当 URL 去下载）。
+DIGEST_PREFIX = "sha256:"
+
+
 def _fingerprint(*, model: Any, cap_key: Any, upstream_model: Any, prompt: Any,
                  images: Any, size: Any, tier: Any, n: Any, seed: Any,
                  negative_prompt: Any, duration_ms: Any, aspect_ratio: Any) -> str:
@@ -378,7 +388,14 @@ def _fingerprint_of_record(rec: TaskRecord, *,
     """
     return _fingerprint(
         model=rec.model, cap_key=rec.cap_key, upstream_model=rec.upstream_model,
-        prompt=rec.prompt, images=rec.image_refs if with_images else [],
+        prompt=rec.prompt,
+        #: 🔴 2026-10-21：有摘要就**优先用摘要** —— `image_refs` 在首次派发成功后
+        #: 会被替换成上游 `image_uri`（见 `_prepare_input_images`），而指纹
+        #: 必须跨这个替换保持不变，否则"同一次请求的重试"在前一条已派发后
+        #: 就不再被认成重复（去重静默失效）。
+        #: 没有摘要的旧记录回落到 `image_refs`（那时它就是原始 ref；
+        #: 与新请求的摘要不同构，由 `_dedupe_by_content` 的内容比对接住）。
+        images=(rec.input_digests or rec.image_refs) if with_images else [],
         size=rec.size,
         tier=rec.resolution_tier, n=rec.n, seed=rec.seed,
         negative_prompt=rec.negative_prompt, duration_ms=rec.duration_ms,
@@ -736,6 +753,11 @@ class Service:
         key = (ref or "").strip()
         if not key:
             return None
+        if key.startswith(DIGEST_PREFIX):
+            #: 已经是**算好的摘要**（`input_digests` 里的形态）⇒ 直接用。
+            #: 没有这条短路，`_same_inputs` 把摘要当 URL 去下载 ⇒ 永远 None
+            #: ⇒ 内容级去重静默失效。
+            return key[len(DIGEST_PREFIX):]
         with self._digest_lock:
             hit = self._digest_cache.get(key)
             if hit is not None:
@@ -753,6 +775,33 @@ class Service:
             while len(self._digest_cache) > 256:
                 self._digest_cache.popitem(last=False)
         return digest
+
+    def _ref_digest(self, ref: str) -> str | None:
+        """给**落库**用的内容摘要 —— 只处理能**本地解码**的形态。
+
+        与 `_image_digest` 的分工（同一个算法的两个场景）：
+
+          · `_image_digest`：**去重比对**用，允许下载外链（有缓存，256 条 LRU）；
+          · `_ref_digest`：**受理期**用，`create` 的不变式是"请求内零上游往返"
+            ⇒ 外链 URL **一律返回 None**，由调用方回退成 URL 原文（与改动前
+            行为逐字一致）；data URI / base64 只是内存解码，不算网络。
+
+        返回 `"sha256:<hex>"`（带前缀，见 `DIGEST_PREFIX`）。
+        """
+        key = (ref or "").strip()
+        if not key:
+            return None
+        if key.startswith(DIGEST_PREFIX):
+            return key
+        if not key.startswith("data:") and "base64," not in key:
+            return None                  # 外链：受理期不下载
+        try:
+            blob = load_one(key, self.settings)
+        except Exception as e:      # noqa: BLE001 —— 解不开就退回原文
+            log.info("受理期算输入图摘要失败（%s）⇒ 存原文: %s",
+                     type(e).__name__, str(e)[:80])
+            return None
+        return DIGEST_PREFIX + hashlib.sha256(blob.data).hexdigest()
 
     def _same_inputs(self, new: list[Any], old: list[Any]) -> bool:
         """两组垫图**内容**是否一致（顺序敏感，与生成语义一致）。"""
@@ -800,7 +849,7 @@ class Service:
             checked += 1
             if checked > 3:         # 比对要下载图，最多看 3 条候选
                 break
-            if self._same_inputs(images, list(r.image_refs or [])):
+            if self._same_inputs(images, list(r.input_digests or r.image_refs or [])):
                 OBS.info("accept deduped by content", task_id=r.task_id,
                          model=r.model, capability=r.cap_key, status=r.status,
                          age_s=now - int(r.created_at or now),
@@ -1704,6 +1753,12 @@ class Service:
         # 指纹相同 + 同凭据 + 那条**仍在途**（且在窗口内）⇒ 复用它的 task_id。
         # 对调用方是透明且正确的：它要的就是"这一次生成的结果"，而它正在跑。
         now = int(time.time())
+        #: 🔴 2026-10-21（"别再存 base64"）：输入图的**内容摘要**在受理期算好。
+        #: data URI / base64 本地解码算 sha256（零网络）；外链 URL 保留原文。
+        #: 两个用途：① 去重指纹 —— `image_refs` 在首次派发成功后会被替换成
+        #: 上游 `image_uri`（见 `_prepare_input_images`），只有这一列能跨替换
+        #: 保持不变；② 排查时能确认"两张图是不是同一张"。
+        digests = [self._ref_digest(r) or r for r in image]
         rec = TaskRecord(
             task_id=new_task_id(cap.api_id),
             credential_id=credential,
@@ -1718,6 +1773,7 @@ class Service:
             priority=priority,
             prompt=prompt,
             image_refs=image,
+            input_digests=digests,
             size=str(size),
             resolution_tier=tier,
             n=n,
@@ -1742,7 +1798,7 @@ class Service:
                 window = self.settings.accept_dedupe_window_s
                 fp = _fingerprint(
                     model=cap.api_id, cap_key=cap.key,
-                    upstream_model=upstream_model, prompt=prompt, images=image,
+                    upstream_model=upstream_model, prompt=prompt, images=digests,
                     size=size, tier=tier, n=n, seed=seed,
                     negative_prompt=body.get("negative_prompt"),
                     duration_ms=duration_ms, aspect_ratio=aspect_ratio)
@@ -1757,7 +1813,7 @@ class Service:
                     prev = self._dedupe_by_content(
                         credential, capability=cap,
                         upstream_model=upstream_model, prompt=prompt,
-                        images=image, size=size, tier=tier, n=n, seed=seed,
+                        images=digests, size=size, tier=tier, n=n, seed=seed,
                         negative_prompt=body.get("negative_prompt"),
                         duration_ms=duration_ms, aspect_ratio=aspect_ratio,
                         now=now)
@@ -3046,10 +3102,25 @@ class Service:
             # 全都可复用 ⇒ 一次下载、一次上传都不需要
             uris = list(reused)          # type: ignore[arg-type]
 
+        #: 🔴 2026-10-21（用户口径"image_refs 别再存 base64"）：**上传成功后
+        #: 立刻把 `image_refs` 换成上游 `image_uri`**。
+        #: 于是 data URI / base64 只在"受理 → 首次派发"这个窗口（秒级）里存在，
+        #: 终态任务的行只有几十字节 ⇒ 表不再按历史累计膨胀（旧行由 autovacuum
+        #: 回收、空间可重用；线上实测一行的 image_refs 曾到 1,023,295 字节）。
+        #: ⚠️ 与 `degradations` 合并成**一次** `patch`（同一行别写两遍）。
+        #: ⚠️ `store.patch` 只写库、**不动内存里的 `rec`** —— 下游一律用返回的
+        #: `uris`（`_pre_audit_materials` / `_submit` 都是显式传参），谁也不读
+        #: `rec.image_refs`，所以这里不需要回写。
+        #: ⚠️ 只在真有上传（`pending`）时替换：全部复用说明它们本来就是 uri，
+        #: 写一遍同样的值只会白白多一个行版本。
+        fields: dict[str, Any] = {}
+        if pending:
+            fields["image_refs"] = list(uris)
         if notes:
             # 一次写完：N 张的降级说明合起来只 patch 一次，别每张都写库
-            self.store.patch(rec.task_id,
-                             degradations=list(rec.degradations) + notes)
+            fields["degradations"] = list(rec.degradations) + notes
+        if fields:
+            self.store.patch(rec.task_id, **fields)
         OBS.info("input images ready", task_id=rec.task_id,
                  count=len(uris),
                  reused=sum(1 for u in reused if u is not None),

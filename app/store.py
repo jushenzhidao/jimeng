@@ -58,20 +58,34 @@ _DSN_PASSWORD_RE = re.compile(r"(?P<head>://[^:/@]+:)(?P<pw>[^@]*)@")
 def _scalar_default(col: Any) -> str | None:
     """取列的**标量**默认值并渲染成 SQL 字面量；没有（或不是标量）返回 None。
 
-    只认 Python 侧声明过的标量默认（`Field(default=0)` / `default=""` …）。
-    `default_factory`（`list` / `dict`）**刻意不认** —— 给 JSON 列编一个
-    `DEFAULT '[]'` 看似方便，实际会掩盖"这列本该有值却没有"的数据问题。
+    两个来源，优先 Python 侧：
+      · `Field(default=...)` —— 只认标量；`default_factory`（`list` / `dict`）
+        **刻意不认**：替 JSON 列编一个 `DEFAULT '[]'` 会掩盖"这列本该有值却没有"
+        的数据问题；
+      · `Column(server_default=...)` —— **认**（2026-10-21 起）：那是作者显式声明的
+        SQL 默认，正是"旧库自动补列"该用的东西（`input_digests` 靠它免掉手工 ALTER）。
     """
     d = getattr(col, "default", None)
-    if d is None or not getattr(d, "is_scalar", False):
+    if d is not None and getattr(d, "is_scalar", False):
+        arg = d.arg
+        if isinstance(arg, bool):
+            return "TRUE" if arg else "FALSE"
+        if isinstance(arg, (int, float)):
+            return str(arg)
+        if isinstance(arg, str):
+            return "'" + arg.replace("'", "''") + "'"
         return None
-    arg = d.arg
-    if isinstance(arg, bool):
-        return "TRUE" if arg else "FALSE"
-    if isinstance(arg, (int, float)):
-        return str(arg)
+    #: 🔴 2026-10-21：**显式声明的 `server_default` 也算**（`input_digests`）。
+    #: 与上面"不认 `default_factory`"不冲突 —— 那条防的是**我替 JSON 列编一个
+    #: 默认值**（会掩盖"本该有值却没有"）；而 `server_default` 是**作者明确声明**
+    #: 的 SQL 默认，正是"旧库补列"该用的东西。没有这一支，带 `default_factory`
+    #: 的非空 JSON 列永远只能手工 ALTER（`image_refs` 就是那么留下的债）。
+    sd = getattr(col, "server_default", None)
+    arg = getattr(sd, "arg", None)
     if isinstance(arg, str):
         return "'" + arg.replace("'", "''") + "'"
+    if arg is not None:
+        return str(arg)          # TextClause，原样拼（如 `'[]'::jsonb`）
     return None
 
 
@@ -138,6 +152,23 @@ class TaskRecord(SQLModel, table=True):
     prompt: str = ""
     image_refs: list = Field(default_factory=list,
                             sa_column=Column(JSON_COL, nullable=False))
+    #: 🔴 2026-10-21（"别再存 base64"）：输入图的**内容摘要**（每张一项，有序）。
+    #:
+    #: 为什么要单独一列：`image_refs` 现在会在**首次派发成功后**被替换成上游
+    #: `image_uri`（`tos-cn-i-…`，几十字节），而受理去重指纹必须**跨这个替换保持
+    #: 不变** —— 否则"同一次请求的重试"在前一条已派发后就不再被识别成重复。
+    #: 因此：data URI / base64 输入在受理时本地解码算 `sha256:<hex>`，
+    #: 外链 URL 存**原文**（受理期不下载，保持"零上游往返"不变式）。
+    #: 非空时去重一律优先读它（见 `_fingerprint_of_record`）。
+    input_digests: list = Field(
+        default_factory=list,
+        sa_column=Column(JSON_COL, nullable=False,
+                         #: 🔴 有 `server_default` 才**能自动补列**（见
+                         #: `_scalar_default`）：没有它，`_ensure_columns` 会把
+                         #: 这一列报成"非空且无标量默认值"、拒绝迁移 ——
+                         #: 而 `image_refs` 当年正是这么留下的技术债。
+                         #: 语义上也成立：**空列表 = 还没算过**。
+                         server_default=text("'[]'::jsonb")))
     size: Optional[str] = None
     #: 🔴 2026-10-02（方案 B）：`model` 后缀指定的分辨率档（如 "4k"）。
     #: 为 None 表示"没指定、按 size 就近吸附"。
@@ -236,7 +267,8 @@ class Meta(SQLModel, table=True):
 
 _PATCHABLE = {
     "credential_id", "model", "cap_key", "upstream_model", "status", "prompt",
-    "image_refs", "size", "n", "seed", "negative_prompt", "duration_ms",
+    "image_refs", "input_digests", "size", "n", "seed", "negative_prompt",
+    "duration_ms",
     "aspect_ratio", "extra_json", "upstream_submit_id", "gen_submit_id",
     "upstream_history_id", "draft_json", "continuations",
     "images", "credits", "error", "degradations", "created_at", "updated_at",
