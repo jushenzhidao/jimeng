@@ -133,6 +133,7 @@ POST /v1/images/generations          Authorization: Bearer <key>
 | 预算内到终态（**内容审核拒绝**） | `451` | `error.code = "content_policy_violation"` —— 换 prompt / 换图才有用 |
 | 预算内到终态（其余失败） | `200` | 与异步一致：`{task_id, status:"failure", error}` |
 | 预算耗尽仍在跑 | `504` | `error.code = "sync_timeout"`。🔴 **2026-10-21 用户口径**：「同步任务就别 202 了」—— 旧的 `202 + Location` 降级**作废**（同步调用方拿 202 得到的是"既不是结果也不是错误"的东西，还得自己实现轮询）。任务**仍在跑、未取消**，`message` 里带 `GET /async/v1/images/generations/<task_id>`；原样重试会命中受理去重（复用同一条在途任务，不重复计费） |
+| 队列积压（最老等待 ≥ 预算） | `429` | `error.code = "queue_overloaded"` + `retry_after`（粗估秒数）。🔴 **2026-10-21 用户口径**："队列最老等待 > 预算就直接 503/429，不让它白等 5 分钟" —— 这单**必然**等不到结果，**零建任务**直接拒。⚠️ 只统计 **`4×预算`（至少 1h）时间窗内**的排队：库里的"僵尸 queued"（从不派发、等待时间无限涨）不算，否则一条僵尸能让整个同步面永久 429 |
 | 没有推进者 | `503` | `error.code = "sync_unavailable"` |
 
 * **预算** = `SYNC_MAX_WAIT`（默认 **300s**，墙钟总时长）：排队 + 建任务 +
@@ -749,6 +750,7 @@ Authorization: Bearer <key>
 | `task_not_found` | 404 | 不存在或不属于本 Key |
 | `upstream_rate_limited` | 429 | 上游限流，**可退避重试**（带 `Retry-After`） |
 | `upstream_quota_exhausted` | 429 | 积分/日额度耗尽，**重试无效** |
+| `queue_overloaded` | 429 | **本服务**的队列过载（与上游无关，上游是好的）：① 该凭据排队条数达 `MAX_QUEUED_PER_CREDENTIAL`（受理口背压）；② **同步链**检出"队列最老等待 ≥ 同步预算"⇒ 零建任务直接拒（2026-10-21 口径，带 `retry_after`）。等前面的跑完再提交，或改用异步端点 |
 | `risk_control_challenge` | 429 | 命中风控，**重试会延长标记**，服务已进入冷却 |
 | `upstream_empty_result` | **500** | 上游报成功却**零产物**（一张都没有），或同步响应体为空对象 `{}`。本服务不交付空成功 ⇒ 同步端点直接 **500**（异步族仍是 200 + `status:"failure"` / `data:[]`）。🔴 2026-10-21 用户口径："不要返回空图或者 `{}`，这个直接报 500" —— 旧的 451 作废（会被网关归到内容合规、甚至渲染成 `{}`）。`code` 单独一个、服务端日志可区分、**不进负缓存**。错误体**只有** `message` / `type` / `code` —— **不带 `detail`**，不回显模型名、能力 key、上游状态码与计数、上游 id |
 | `upstream_error` | 502 | 上游 5xx / 非 JSON / WAF 页 |

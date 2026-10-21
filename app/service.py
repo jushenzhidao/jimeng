@@ -1698,6 +1698,10 @@ class Service:
                 f"任务 {task_id} 不存在，或不属于当前 API Key。")
         return rec
 
+    def queue_oldest_wait_s(self, *, within_s: int | None = None) -> int:
+        """队列最老等待秒数（同步链快速失败用，见 `main._sync_generate`）。"""
+        return self.store.queue_oldest_wait_s(within_s=within_s)
+
     def delete_for_credential(self, task_id: str, credential: str) -> dict:
         """删除/取消任务。
 

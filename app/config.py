@@ -203,6 +203,9 @@ class Settings:
     #: 默认 360）与生产 nginx 的 `proxy_read_timeout`（需 ≥ 300 + 余量）——
     #: 否则跑满预算的请求会被掐断，客户端拿到的是断连而不是我们构造的降级响应。
     sync_max_wait: float = 300.0
+    #: 🔴 2026-10-21（用户口径）：同步链**快速失败** —— 队列最老等待已达同步预算时，
+    #: 这单必然等不到结果，直接在受理口 429，别让它白等 300s。
+    sync_backlog_guard: bool = True
 
     # -------------------------------------------------- 内容审核负缓存
     #: 🔴 2026-10-02：被上游审核拒绝过的 (能力, 模型, prompt, 输入图, 档位)
@@ -374,6 +377,7 @@ class Settings:
             coordinator_tick=_f("COORDINATOR_TICK", 1.0),
             coordinator_lease=_f("COORDINATOR_LEASE", 30.0),
             sync_max_wait=_f("SYNC_MAX_WAIT", 300.0),
+            sync_backlog_guard=_b("SYNC_BACKLOG_GUARD", True),
             neg_cache_ttl=_f("NEG_CACHE_TTL", 86400.0),
             neg_cache_max=int(_f("NEG_CACHE_MAX", 2048)),
             neg_cache_action=_s("NEG_CACHE_ACTION", "fail").strip().lower(),

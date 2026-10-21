@@ -60,6 +60,7 @@ from .errors import (
     ContentPolicyError,
     EmptyResultError,
     InvalidParameterError,
+    QueueOverloadedError,
     SyncTimeoutError,
     SyncUnavailableError,
 )
@@ -551,6 +552,30 @@ async def _sync_generate(svc: Service, coordinator: Any, settings: Settings,
             "后台协调器未在运行（COORDINATOR_ENABLED=0？）—— 没有任务推进者，"
             "同步等待无法履行。请改用异步端点 POST /async/v1/images/generations，"
             "或开启协调器后重试。")
+    #: 🔴 2026-10-21（用户口径）：**队列积压时同步链快速失败** —— 最老那条
+    #: 已经等了 ≥ 同步预算，说明新请求必然也等不到；此时建任务只会让它
+    #: 白等 300s 再 504，还平白把队列排得更长（恶性循环）。
+    #: 判据用**全局最老等待**（不是自己的条数）：公平轮转下，堵住的队列对
+    #: 谁都是堵的。放在 `create` **之前** ⇒ 零建任务、零计费、零排队。
+    #: ⚠️ 顺序：先判 `coordinator.running`（没有推进者时队列必然积压，
+    #: 报 503 才指向真因），再判积压（429）。
+    if settings.sync_backlog_guard:
+        #: 时间窗 = 4 倍预算（至少 1h）：**只看"近期"的排队**，把"从未提交、
+        #: 永远派不出去"的孤儿 queued 排除在外 —— 那种任务等待时间会无限涨，
+        #: 不设窗就等于让一条僵尸把整个同步面永久 429。宁可漏判（偶发 504）。
+        window = max(int(settings.sync_max_wait * 4), 3600)
+        oldest = await run_in_threadpool(
+            svc.queue_oldest_wait_s, within_s=window)
+        if oldest >= settings.sync_max_wait:
+            OBS.warning("sync backlog fast-fail", oldest_wait_s=oldest,
+                        budget_s=settings.sync_max_wait)
+            raise QueueOverloadedError(
+                f"队列最老的任务已等待 {oldest}s，已达同步预算 "
+                f"{settings.sync_max_wait:.0f}s ⇒ 这单必然等不到结果，"
+                f"直接拒绝而不是让你白等。请改用异步端点 "
+                f"POST /async/v1/images/generations（受理即可拿 task_id），"
+                f"或等队列消化后重试。",
+                retry_after=float(max(1, oldest - int(settings.sync_max_wait))))
     rec = await run_in_threadpool(
         svc.create, body, credential=credential, sessionid=sessionid,
         preset_degradations=preset_degradations)

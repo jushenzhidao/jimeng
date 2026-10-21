@@ -1128,6 +1128,77 @@ def test_sync_timeout_raises_504(client_factory):
     assert got.json()["status"] == "queued"
 
 
+def test_sync_fast_fails_when_backlog_exceeds_budget(sync_client, monkeypatch):
+    """🔴 队列最老等待 ≥ 同步预算 ⇒ **429 快速失败**，且**零建任务**。
+
+    2026-10-21 用户口径："队列最老等待 > 预算就直接 503/429，不让它白等 5 分钟"。
+    没有这道闸时：先建任务（真提交上游、真计费）→ 干等满 300s → 504，
+    而图多半已经生成好却没人来取（白花钱），队列还被排得更长。
+    """
+    monkeypatch.setattr("app.service.Service.queue_oldest_wait_s",
+                        lambda self, *, within_s=None: 999)
+    before = sync_client.get(BASE, headers=AUTH).json()["total"]
+
+    r = sync_client.post(SYNC, json={"model": "jimeng-t2i", "prompt": "x"},
+                         headers=AUTH)
+
+    assert r.status_code == 429, r.text
+    err = r.json()["error"]
+    assert err["code"] == "queue_overloaded", err
+    assert err["type"] == "rate_limit_error", err
+    # 粗估的等待要给出来（别编精确数字），且 message 指向异步端点。
+    assert err["retry_after"] >= 1, err
+    assert "异步端点" in err["message"], err
+
+    after = sync_client.get(BASE, headers=AUTH).json()["total"]
+    assert after == before, "被拒的请求不该建任务（零计费、零排队）"
+
+
+def test_sync_backlog_guard_can_be_switched_off(client_factory, monkeypatch):
+    """闸关掉之后必须回到"照常建任务、等满预算再 504"的老路径。
+
+    留这个开关是为了**排障**：若线上误判（例如队列指标被僵尸污染），
+    运维能立刻关掉它，而不是回滚整个版本。
+    """
+    c = client_factory(sync_max_wait=0.05, sync_backlog_guard=False)
+    st = c.app.state
+    st.coordinator = _InlineCoordinator(st.coordinator, advances=0)
+    monkeypatch.setattr("app.service.Service.queue_oldest_wait_s",
+                        lambda self, *, within_s=None: 9999)
+
+    r = c.post(SYNC, json={"model": "jimeng-t2i", "prompt": "x"}, headers=AUTH)
+
+    assert r.status_code == 504, r.text
+    assert r.json()["error"]["code"] == "sync_timeout", r.text
+
+
+def test_queue_oldest_wait_window_excludes_zombies(store):
+    """🔴 时间窗必须把"从不派发"的僵尸 queued 排除在外。
+
+    现场：库里真出现过 `queued` 且 `upstream_submit_id` 为空、永远派不出去的
+    任务（本地生产库就躺着一条 10-04 的）。它的"等待时间"会无限涨 ——
+    判据若不设窗口，一条僵尸就能让**整个同步面永久 429**。
+    取舍写死：宁可漏判（偶发 504），不能误判（全站不可用）。
+    """
+    import time as _time
+
+    from sqlmodel import Session
+
+    from app.store import TaskRecord
+
+    old = int(_time.time()) - 86400
+    with Session(store.engine) as s:
+        s.add(TaskRecord(task_id="zombie-queued-1", credential_id="c1",
+                         model="jimeng-t2i", cap_key="jimeng:t2i",
+                         status="queued", created_at=old, updated_at=old))
+        s.commit()
+
+    # 不带窗口：它就是最老那条（≈1 天）—— 这正是会毒化同步面的值。
+    assert store.queue_oldest_wait_s() >= 86000
+    # 带窗口（同步链实际用的形态）：僵尸被排除 ⇒ 0，闸不会误开。
+    assert store.queue_oldest_wait_s(within_s=3600) == 0
+
+
 def test_sync_503_without_a_running_coordinator(client):
     """没有推进者 ⇒ **快速 503**，而不是白等一整个预算。
 

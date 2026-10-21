@@ -559,6 +559,29 @@ class TaskStore:
                               for k, n in rows],
         }
 
+    def queue_oldest_wait_s(self, *, within_s: int | None = None) -> int:
+        """排队任务里**最老的已等待秒数**（没有排队 = 0）。
+
+        🔴 2026-10-21：同步链快速失败的判据 —— 最老那条已经等了 ≥ 同步预算，
+        新进来的同步请求必然也等不到，直接在受理口拒绝比让人白等 300s 诚实。
+        ⚠️ 比 `queue_snapshot()` 轻：只做一次 `min(created_at)`，不分组、
+        不数条数 —— 它是**每个同步请求都要过**的一道闸。
+
+        🔴 `within_s`：**只看这么多秒以内**创建的 queued。这是防"僵尸任务
+        毒化同步面"的必备项 —— 库里真出现过"从未提交、永远派不出去"的
+        queued（本地库就躺着一条 10-04 的），它的等待时间会无限涨；
+        若判据不设窗口，一条僵尸就能让**整个同步面永久 429**。
+        宁可漏判（偶发 504），不能误判（全站不可用）。
+        """
+        stmt = select(func.min(TaskRecord.created_at)).where(
+            TaskRecord.status == "queued")
+        if within_s is not None:
+            stmt = stmt.where(
+                TaskRecord.created_at >= int(time.time()) - int(within_s))
+        with Session(self.engine) as s:
+            oldest = s.exec(stmt).one()
+        return max(0, int(time.time()) - int(oldest)) if oldest else 0
+
     def list_recent(self, *, credential_id: str | None = None,
                     limit: int = 50) -> list[TaskRecord]:
         stmt = select(TaskRecord)
