@@ -582,8 +582,10 @@ async def _sync_generate(svc: Service, coordinator: Any, settings: Settings,
         #: 永远派不出去"的孤儿 queued 排除在外 —— 那种任务等待时间会无限涨，
         #: 不设窗就等于让一条僵尸把整个同步面永久 429。宁可漏判（偶发 504）。
         window = max(int(settings.sync_max_wait * 4), 3600)
+        #: 只看**同步自己的**排队：异步灌到 1000 条不该判同步死刑（它能插队，
+        #: 见 `coordinator._dispatch` 的 priority 分支）。
         oldest = await run_in_threadpool(
-            svc.queue_oldest_wait_s, within_s=window)
+            svc.queue_oldest_wait_s, within_s=window, priority_only=True)
         if oldest >= settings.sync_max_wait:
             OBS.warning("sync backlog fast-fail", oldest_wait_s=oldest,
                         budget_s=settings.sync_max_wait)
@@ -596,7 +598,9 @@ async def _sync_generate(svc: Service, coordinator: Any, settings: Settings,
                 retry_after=float(max(1, oldest - int(settings.sync_max_wait))))
     rec = await run_in_threadpool(
         svc.create, body, credential=credential, sessionid=sessionid,
-        preset_degradations=preset_degradations)
+        preset_degradations=preset_degradations,
+        #: 🔴 同步请求打上 priority=1：协调器**先派它**，不排在异步积压后面。
+        priority=1)
     coordinator.wake()
     rec = await _wait_terminal_async(svc, rec.task_id, credential,
                                      settings.sync_max_wait)

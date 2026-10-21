@@ -1468,7 +1468,7 @@ def test_dispatch_starvation_is_counted_not_silent(settings):
         def list_by_status(self, *a, **k):
             self.list_calls += 1
             # 有一条待派发（要能读出 `upstream_sessionid` —— 派发侧按它判静默）
-            return [SimpleNamespace(upstream_sessionid=self.sessionid)]
+            return [SimpleNamespace(upstream_sessionid=self.sessionid, priority=0)]
 
     class _Gate:
         def __init__(self, cooling: float, risk: set | None = None) -> None:
@@ -1618,8 +1618,8 @@ def test_dispatch_actually_uses_the_fair_order(settings):
 
     class _Store:
         def __init__(self) -> None:
-            self.rows = ([SimpleNamespace(upstream_sessionid="A")] * 50
-                         + [SimpleNamespace(upstream_sessionid="B")])
+            self.rows = ([SimpleNamespace(upstream_sessionid="A", priority=0)] * 50
+                         + [SimpleNamespace(upstream_sessionid="B", priority=0)])
 
         def count_by_status(self, _status: str) -> int:
             return 0                      # 并发位全空

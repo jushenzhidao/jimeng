@@ -270,7 +270,7 @@ class Coordinator:
         #: "谁不该派"，轮转负责"该派的怎么排序"）。
         cands: list[TaskRecord] = []
         for rec in store.list_by_status("queued", limit=_DISPATCH_SCAN,
-                                        order="oldest"):
+                                        order="priority"):
             if rec.upstream_sessionid in silent:
                 self.dispatch_quota_silent += 1
                 continue
@@ -279,9 +279,16 @@ class Coordinator:
                 continue
             cands.append(rec)
 
-        #: 按凭据轮转（**跨 tick 记忆游标** —— 否则 `budget=1` 时永远同一个凭据）。
-        picked, self._rr_cursor = _fair_batch(cands, budget, self._rr_cursor)
-        for rec in picked:
+        #: 🔴 2026-10-21（用户口径"同步任务不做 queued 免得积压"）：
+        #: **同步请求直接插到队首**，不参与按凭据轮转 —— 否则 800 条异步积压
+        #: 会让每个同步请求都白等满预算（线上实测 849 条、最老等 5 天）。
+        #: 并发预算不变（还是那几个槽），只是"谁先用"变了。
+        sync_first = [r for r in cands if r.priority > 0][:budget]
+        rest = [r for r in cands if r.priority <= 0]
+        #: 其余按凭据轮转（**跨 tick 记忆游标** —— 否则 `budget=1` 时永远同一个凭据）。
+        picked, self._rr_cursor = _fair_batch(
+            rest, max(0, budget - len(sync_first)), self._rr_cursor)
+        for rec in [*sync_first, *picked]:
             self.service.dispatch(rec)
             self.dispatched += 1
 

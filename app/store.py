@@ -129,6 +129,10 @@ class TaskRecord(SQLModel, table=True):
     cap_key: str                      # 内部能力 key（如 jimeng:t2i）
     upstream_model: Optional[str] = None
     status: str = Field(default="queued", index=True)
+    #: 🔴 2026-10-21（用户口径"同步任务不做 queued 免得积压"）：
+    #: **1 = 同步请求建的**，协调器永远先派它，不允许排在异步积压后面。
+    #: 0 = 普通（异步受理）。加列由 `_ensure_columns` 自动补（`DEFAULT 0`）。
+    priority: int = Field(default=0)
 
     # ---- 请求参数（原样留着：崩溃恢复与审计都要靠它）----
     prompt: str = ""
@@ -462,9 +466,15 @@ class TaskStore:
                        order: str = "oldest") -> list[TaskRecord]:
         """按状态取任务。`oldest` 让最早排队的最先被处理（避免饿死）。"""
         stmt = select(TaskRecord).where(TaskRecord.status == status)
-        stmt = stmt.order_by(
-            TaskRecord.created_at.asc() if order == "oldest"
-            else TaskRecord.created_at.desc())
+        if order == "priority":
+            #: 同步请求（priority=1）排最前，其余仍按 FIFO —— 只改**排序**，
+            #: 不改"谁能派"（静默/轮转逻辑照旧）。
+            stmt = stmt.order_by(TaskRecord.priority.desc(),
+                                 TaskRecord.created_at.asc())
+        else:
+            stmt = stmt.order_by(
+                TaskRecord.created_at.asc() if order == "oldest"
+                else TaskRecord.created_at.desc())
         with Session(self.engine) as s:
             rows = list(s.exec(stmt.limit(limit)).all())
             for r in rows:
@@ -559,7 +569,8 @@ class TaskStore:
                               for k, n in rows],
         }
 
-    def queue_oldest_wait_s(self, *, within_s: int | None = None) -> int:
+    def queue_oldest_wait_s(self, *, within_s: int | None = None,
+                            priority_only: bool = False) -> int:
         """排队任务里**最老的已等待秒数**（没有排队 = 0）。
 
         🔴 2026-10-21：同步链快速失败的判据 —— 最老那条已经等了 ≥ 同步预算，
@@ -575,6 +586,10 @@ class TaskStore:
         """
         stmt = select(func.min(TaskRecord.created_at)).where(
             TaskRecord.status == "queued")
+        if priority_only:
+            #: 只看**同步请求自己的**排队（priority=1）。异步灌到 1000 条
+            #: 也不该让同步被判"必然等不到" —— 它能插队。
+            stmt = stmt.where(TaskRecord.priority > 0)
         if within_s is not None:
             stmt = stmt.where(
                 TaskRecord.created_at >= int(time.time()) - int(within_s))

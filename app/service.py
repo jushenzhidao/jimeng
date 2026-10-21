@@ -870,7 +870,8 @@ class Service:
                sessionid: str | None = None,
                dry_run: bool = False, video: bool = False,
                preset_degradations: list[str] | None = None,
-               ark_model: str | None = None) -> TaskRecord:
+               ark_model: str | None = None,
+               priority: int = 0) -> TaskRecord:
         """校验 + 落库，返回任务记录。**请求内零上游往返。**
 
         ⚠️ **唯一例外**（2026-10-12）：请求落在 **4k 档**（或带 `-4k/-2k…`
@@ -1523,6 +1524,7 @@ class Service:
             cap_key=cap.key,
             upstream_model=upstream_model,
             status="queued",
+            priority=priority,
             prompt=prompt,
             image_refs=image,
             size=str(size),
@@ -1698,9 +1700,11 @@ class Service:
                 f"任务 {task_id} 不存在，或不属于当前 API Key。")
         return rec
 
-    def queue_oldest_wait_s(self, *, within_s: int | None = None) -> int:
+    def queue_oldest_wait_s(self, *, within_s: int | None = None,
+                            priority_only: bool = False) -> int:
         """队列最老等待秒数（同步链快速失败用，见 `main._sync_generate`）。"""
-        return self.store.queue_oldest_wait_s(within_s=within_s)
+        return self.store.queue_oldest_wait_s(within_s=within_s,
+                                              priority_only=priority_only)
 
     def delete_for_credential(self, task_id: str, credential: str) -> dict:
         """删除/取消任务。

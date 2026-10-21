@@ -1136,7 +1136,7 @@ def test_sync_fast_fails_when_backlog_exceeds_budget(sync_client, monkeypatch):
     而图多半已经生成好却没人来取（白花钱），队列还被排得更长。
     """
     monkeypatch.setattr("app.service.Service.queue_oldest_wait_s",
-                        lambda self, *, within_s=None: 999)
+                        lambda self, *, within_s=None, priority_only=False: 999)
     before = sync_client.get(BASE, headers=AUTH).json()["total"]
 
     r = sync_client.post(SYNC, json={"model": "jimeng-t2i", "prompt": "x"},
@@ -1162,7 +1162,7 @@ def test_sync_backlog_guard_does_not_block_audit(sync_client, monkeypatch):
     队列再堵它也能立刻出结果。
     """
     monkeypatch.setattr("app.service.Service.queue_oldest_wait_s",
-                        lambda self, *, within_s=None: 9999)
+                        lambda self, *, within_s=None, priority_only=False: 9999)
 
     r = sync_client.post(SYNC, json={"model": "jimeng-audit",
                                      "image": [PNG_DATA_URI]}, headers=AUTH)
@@ -1182,12 +1182,72 @@ def test_sync_backlog_guard_can_be_switched_off(client_factory, monkeypatch):
     st = c.app.state
     st.coordinator = _InlineCoordinator(st.coordinator, advances=0)
     monkeypatch.setattr("app.service.Service.queue_oldest_wait_s",
-                        lambda self, *, within_s=None: 9999)
+                        lambda self, *, within_s=None, priority_only=False: 9999)
 
     r = c.post(SYNC, json={"model": "jimeng-t2i", "prompt": "x"}, headers=AUTH)
 
     assert r.status_code == 504, r.text
     assert r.json()["error"]["code"] == "sync_timeout", r.text
+
+
+def test_priority_queue_puts_sync_tasks_first(store):
+    """🔴 同步请求（priority=1）必须排在异步积压**前面**。
+
+    2026-10-21 用户口径："同步任务不做 queued 免得积压"。
+    线上实测：849 条异步积压、最老等 5 天 —— 同步请求若跟它们一起 FIFO，
+    每个都必然等满预算。这里钉住派发顺序的唯一依据：
+    `list_by_status(order="priority")` 先按 priority 降序、再按 FIFO。
+    """
+    import time as _time
+
+    from sqlmodel import Session
+
+    from app.store import TaskRecord
+
+    now = int(_time.time())
+
+    def _mk(task_id: str, *, created_at: int, priority: int) -> TaskRecord:
+        return TaskRecord(task_id=task_id, credential_id="c1",
+                          model="jimeng-t2i", cap_key="jimeng:t2i",
+                          status="queued", priority=priority,
+                          created_at=created_at, updated_at=created_at)
+
+    with Session(store.engine) as s:
+        # 异步的那条**更老**（FIFO 本该它先），同步的刚进来 —— 同步仍要排第一。
+        s.add(_mk("async-old", created_at=now - 3600, priority=0))
+        s.add(_mk("sync-new", created_at=now, priority=1))
+        s.commit()
+
+    order = [r.task_id for r in store.list_by_status("queued",
+                                                     order="priority")]
+    assert order == ["sync-new", "async-old"], order
+
+
+def test_backlog_wait_ignores_async_backlog(store):
+    """🔴 积压判据只看**同步自己的**排队（`priority_only=True`）。
+
+    异步灌 800 条不等于同步会等 800 条 —— 它能插队。若判据看全局，
+    就会把"本来能立刻跑"的同步请求全部 429 掉（这是最坏的误伤：
+    越忙越拒，等于自断服务）。
+    """
+    import time as _time
+
+    from sqlmodel import Session
+
+    from app.store import TaskRecord
+
+    now = int(_time.time())
+    with Session(store.engine) as s:
+        s.add(TaskRecord(task_id="async-1", credential_id="c1",
+                         model="jimeng-t2i", cap_key="jimeng:t2i",
+                         status="queued", priority=0,
+                         created_at=now - 900, updated_at=now - 900))
+        s.commit()
+
+    # 全局：异步那条等了 15 分钟。
+    assert store.queue_oldest_wait_s(within_s=3600) >= 890
+    # 只看同步：没有同步在排队 ⇒ 0，闸不会误开。
+    assert store.queue_oldest_wait_s(within_s=3600, priority_only=True) == 0
 
 
 def test_queue_oldest_wait_window_excludes_zombies(store):
