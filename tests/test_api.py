@@ -950,7 +950,7 @@ def test_sync_failure_is_a_200_with_failure_status(sync_client, fake_jimeng):
     直接回 `failure` 体，调用方无需再轮询。
 
     🔴 边界（2026-10-10 用户口径）：**空图**与**内容审核**两种失败
-    不走这条路 —— 它们直接抛 500 / 451（见下面两个用例）。
+    不走这条路 —— 空图直接抛 **500**、审核抛 **451**（见下面几个用例）。
     """
     fake_jimeng.states = [failed_state("generate_failed")]
     r = sync_client.post(SYNC, json={"model": "jimeng-t2i", "prompt": "x"},
@@ -960,13 +960,14 @@ def test_sync_failure_is_a_200_with_failure_status(sync_client, fake_jimeng):
     assert r.json()["error"]
 
 
-def test_sync_empty_result_raises_451(sync_client, fake_jimeng):
-    """🔴 空图（终态成功却零产物）⇒ 同步接口**直接抛 451**。
+def test_sync_empty_result_raises_500(sync_client, fake_jimeng):
+    """🔴 空图（终态成功却零产物）⇒ 同步接口**直接抛 500**。
 
     用户口径 2026-10-10：调用方拿一个 200 + `data: []` 的"成功体"
     等于被骗 —— 同步是一锤子买卖，没有东西就说没有，用状态码说。
-    2026-10-12 口径：空图多由上游内容审核所致 ⇒ 归到"内容因合规原因
-    不可用"一侧，用 451 让调用方一眼分流成"别原样重试"。
+    🔴 2026-10-21 口径（**覆盖** 2026-10-12 的 451）：直接 **500** ——
+    451 会被一部分网关归到"内容合规"、甚至渲染成空响应 `{}`，
+    调用方照样读成"拿到了东西"。500 才是不会被误读的服务端失败。
     判据链：零产物落库为 `empty_result_error` ⇒ 同步端点按 type 转抛。
     """
     from app.upstream.jimeng.client import TaskState
@@ -979,7 +980,7 @@ def test_sync_empty_result_raises_451(sync_client, fake_jimeng):
 
     r = sync_client.post(SYNC, json={"model": "jimeng-t2i", "prompt": "x"},
                          headers=AUTH)
-    assert r.status_code == 451, r.text
+    assert r.status_code == 500, r.text
     err = r.json()["error"]
     assert err["type"] == "empty_result_error"
     assert err["code"] == "upstream_empty_result"
@@ -995,11 +996,12 @@ def test_sync_empty_result_raises_451(sync_client, fake_jimeng):
         assert leaked not in err["message"], f"message 不该出现 {leaked!r}"
 
 
-def test_sync_zero_product_success_raises_451(sync_client, fake_jimeng):
-    """🔴 终态 **success 却零产物** ⇒ 同步接口**直接抛 451**（2026-10-15 用户口径：
-    "同步接口返回空图请报错"）。
+def test_sync_zero_product_success_raises_500(sync_client, fake_jimeng):
+    """🔴 终态 **success 却零产物** ⇒ 同步接口**直接抛 500**（2026-10-15 口径：
+    "同步接口返回空图请报错"；2026-10-21 从 451 收紧为 500 ——
+    "不要返回空图或者 `{}`，这个直接报 500"）。
 
-    ⚠️ 与上面那条 `test_sync_empty_result_raises_451` 判据**不同**：那条是
+    ⚠️ 与上面那条 `test_sync_empty_result_raises_500` 判据**不同**：那条是
     `_advance` 把"零产物"判成了**失败**（落库 `error.type`），这条是任务**被判成功**、
     只是交付张数为 0 —— 所以闸口必须落在**交付张数**上。
 
@@ -1013,7 +1015,7 @@ def test_sync_zero_product_success_raises_451(sync_client, fake_jimeng):
     # 素材用 data URI（测试零网络纪律，见文件顶部）。
     r = sync_client.post(SYNC, json={"model": "jimeng-audit",
                                      "image": [PNG_DATA_URI]}, headers=AUTH)
-    assert r.status_code == 451, r.text
+    assert r.status_code == 500, r.text
     err = r.json()["error"]
     assert err["type"] == "empty_result_error", err
     assert err["code"] == "upstream_empty_result", err
@@ -1035,6 +1037,24 @@ def test_sync_zero_product_success_raises_451(sync_client, fake_jimeng):
     assert rec["status"] == "success", rec
     assert rec["data"] == [], rec          # 异步侧**仍是** data:[]（契约不变）
     assert any("素材预审" in d for d in rec.get("degradations", [])), rec
+
+
+def test_sync_empty_body_raises_500(sync_client, fake_jimeng, monkeypatch):
+    """🔴 200 体是空对象 `{}` ⇒ 同步接口**必须报 500**（2026-10-21 用户口径）。
+
+    这条刻意绕过语义层（产物是有的），只把 `view()` 的返回值换成一个空
+    dict —— 钉住 `_sync_view()` 的**形状守卫**：无论将来哪条路径写出
+    "200 什么都没带"的响应，同步调用方都不该把它读成成功。
+    """
+    fake_jimeng.states = [ok_state(["https://cdn/a.png"])]
+    monkeypatch.setattr("app.main.view", lambda rec, **kw: (200, {}))
+
+    r = sync_client.post(SYNC, json={"model": "jimeng-t2i", "prompt": "x"},
+                         headers=AUTH)
+    assert r.status_code == 500, r.text
+    err = r.json()["error"]
+    assert err["type"] == "empty_result_error", err
+    assert set(err) == {"message", "type", "code"}, err
 
 
 def test_sync_content_policy_raises_451(sync_client, fake_jimeng):

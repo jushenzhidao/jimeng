@@ -473,6 +473,21 @@ async def _wait_terminal_async(svc: Service, task_id: str, credential: str,
         await asyncio.sleep(min(SYNC_WAIT_POLL_INTERVAL, remaining))
 
 
+def _empty_success_error(rec: TaskRecord) -> EmptyResultError:
+    """同步链上"没有东西可交付"的统一错误（**500**，2026-10-21 用户口径）。
+
+    文案刻意带上 `task_id`：任务本身可能**真是成功的**（如 `jimeng-audit`
+    成功时本就没有产物，判定写在 `degradations` 里），调用方要完整记录
+    就得转异步查询那一条。对外仍只有 `message`/`type`/`code`
+    （最小暴露口径见 `errors.EmptyResultError`）。
+    """
+    return EmptyResultError(
+        "上游报成功但**零产物**：本服务不交付空成功（0 张）。"
+        f"如需该任务的完整记录（判定与降级说明都在里面），"
+        f"请用 GET /async/v1/images/generations/{rec.task_id} 查看。",
+        upstream="jimeng")
+
+
 async def _sync_generate(svc: Service, coordinator: Any, settings: Settings,
                          body: dict[str, Any], *, credential: str,
                          sessionid: str | None,
@@ -498,11 +513,12 @@ async def _sync_generate(svc: Service, coordinator: Any, settings: Settings,
     终态失败里两种直接转抛 HTTP 错误（2026-10-10 用户口径，判据是**落库的**
     `error.type`，不做 message 字符串匹配）：
       · **内容审核拒绝** → 451 `ContentPolicyError`；
-      · **空图**（上游报成功却零产物）→ 451 `EmptyResultError`。
+      · **空图**（上游报成功却零产物）→ **500** `EmptyResultError`
+        （2026-10-21 用户口径；451 作废）。
     其余失败保持"任务完成了、结果是失败"的语义，返回 rec 由调用方渲染。
 
     🔴 还有**第三种**转抛（2026-10-15 用户口径："同步接口返回空图请报错"）：
-    终态 **`success` 却零产物** ⇒ 同样 451（见下方那道闸）—— 它与上面那条
+    终态 **`success` 却零产物** ⇒ 同样 **500**（见下方那道闸）—— 它与上面那条
     **判据不同**：上面看的是落库的 `error.type`（任务已被判失败），这条看的是
     **交付张数**（任务被判成功，但一张图都没有）。
     """
@@ -570,12 +586,36 @@ async def _sync_generate(svc: Service, coordinator: Any, settings: Settings,
             continuations=rec.continuations,
             upstream_submit_id=rec.upstream_submit_id,
             upstream_history_id=rec.upstream_history_id)
-        raise EmptyResultError(
-            "上游报成功但**零产物**：本服务不交付空成功（0 张）。"
-            f"如需该任务的完整记录（判定与降级说明都在里面），"
-            f"请用 GET /async/v1/images/generations/{rec.task_id} 查看。",
-            upstream="jimeng")
+        raise _empty_success_error(rec)
     return rec
+
+
+def _sync_view(rec: TaskRecord, *,
+               show_degradations: bool) -> tuple[int, dict[str, Any]]:
+    """同步端点的**唯一**渲染出口：`view()` + "不许空"的形状守卫。
+
+    🔴 2026-10-21 用户口径："同步接口不要返回空图或者 `{}`，这个直接报 500。"
+    语义层已经在 `_sync_generate` 拦过"success 且零产物"；这里补**形状层**：
+    只要 200 体是空对象 `{}`，或 success 体里 `data` 是空的，一律转 500。
+    多这一道是因为**一锤子买卖的调用方只看 HTTP 与 `data`** ——
+    遇到 `{}` 它会当成成功（这正是这条口径的现场），而不是当成"没东西"。
+
+    ⚠️ 只管**同步语义**端点（`/v1/*`）。异步查询仍走 `view()` 原样返回
+    `data: []`：那是"任务记录"语义，`jimeng-audit` 的判定就在 `degradations` 里
+    （这条闸只加在同步链上，2026-10-15 口径不变）。
+    """
+    status_code, payload = view(rec, show_degradations=show_degradations)
+    if status_code != 200:
+        return status_code, payload
+    empty_body = not payload
+    empty_product = rec.status == "success" and not payload.get("data")
+    if empty_body or empty_product:
+        # 现场只进服务端日志（对外仍是最小错误体）。
+        OBS.warning("sync empty payload", task_id=rec.task_id,
+                    status=rec.status, capability=rec.cap_key, n=rec.n,
+                    empty_body=empty_body, empty_product=empty_product)
+        raise _empty_success_error(rec)
+    return status_code, payload
 
 
 def _install_routes(app: FastAPI) -> None:
@@ -631,12 +671,15 @@ def _install_routes(app: FastAPI) -> None:
 
         🔴 2026-10-10 用户口径 —— 终态失败里**两种直接抛 HTTP 错误**，
         不再回 200 + failure 体：
-          · **空图**（上游报成功却零产物）→ **451**（`EmptyResultError`；
-            2026-10-12 口径：空图多由上游内容审核所致，故与审核同类归 451）；
+          · **空图**（上游报成功却零产物）→ **500**（`EmptyResultError`）；
           · **内容审核拒绝** → **451**（`ContentPolicyError`，换 prompt/素材
             才有用，原样重试必再拒）。
+        🔴 2026-10-21 用户口径（本条为最新，覆盖旧口径）：
+        "同步接口**不要返回空图或者 `{}`**，这个直接报 500" ——
+        空产物从此一律 **500**（旧的 451 会被网关归到"内容合规"、
+        甚至被渲染成 `{}`，调用方仍读成成功）。形状层的守卫在 `_sync_view()`。
         🔴 2026-10-15 补第三种（用户口径："同步接口返回空图请报错"）：
-        **终态 `success` 却零产物** ⇒ 同样 **451**。它与上面第一条**判据不同** ——
+        **终态 `success` 却零产物** ⇒ **500**。它与上面第一条**判据不同** ——
         上面看落库的 `error.type`（任务已被判失败），这条看**交付张数**
         （任务被判成功、但一张图都没有；当前唯一已知来源是 `jimeng-audit`
         这类"成功时本就没有产物"的豁免能力）。**异步端点不受此闸影响**：
@@ -659,7 +702,7 @@ def _install_routes(app: FastAPI) -> None:
                                    body.model_dump(), credential=credential,
                                    sessionid=await _sessionid(request))
 
-        status_code, payload = view(
+        status_code, payload = _sync_view(
             rec, show_degradations=request.app.state.settings.show_degradations)
         headers: dict[str, str] = {}
         if status_code == 202:
@@ -746,7 +789,7 @@ def _install_routes(app: FastAPI) -> None:
                                    body, credential=credential,
                                    sessionid=await _sessionid(request),
                                    preset_degradations=degradations)
-        status_code, payload = view(
+        status_code, payload = _sync_view(
             rec, show_degradations=request.app.state.settings.show_degradations)
         headers2: dict[str, str] = {}
         if status_code == 202:
@@ -939,7 +982,7 @@ h2{{color:#7cb0ff}}a{{color:#7cb0ff}}td,th{{border-color:#1e2836}}}}</style></he
         `stream`：`true` ⇒ 回标准 SSE（**先发 role 帧占位**，生成完成再发 content
         帧，`data: [DONE]` 收尾）；否则回整包 `chat.completion`。
         ⚠️ 流式下响应头一旦发出就改不动状态码 ⇒ 生成失败只能把错误**当正文**
-        吐出去；非流式则照常抛 HTTP 错误（451/429/502…，与出图端点逐字一致）。
+        吐出去；非流式则照常抛 HTTP 错误（500/451/429/502…，与出图端点逐字一致）。
 
         ⚠️ 归属：它是**同步语义**端点（一问一答、返回前等到结果），与
         `/v1/models`、`POST /v1/images/generations` 同族 ⇒ 允许挂在 `/v1`；

@@ -145,12 +145,14 @@ class EmptyResultError(AdapterError):
     零产物不是"上游打不通"，是"上游说好了却没交货" —— 调用方要的
     不是"可重试"的分类学，是一个**没有东西**的明确宣告。
 
-    🔴 **HTTP 451**（2026-10-12 用户口径：空图多由上游内容审核所致）：
-    审核把产物整批掐掉、但上游状态机仍报成功 —— 这种"报成功却交不出
-    合规产物"归到"内容因合规原因不可用"一侧，用 451 让调用方一眼分流成
-    **别原样重试**。`retryable=False` 与 451 一致（同 `ContentPolicyError`）。
+    🔴 **HTTP 500**（2026-10-21 用户口径："同步接口不要返回空图或者 `{}`，
+    这个直接报 500"）。旧的 451（2026-10-12 口径：空图多由上游审核所致）
+    **作废** —— 451 会被一部分网关归到"内容合规"一侧：既不重试、也不报错，
+    甚至有客户端把它渲染成空响应 `{}`，调用方照样读成"拿到了东西"。
+    空产物是**服务端没交付**，就该按服务端错报：500 不会被误读。
+    `retryable=False` 保持不变（同样的 prompt 再打一次，多半还是空）。
 
-    ⚠️ **刻意不复用 `ContentPolicyError`**，尽管对外状态码相同：
+    ⚠️ **刻意不复用 `ContentPolicyError`**（两者现在都是失败，但码不同）：
       · `err_type` / `err_code` 保持独立（`empty_result_error` /
         `upstream_empty_result`）—— 服务端日志与 `/stats` 才能把
         "上游真审核拒"与"上游空产物"分开看；
@@ -160,7 +162,7 @@ class EmptyResultError(AdapterError):
     这个码（`view()` 的"失败也回 200"只服务异步查询族，见 `app/main.py`）。
     """
 
-    status_code = 451
+    status_code = 500
     err_type = "empty_result_error"
     err_code = "upstream_empty_result"
     retryable = False
