@@ -1669,3 +1669,30 @@ def test_dispatch_actually_uses_the_fair_order(settings):
 
     assert "B" in svc.sent, \
         f"队尾那条别的凭据必须被派出去（公平轮转没接线？），实得 {svc.sent}"
+
+
+def test_poll_tick_runs_independently_of_dispatch(coordinator, monkeypatch):
+    """🔴 轮询必须能**脱离派发**单独推进（2026-10-21 拆线程的门禁）。
+
+    线上现场：`dispatch` 是同步的，i2i 上传被限流一次就卡 60s；原先轮询和
+    派发挤在同一个 `tick()` 里 ⇒ 那 60s 内在途任务**一次都没被轮询**
+    （铁证 `idle_s == running_s == 364`），槽位不释放、吞吐掉一半。
+    现在派发与轮询是两个线程两个方法：这条钉住"轮询不依赖派发跑完"。
+    """
+    calls: list[str] = []
+    monkeypatch.setattr(coordinator, "_dispatch_queued",
+                        lambda: calls.append("dispatch"))
+    monkeypatch.setattr(coordinator, "_maintenance", lambda: None)
+    monkeypatch.setattr(coordinator, "_poll_running",
+                        lambda: calls.append("poll"))
+
+    coordinator.tick_dispatch()          # 派发线程的一轮
+    coordinator.tick_poll()              # 轮询线程的一轮（独立入口）
+
+    assert calls == ["dispatch", "poll"], calls
+
+    # 没拿到租约（别的实例在推进）时，轮询必须**停下** —— 否则两个进程
+    # 会同时 fetch 同一批任务（上游请求翻倍，风控最敏感的就是这个）。
+    coordinator._lease_ok = False
+    coordinator.tick_poll()
+    assert calls == ["dispatch", "poll"], calls

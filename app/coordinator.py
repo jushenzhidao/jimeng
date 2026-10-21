@@ -110,6 +110,12 @@ class Coordinator:
         #: DB 查询次数按倍增加（每轮都要 count + list）。
         self._wake = threading.Event()
         self._thread: threading.Thread | None = None
+        #: 🔴 2026-10-21：**轮询独立线程**（不与派发共用）。
+        #: 派发是同步的，一次慢上传会把整个 tick 卡住；拆开后慢派发只堵派发，
+        #: 在途任务的推进（槽位释放）照常。
+        self._poll_thread: threading.Thread | None = None
+        #: 本进程当前是否持有协调器租约（派发线程每轮更新，轮询线程只读）。
+        self._lease_ok = False
         self._last_maintenance = 0.0
         #: 累计统计（运维观测）
         self.ticks = 0
@@ -141,6 +147,9 @@ class Coordinator:
         self._thread = threading.Thread(
             target=self._loop, name="jimeng-coordinator", daemon=True)
         self._thread.start()
+        self._poll_thread = threading.Thread(
+            target=self._poll_loop, name="jimeng-poll", daemon=True)
+        self._poll_thread.start()
         OBS.info("coordinator started", owner=self.owner,
                  tick_s=self.settings.coordinator_tick,
                  concurrency=self.settings.jm_concurrency)
@@ -156,6 +165,9 @@ class Coordinator:
         if self._thread is not None:
             self._thread.join(timeout=timeout)
             self._thread = None
+        if self._poll_thread is not None:
+            self._poll_thread.join(timeout=timeout)
+            self._poll_thread = None
 
     @property
     def running(self) -> bool:
@@ -189,6 +201,22 @@ class Coordinator:
             # 超时仍然保留：它兜住"唤醒信号丢了"这类情况。
             self._wake.wait(self.settings.coordinator_tick)
             self._wake.clear()
+
+    def _poll_loop(self) -> None:
+        """**独立的轮询线程**（2026-10-21 从 `_loop` 里拆出来）。
+
+        🔴 为什么必须独立：`dispatch` 是同步调用，i2i 上传一次被限流就能把
+        派发线程卡 60s；原先轮询和派发在同一个 tick 里 ⇒ 那 60s 里
+        **在途任务也不推进**（线上铁证：`idle_s == running_s == 364`），
+        槽位不释放，吞吐直接掉一半。
+        `poll_many` 内部按 `JIMENG_POLL_INTERVAL` 节流，所以每秒调是安全的。
+        """
+        while not self._stop.is_set():
+            try:
+                self.tick_poll()
+            except Exception:
+                log.exception("coordinator 轮询轮异常（已吞掉，下一轮继续）")
+            self._stop.wait(1.0)
 
     def _prewarm(self) -> None:
         """启动预热：把**与具体任务无关**的只读往返提前做掉。
@@ -224,7 +252,16 @@ class Coordinator:
     # ------------------------------------------------------------------ 单轮
 
     def tick(self) -> None:
-        """一轮推进。租约抢不到就**直接返回**（别人在做，不是错误）。"""
+        """一轮**完整**推进（测试/运维入口：同步跑完派发 + 轮询 + 维护）。
+
+        生产上这两个阶段由**两个线程**分别驱动（`_loop` / `_poll_loop`），
+        见 `tick_dispatch()` / `tick_poll()` —— 拆开是为了"慢派发不堵轮询"。
+        """
+        self.tick_dispatch()
+        self.tick_poll()
+
+    def tick_dispatch(self) -> None:
+        """**派发线程**的一轮：抢租约 → 派发 → 维护。租约抢不到直接返回。"""
         self.ticks += 1
         if not self.settings.upstream_configured:
             return
@@ -232,13 +269,20 @@ class Coordinator:
         if not store.acquire_lease("coordinator", self.owner,
                                    self.settings.coordinator_lease):
             self.skipped_lease += 1
+            self._lease_ok = False
             return
+        self._lease_ok = True
         try:
             self._dispatch_queued()
-            self._poll_running()
             self._maintenance()
         finally:
             store.release_lease("coordinator", self.owner)
+
+    def tick_poll(self) -> None:
+        """**轮询线程**的一轮：推进所有在途任务（不抢租约，只看 `_lease_ok`）。"""
+        if not (self._lease_ok and self.settings.upstream_configured):
+            return
+        self._poll_running()
 
     # ------------------------------------------------------------------ 各段
 

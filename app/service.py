@@ -466,9 +466,15 @@ class Service:
         #: prompt 没有上游预审接口，违规只能提交后被拒且照样计费 ⇒
         #: 受理时就地判一次；结果缓存；**远端失败默认放行**（fail-open）。
         self.guard = PromptGuard.from_settings(settings)
-        self.client = client
-        self.uploader = uploader
-        self.cfg = cfg
+        #: 🔴 2026-10-21：凭据上下文改成 **per-thread**（`threading.local`）。
+        #: 原先 `client/uploader/vod/cfg` 是**实例级**属性、`_cred_stack` 是
+        #: 实例级 list —— 那套只在"单线程"下成立。派发一旦挪到工作线程
+        #: （见 `coordinator`），派发与轮询会**同时**跑，两个线程互相把对方的
+        #: client 换进来 ⇒ **拿错人的凭据打上游**（静默串号，最难查的一类）。
+        #: 现在每线程一个栈，四个属性都是读**本线程**栈顶的 property。
+        self._cred_tls = threading.local()
+        #: 构造时注入的默认那一套（测试的 Fake / 旧行为）；生产恒为 None。
+        self._default_cred: list[Any] = [client, uploader, None, cfg]
         #: 🔴 外部注入（测试）标记：注入的 client 对**所有** sessionid 生效，
         #: 见 `bundle_for`。生产为False（client 由本类按 sessionid 自建）。
         self._client_injected = client is not None
@@ -508,8 +514,8 @@ class Service:
         #: ⚠️ **单进程假设**：`WORKERS=1`（见 gunicorn_conf.py）。多 worker
         #: 时各进程一份池，互不影响正确性（凭据都在库里），只是命中率低些。
         self._cred_lock = threading.Lock()
-        #: 凭据上下文的**栈**（`_push_cred`/`_pop_cred` 必须配对）
-        self._cred_stack: list[tuple[Any, Any, Any, Any]] = []
+        #: 凭据上下文的**栈**（`_push_cred`/`_pop_cred` 必须配对）——
+        #: 每线程一份，见 `_cred_stack_now()`（2026-10-21 从实例级改过来）。
         self._cred_pool: "OrderedDict[str, tuple[Any, Any, Any, Any]]" = \
             OrderedDict()
         self._cred_pool_max = max(1, int(getattr(settings, "cred_pool_max", 32)))
@@ -704,6 +710,60 @@ class Service:
             log.warning("受理期取能力表失败（改道/档位校验退化为不校验）: %s", e)
             return None
 
+    # ------------------------------------------------------------ 凭据上下文
+    def _cred_stack_now(self) -> list[tuple[Any, Any, Any, Any]]:
+        """**本线程**的凭据栈。
+
+        为什么按线程（2026-10-21）：把 `dispatch` 挪到工作线程后，派发与
+        轮询是并发的；实例级共享 `self.client` 会被两边互相覆盖。
+        """
+        st = getattr(self._cred_tls, "stack", None)
+        if st is None:
+            st = []
+            self._cred_tls.stack = st
+        return st
+
+    def _cur_cred(self) -> tuple[Any, Any, Any, Any]:
+        """当前生效的一套：本线程栈顶；空栈 ⇒ 构造时注入的默认那套。"""
+        st = self._cred_stack_now()
+        if st:
+            return st[-1]
+        d = self._default_cred
+        return (d[0], d[1], d[2], d[3])          # type: ignore[return-value]
+
+    #: 四个属性都是**只读视图**（写走 setter ⇒ 改默认那套，兼容测试注入）。
+    @property
+    def client(self) -> Any:
+        return self._cur_cred()[0]
+
+    @client.setter
+    def client(self, v: Any) -> None:
+        self._default_cred[0] = v
+
+    @property
+    def uploader(self) -> Any:
+        return self._cur_cred()[1]
+
+    @uploader.setter
+    def uploader(self, v: Any) -> None:
+        self._default_cred[1] = v
+
+    @property
+    def vod(self) -> Any:
+        return self._cur_cred()[2]
+
+    @vod.setter
+    def vod(self, v: Any) -> None:
+        self._default_cred[2] = v
+
+    @property
+    def cfg(self) -> Any:
+        return self._cur_cred()[3]
+
+    @cfg.setter
+    def cfg(self, v: Any) -> None:
+        self._default_cred[3] = v
+
     def _push_cred(self, client: Any, uploader: Any, vod: Any, cfg: Any,
                    rec: TaskRecord) -> None:
         """把某任务的凭据组件**临时**换到 `self.*` 上，下游代码不用逐个改参数。
@@ -719,15 +779,13 @@ class Service:
         或按任务传参 —— 已用 `test_no_credential_context_leak` 盯住
         "必须配对"的性质。
         """
-        prev = (self.client, self.uploader, self.vod, self.cfg)
-        self.client, self.uploader, self.vod, self.cfg = (
-            client, uploader, vod, cfg)
-        self._cred_stack.append(prev)
+        self._cred_stack_now().append((client, uploader, vod, cfg))
 
     def _pop_cred(self) -> None:
-        if not self._cred_stack:            # pragma: no cover-防御
+        st = self._cred_stack_now()
+        if not st:                          # pragma: no cover-防御
             raise RuntimeError("_pop_cred 没有对应的 _push_cred（上下文错配）")
-        self.client, self.uploader, self.vod, self.cfg = self._cred_stack.pop()
+        st.pop()
 
     def sessionid_of(self, rec: TaskRecord) -> str | None:
         """从任务行取回**原始** sessionid（明文；空 ⇒ 走默认凭据）。"""
