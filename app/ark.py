@@ -242,14 +242,18 @@ def translate_ark_create(body: dict[str, Any]) -> tuple[dict[str, Any], list[str
     return our, degradations
 
 
-def ark_task_view(rec: TaskRecord) -> dict[str, Any]:
+def ark_task_view(rec: TaskRecord, *, show_degradations: bool = False) -> dict[str, Any]:
     """任务记录 → 方舟《查询视频生成任务》响应形状。
 
     · `id` 回本服务 task_id（不透明字符串，语义同方舟 `cgt-*`）；
     · `usage`（tokens）**不给** —— 即梦链路没有 token 口径，不伪造；
-      预估积分在扩展字段 `degradations` 与本服务原生接口里；
+      预估积分在扩展字段 `usage.forecast_credits` 里（**不是** `degradations`）；
     · `model` 回 Ark 门面收到的**原样**模型名（存于 `extra_json.ark_model`）；
       门面之前创建的任务回内部名。
+    · 🔴 `degradations` 与原生端点**同一个开关**（`Settings.show_degradations`，生产默认关）：
+      它曾经在这里**无条件**透出 —— 2026-10-21 线上实测，同一条 i2i 任务在
+      `/async/v1/...` 干净、在 `/api/v3/...` 却带着 `已归一化 614412B -> 274638B`。
+      默认值取 **False**（安全默认）：漏传开关只丢信息、不泄内部细节。
     """
     status = STATUS_TO_ARK.get(rec.status, "failed")
     content: dict[str, Any] | None = None
@@ -281,7 +285,7 @@ def ark_task_view(rec: TaskRecord) -> dict[str, Any]:
             usage["forecast_credits"] = rec.credits
         if usage:
             out["usage"] = usage
-    if rec.degradations:
+    if show_degradations and rec.degradations:
         out["degradations"] = list(rec.degradations)   # 加性扩展，形状超集
     out.update({
         "created_at": rec.created_at,

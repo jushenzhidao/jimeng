@@ -958,7 +958,8 @@ def _install_routes(app: FastAPI) -> None:
         `Authorization: Bearer <api_key>`，所以客户端无需改动）。"""
         svc: Service = request.app.state.service
         rec = svc.get_for_credential(task_id, credential)
-        return JSONResponse(status_code=200, content=ark_view(rec))
+        return JSONResponse(status_code=200, content=ark_view(
+            rec, show_degradations=request.app.state.settings.show_degradations))
 
     # ------------------------------------------------------- 发现面（给人/给 LLM）
     @app.get("/", include_in_schema=False)

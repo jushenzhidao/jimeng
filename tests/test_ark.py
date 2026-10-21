@@ -158,6 +158,23 @@ def test_ark_view_failure_shape():
     assert v["content"] is None
 
 
+def test_ark_view_hides_degradations_by_default():
+    """对方舟端点也受 `show_degradations` 管 —— 默认不吐内部细节。
+
+    2026-10-21 线上实测的漏点：同一条 i2i 任务在 `/async/v1/...` 干净，
+    在 `/api/v3/contents/generations/tasks/{id}` 却带着
+    `已归一化 614412B -> 274638B`。这里把"默认关"钉住。
+    """
+    v = ark_task_view(_rec(status="success",
+                           degradations=["已归一化 614412B -> 274638B"]))
+    assert "degradations" not in v
+
+
+def test_ark_view_shows_degradations_when_enabled():
+    v = ark_task_view(_rec(degradations=["d1"]), show_degradations=True)
+    assert v["degradations"] == ["d1"]
+
+
 def test_status_table_covers_all_states():
     assert set(STATUS_TO_ARK) == {"queued", "in_progress", "success",
                                   "failure", "canceled"}
