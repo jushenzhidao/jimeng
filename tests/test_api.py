@@ -1154,6 +1154,24 @@ def test_sync_fast_fails_when_backlog_exceeds_budget(sync_client, monkeypatch):
     assert after == before, "被拒的请求不该建任务（零计费、零排队）"
 
 
+def test_sync_backlog_guard_does_not_block_audit(sync_client, monkeypatch):
+    """🔴 积压闸**不拦"不排队"的能力** —— `jimeng-audit` 是受理即终态。
+
+    线上实测（2026-10-21 16:05）：队列积压 849 条、最老等了 5 天。这种时候
+    把预审请求也 429 掉就是**纯误伤** —— 它不建生成任务、不占并发槽，
+    队列再堵它也能立刻出结果。
+    """
+    monkeypatch.setattr("app.service.Service.queue_oldest_wait_s",
+                        lambda self, *, within_s=None: 9999)
+
+    r = sync_client.post(SYNC, json={"model": "jimeng-audit",
+                                     "image": [PNG_DATA_URI]}, headers=AUTH)
+
+    # 空产物照旧 500（不是 429）—— 说明它根本没走队列闸。
+    assert r.status_code == 500, r.text
+    assert r.json()["error"]["code"] == "upstream_empty_result", r.text
+
+
 def test_sync_backlog_guard_can_be_switched_off(client_factory, monkeypatch):
     """闸关掉之后必须回到"照常建任务、等满预算再 504"的老路径。
 

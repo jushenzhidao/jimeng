@@ -71,7 +71,9 @@ from .observability import (
     setup_logging,
     should_log_path,
 )
-from .service import SYNC_WAIT_POLL_INTERVAL, Service, view
+from .models import resolve
+from .service import (NON_SUBMIT_CAPABILITIES, SYNC_WAIT_POLL_INTERVAL,
+                      Service, view)
 from .sg_login import parse_account_token
 from .store import TaskRecord
 
@@ -493,6 +495,22 @@ def _empty_success_error(rec: TaskRecord) -> EmptyResultError:
         upstream="jimeng")
 
 
+def _needs_queue(body: dict[str, Any]) -> bool:
+    """这一单**会不会排队**？队列积压闸的豁免判定。
+
+    🔴 2026-10-21：`jimeng-audit`（素材预审）是"受理即终态"—— 不建生成任务、
+    不占并发槽 ⇒ 队列再堵它也能立刻出结果，拦它就是**误伤**。
+    解析失败也返回 False：让 `create` 去抛它该抛的 400/404，
+    别用一个 429 把真正的参数错误盖住。
+    """
+    try:
+        cap, _ = resolve(body.get("model") or "",
+                         has_image=bool(body.get("image")))
+    except Exception:  # noqa: BLE001 —— 解析不了就交给 create 报错
+        return False
+    return cap.name not in NON_SUBMIT_CAPABILITIES
+
+
 def _sync_timeout_error(rec: TaskRecord,
                         wait: float | None = None) -> SyncTimeoutError:
     """同步预算耗尽、任务仍在跑 ⇒ **504 `sync_timeout`**（2026-10-21 口径）。
@@ -559,7 +577,7 @@ async def _sync_generate(svc: Service, coordinator: Any, settings: Settings,
     #: 谁都是堵的。放在 `create` **之前** ⇒ 零建任务、零计费、零排队。
     #: ⚠️ 顺序：先判 `coordinator.running`（没有推进者时队列必然积压，
     #: 报 503 才指向真因），再判积压（429）。
-    if settings.sync_backlog_guard:
+    if settings.sync_backlog_guard and _needs_queue(body):
         #: 时间窗 = 4 倍预算（至少 1h）：**只看"近期"的排队**，把"从未提交、
         #: 永远派不出去"的孤儿 queued 排除在外 —— 那种任务等待时间会无限涨，
         #: 不设窗就等于让一条僵尸把整个同步面永久 429。宁可漏判（偶发 504）。
