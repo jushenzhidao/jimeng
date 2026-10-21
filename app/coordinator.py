@@ -35,6 +35,7 @@ import time
 import uuid
 
 from .config import Settings
+from .errors import quota_exhausted
 from .observability import OBS
 from .service import Service
 from .store import TaskRecord
@@ -317,6 +318,7 @@ class Coordinator:
                                         order="priority"):
             if rec.upstream_sessionid in silent:
                 self.dispatch_quota_silent += 1
+                self._fail_stale_quota_task(rec)
                 continue
             if rec.upstream_sessionid in risk_silent:
                 self.dispatch_risk_silent += 1
@@ -335,6 +337,24 @@ class Coordinator:
         for rec in [*sync_first, *picked]:
             self.service.dispatch(rec)
             self.dispatched += 1
+
+    def _fail_stale_quota_task(self, rec: TaskRecord) -> None:
+        """额度静默里的排队任务：等够一个同步预算就**判失败**，别让它变僵尸。
+
+        🔴 2026-10-21 线上实测：额度静默期间受理的同步请求不会被派发，
+        `_sync_generate` 等满 `SYNC_MAX_WAIT` 抛 504，但 504 **不取消任务**
+        （"任务照跑"的语义），可这一条**根本没在跑** ⇒ 任务永久 queued。
+        它的 `created_at` 又落在同步闸门的窗口内 ⇒ `oldest_wait_s` 一路涨 ⇒
+        **全站**同步请求 429（一个号没额度把所有调用方拖死）。
+
+        为什么用"等待 ≥ 同步预算"而不是"一进静默就判死"：静默本身**有界**
+        （`min(JM_COOLDOWN*2, 3600)`），窗口内到期的任务还该有机会真跑一次；
+        而等超过同步预算的，调用方那边**早就**拿到 504 了，留着它只有害。
+        """
+        grace = max(60.0, float(self.settings.sync_max_wait))
+        if time.time() - rec.created_at < grace:
+            return
+        self.service.fail_queued(rec, quota_exhausted(waited_s=grace))
 
     def _poll_running(self) -> None:
         """推进所有在途任务 —— **上游查询合并成一次**（见 `Service.poll_many`）。

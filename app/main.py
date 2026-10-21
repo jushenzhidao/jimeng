@@ -63,6 +63,7 @@ from .errors import (
     QueueOverloadedError,
     SyncTimeoutError,
     SyncUnavailableError,
+    quota_exhausted,
 )
 from .observability import (
     OBS,
@@ -577,6 +578,18 @@ async def _sync_generate(svc: Service, coordinator: Any, settings: Settings,
     #: 谁都是堵的。放在 `create` **之前** ⇒ 零建任务、零计费、零排队。
     #: ⚠️ 顺序：先判 `coordinator.running`（没有推进者时队列必然积压，
     #: 报 503 才指向真因），再判积压（429）。
+    #: 🔴 2026-10-21（用户口径「积分不足应该立刻报错返回」）：**额度静默优先于
+    #: 积压闸**。同一个号既没额度、队列又堵时，报"你这个号没额度（重试无效）"
+    #: 才有用；报 `queue_overloaded` 会让调用方以为"等一会儿再试就好" —— 而它
+    #: 永远好不了（`UpstreamQuotaError.retryable = False`）。
+    #: ⚠️ 与 `Service.create` 里那道是**同一判据的两道门**：这道保证同步面的
+    #: 错误码精确（早于积压闸），那道兜住异步面/方舟门面（它们不经过本函数）。
+    #: 查的是进程内内存态（带锁、微秒级）⇒ 不必进线程池。
+    if _needs_queue(body):
+        quiet = svc.quota_cooling_for(sessionid)
+        if quiet > 0:
+            raise quota_exhausted(quiet)
+
     if settings.sync_backlog_guard and _needs_queue(body):
         #: 时间窗 = 4 倍预算（至少 1h）：**只看"近期"的排队**，把"从未提交、
         #: 永远派不出去"的孤儿 queued 排除在外 —— 那种任务等待时间会无限涨，

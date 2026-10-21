@@ -545,11 +545,15 @@ def test_quota_exhaustion_silences_only_that_credential(
     assert st["quota_silent"] == 1, "该凭据要进静默"
     assert st["quota_cooling_max"] > 0
 
-    # 凭据 A 的下一个新任务：**不派发**（不烧钱、不刷上游）
+    # 凭据 A 的下一个新任务：**受理口直接拒**（2026-10-21 用户口径「积分不足
+    # 应该立刻报错返回」）—— 不建任务、不排队、不烧钱。
+    # 此前是"照收、只是不派发"：任务白等满 `SYNC_MAX_WAIT` 变僵尸，
+    # 还把全局同步闸门顶到 429（现场见 `tests/test_quota_fastfail.py` 文件头）。
     before = len(fake_jimeng.of("submit"))
-    tid_a2 = _create(client)
-    client_state.coordinator.tick()
-    assert service.store.get(tid_a2).status == "queued"
+    r = client.post(BASE, json={"model": "jimeng-t2i", "prompt": "再来一条"},
+                    headers=AUTH)
+    assert r.status_code == 429, r.text
+    assert r.json()["error"]["code"] == "upstream_quota_exhausted", r.text
     assert len(fake_jimeng.of("submit")) == before, "静默凭据不该再打上游"
 
     # 🔴 换一个凭据（B）：**照常派发** —— 这条就是"不再连坐"的判据

@@ -131,6 +131,47 @@ class UpstreamQuotaError(AdapterError):
     retryable = False
 
 
+def quota_exhausted(quiet_s: float = 0.0, *,
+                    waited_s: float | None = None,
+                    upstream: str = "jimeng") -> UpstreamQuotaError:
+    """「这个号没额度」的**统一**错误对象（三个出口共用，文案不许漂移）。
+
+    🔴 2026-10-21（用户口径「积分不足应该立刻报错返回」）三处调用：
+      · `Service.create` —— 受理口直接拒（不建任务、不排队、零计费）；
+      · `main._sync_generate` —— 同步面**早于**积压闸，保证错误码精确；
+      · `Coordinator._fail_stale_quota_task` —— 把静默期里遗留的僵尸 queued
+        判失败（否则它会顶高 `oldest_wait_s`，让全站同步请求 429）。
+
+    `waited_s` 给了 = 僵尸清账口径（任务已被判失败）；不给 = 受理拒绝口径。
+    两种口径都刻意**不带 `retry_after`**：额度是按上游重置的，编一个"等 N 秒
+    再来"就是伪造事实（且会诱导调用方做无效重试 —— `retryable=False`）。
+
+    🔴 **文案末尾那句英文是给 new-api 的自动禁用钩子，别删**（2026-10-21）：
+    new-api 的 `AutomaticDisableStatusCodeRanges` 默认**只有 401**
+    （429 不在内），所以"额度耗尽 ⇒ 网关自动禁用该渠道"只能靠
+    `AutomaticDisableKeywords` 兜 —— 默认列表里正是 OpenAI 那句
+    `You exceeded your current quota`（匹配是 **message 子串 + 不区分大小写**，
+    见 `service.ShouldDisableChannel`）。没有这句的症状：号已经没额度，
+    网关却还继续把请求派进来，每条都白跑一趟（静默失效，最难查）。
+    ⚠️ 前提：new-api 侧 `AutomaticDisableChannelEnabled`（运营设置→监控）
+    与渠道 `auto_ban` 都开着。
+    """
+    if waited_s is not None:
+        return UpstreamQuotaError(
+            f"该账号的即梦积分/日额度已耗尽（上游 ret=1006：积分不足或没有"
+            f"相关权益）：排队已等满 {waited_s:.0f}s 仍无法提交 ⇒ 判失败。"
+            f"**重试不会变好**，需充值或等额度重置。"
+            f"（You exceeded your current quota）",
+            upstream=upstream)
+    return UpstreamQuotaError(
+        f"该账号的即梦积分/日额度已耗尽（上游 ret=1006：积分不足或没有"
+        f"相关权益），**重试不会变好** —— 本服务已对该凭据静默 "
+        f"{quiet_s:.0f}s，期间不再向它提交任何生成。"
+        f"请充值，或等额度重置后再试。"
+        f"（You exceeded your current quota）",
+        upstream=upstream)
+
+
 class UpstreamUnavailableError(AdapterError):
     status_code = 502
     err_type = "upstream_error"

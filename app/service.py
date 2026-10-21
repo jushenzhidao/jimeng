@@ -50,6 +50,7 @@ from .errors import (
     UpstreamRateLimitError,
     UpstreamTimeoutError,
     UpstreamUnavailableError,
+    quota_exhausted,
 )
 from .gate import UpstreamGate, build_gate
 from .media import Blob, load_images, load_one, normalize, reuse_image_uri
@@ -1070,18 +1071,39 @@ class Service:
         #: 也更诚实（调用方立刻知道该等，而不是以为服务坏了）。
         #: `MAX_QUEUED_PER_CREDENTIAL=0` = 关闭（默认，既有行为不变）。
         cap_q = self.settings.max_queued_per_credential
-        #: 🔴 2026-10-21（线上实测）：`jimeng-audit` 被这个闸误伤 —— 它**不排队**
+        #: 这一单**会不会排队**？两道闸共用：① 额度静默闸（下面立刻 429）；
+        #: ② 入队背压（按凭据封顶）。
+        #: 🔴 2026-10-21（线上实测）：`jimeng-audit` 被入队闸误伤 —— 它**不排队**
         #: （受理即终态、不占并发槽），队列再堵也能立刻出结果，拦它纯属连坐。
-        #: 这里单独解析一次能力（`cap` 在下面 1021 行才解析，纯字典查找、很轻）。
-        _needs_queue = True
-        if cap_q > 0:
-            try:
-                _cap_now, _ = models.resolve(str(body.get("model") or ""),
-                                             has_image=bool(body.get("image")),
-                                             video=video)
-                _needs_queue = _cap_now.name not in NON_SUBMIT_CAPABILITIES
-            except Exception:      # noqa: BLE001 —— 解析失败交给下面报它该报的错
-                _needs_queue = True
+        #: ⚠️ 解析**无条件**做（`models.resolve` 是纯字典查找、很轻）：额度闸
+        #: 与 `cap_q` 开不开无关，不能再挂在 `if cap_q > 0` 里面。
+        _needs_queue = False
+        try:
+            _cap_now, _ = models.resolve(str(body.get("model") or ""),
+                                         has_image=bool(body.get("image")),
+                                         video=video)
+            _needs_queue = _cap_now.name not in NON_SUBMIT_CAPABILITIES
+        except Exception:      # noqa: BLE001 —— 解析失败交给下面报它该报的错
+            _needs_queue = False
+
+        #: 🔴 2026-10-21（用户口径「积分不足应该立刻报错返回」）：
+        #: 该凭据处于**额度静默**（上游 `ret=1006` 积分不足/无权益，
+        #: `UpstreamQuotaError.retryable = False`）⇒ 在受理口**直接 429**，
+        #: 不建任务、不排队、不占并发槽。
+        #:
+        #: 此前的行为是"受理照收、派发时 `continue` 跳过" ⇒ `_sync_generate`
+        #: 白等满 `SYNC_MAX_WAIT` 再 504，而 504 **不取消任务**（"任务照跑"的
+        #: 语义），可这一条**根本没在跑** ⇒ 永久 queued 僵尸。线上实测
+        #: （20:34:02 / 20:35:58 两条）：僵尸把 `oldest_wait_s` 顶到 600s+，
+        #: 触发 `sync_backlog_guard` ⇒ **全站**同步请求一律 429（别人陪葬）。
+        #:
+        #: ⚠️ 豁免 `NON_SUBMIT_CAPABILITIES`（素材预审不提交生成、不花额度，
+        #: 拦它就是误伤）；⚠️ 模型名解析失败时 `_needs_queue=False` ⇒ 不拦，
+        #: 让下面的精确 400 报出来（别用 429 盖住参数错误）。
+        if _needs_queue:
+            quiet = self.gate.quota_cooling_for(sessionid)
+            if quiet > 0:
+                raise quota_exhausted(quiet)
         if cap_q > 0 and _needs_queue:
             waiting = self.store.count_queued_by_session(sessionid)
             if waiting >= cap_q:
@@ -1886,6 +1908,14 @@ class Service:
         return self.store.queue_oldest_wait_s(within_s=within_s,
                                               priority_only=priority_only)
 
+    def quota_cooling_for(self, sessionid: str | None) -> float:
+        """该凭据的**额度静默**剩余秒数（0 = 不在静默期）。
+
+        薄封装（`gate.quota_cooling_for`）：让 HTTP 层不必直接摸 `gate` 的细节，
+        也保证"这个号还能不能提交"只有**一个**判据来源（`gate._quota_until`）。
+        """
+        return self.gate.quota_cooling_for(sessionid)
+
     def delete_for_credential(self, task_id: str, credential: str) -> dict:
         """删除/取消任务。
 
@@ -1951,6 +1981,17 @@ class Service:
             time.sleep(min(SYNC_WAIT_POLL_INTERVAL, remaining))
 
     # ------------------------------------------------------------------ 推进
+
+    def fail_queued(self, rec: TaskRecord, err: AdapterError) -> None:
+        """把一条**已受理、从未提交**的 queued 判失败（派发层用）。
+
+        🔴 2026-10-21：`Coordinator._fail_stale_quota_task` 清僵尸时要复用
+        派发失败的分类逻辑（额度错误要续静默、`retryable=False` 才判死），而那套
+        逻辑在 `_on_dispatch_error` 里。直接调私有方法会被 ruff 的 **SLF001
+        （跨层私有访问）**拦下 —— 那条规则正是防"协调器偷偷摸 Service 内部"的，
+        **别用 `# noqa` 绕过去**：给它一个语义明确的公开入口，调用方就只能做这一件事。
+        """
+        self._on_dispatch_error(rec, err)
 
     def dispatch(self, rec: TaskRecord) -> None:
         """把queued 任务推到上游（**计费动作**）。协调器线程调用。"""
