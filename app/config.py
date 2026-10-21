@@ -206,6 +206,11 @@ class Settings:
     #: 🔴 2026-10-21（用户口径）：同步链**快速失败** —— 队列最老等待已达同步预算时，
     #: 这单必然等不到结果，直接在受理口 429，别让它白等 300s。
     sync_backlog_guard: bool = True
+    #: 🔴 2026-10-21（线上实测）：图片上传（ImageX 三段式）单段超时。
+    #: 原先是**写死 60s** ⇒ 一次限流可以把协调器线程卡住 60s（`dispatch` 是
+    #: 串行的），期间所有任务既不派发也不轮询。收紧到 20s：正常 10MB 图
+    #: 1~3s 就传完，20s 已经宽松；超时快速失败比占着线程划算。
+    upload_timeout: float = 20.0
 
     # -------------------------------------------------- 内容审核负缓存
     #: 🔴 2026-10-02：被上游审核拒绝过的 (能力, 模型, prompt, 输入图, 档位)
@@ -378,6 +383,7 @@ class Settings:
             coordinator_lease=_f("COORDINATOR_LEASE", 30.0),
             sync_max_wait=_f("SYNC_MAX_WAIT", 300.0),
             sync_backlog_guard=_b("SYNC_BACKLOG_GUARD", True),
+            upload_timeout=_f("UPLOAD_TIMEOUT", 20.0),
             neg_cache_ttl=_f("NEG_CACHE_TTL", 86400.0),
             neg_cache_max=int(_f("NEG_CACHE_MAX", 2048)),
             neg_cache_action=_s("NEG_CACHE_ACTION", "fail").strip().lower(),

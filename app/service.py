@@ -565,7 +565,9 @@ class Service:
         # cn 站不挂（国内没有 shark，直连更快也不引入桥的可用性依赖）。
         if profile.name == "sg" and st.sg_bridge_url:
             c.bridge_url = st.sg_bridge_url
-        up = ImageXUploader(c)
+        #: 🔴 单段上传超时由配置决定（默认 20s，原先写死 60s）——
+        #: 协调器**串行** dispatch，一次上传卡 60s 就等于全站停 60s。
+        up = ImageXUploader(c, timeout=self.settings.upload_timeout)
         cfg2 = ModelConfigCache(c)
         return (c, up, VodUploader(c, imagex=up), cfg2)
 
