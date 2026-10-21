@@ -1215,6 +1215,56 @@ def test_audit_is_not_blocked_by_the_queue_cap(client_factory):
     assert r3.status_code == 202, r3.text
 
 
+def test_content_dedupe_reuses_when_image_bytes_match(client_factory, monkeypatch):
+    """🔴 同一张图**换了 URL** 也必须认出是同一个请求（2026-10-21 线上）。
+
+    现场：调用方每次重试都把图**重新上传**到 S3（`tmpXXXX.jpg?AWSAccessKey…`
+    每次都变）⇒ 指纹含 URL 原文 ⇒ 去重永不命中 ⇒ 同一个「2k 生成 + 超清」
+    被受理 N 次，页面上出现多条相同的 4K 结果，而且每次都计费。
+
+    修法：指纹不命中时，用**不含图**的弱指纹找近邻，再比对图片**内容**。
+    """
+    c = client_factory()
+    st = c.app.state
+    st.coordinator = _InlineCoordinator(st.coordinator, advances=0)
+
+    body = {"model": "jimeng-i2i", "prompt": "同一张脸",
+            "size": "2048x2048"}
+    r1 = c.post(BASE, json={**body, "image": ["https://s3/x/a.jpg?sig=1"]},
+                headers=AUTH)
+    assert r1.status_code == 202, r1.text
+    tid = r1.json()["task_id"]
+
+    # 内容摘要相同（模拟"同一张图重新上传、URL 变了"）
+    monkeypatch.setattr("app.service.Service._image_digest",
+                        lambda self, ref: "same-bytes")
+    r2 = c.post(BASE, json={**body, "image": ["https://s3/x/b.jpg?sig=2"]},
+                headers=AUTH)
+    assert r2.status_code == 202, r2.text
+    assert r2.json()["task_id"] == tid, "同一内容换了 URL ⇒ 应复用，不该新建"
+
+
+def test_content_dedupe_keeps_different_images_apart(client_factory, monkeypatch):
+    """换了一张**不同**的图 ⇒ 必须新建（不能因为 prompt 一样就复用）。"""
+    c = client_factory()
+    st = c.app.state
+    st.coordinator = _InlineCoordinator(st.coordinator, advances=0)
+
+    body = {"model": "jimeng-i2i", "prompt": "同一张脸", "size": "2048x2048"}
+    r1 = c.post(BASE, json={**body, "image": ["https://s3/x/a.jpg"]},
+                headers=AUTH)
+    assert r1.status_code == 202, r1.text
+    tid = r1.json()["task_id"]
+
+    # 摘要不同（内容真的换了）⇒ 必须新建
+    monkeypatch.setattr("app.service.Service._image_digest",
+                        lambda self, ref: ref)
+    r2 = c.post(BASE, json={**body, "image": ["https://s3/x/other.jpg"]},
+                headers=AUTH)
+    assert r2.status_code == 202, r2.text
+    assert r2.json()["task_id"] != tid, "图换了就不该复用"
+
+
 def test_priority_queue_puts_sync_tasks_first(store):
     """🔴 同步请求（priority=1）必须排在异步积压**前面**。
 

@@ -163,6 +163,15 @@ class Settings:
     #: 默认 600 = 与 `TASK_TIMEOUT` 同量级（在途任务的自然寿命），
     #: 免得一条卡死的僵尸任务在它整个寿命里吞掉所有重复提交。**0 = 只看非终态**。
     accept_dedupe_window_s: int = 600
+    #: 🔴 2026-10-21（线上实测）：**内容级去重**。
+    #: 现场：调用方每次重试都把同一张图**重新上传**到 S3，拿到新的预签名 URL
+    #: ⇒ 指纹（含 URL 原文）每次都不同 ⇒ 去重永不命中 ⇒ 同一个「2k 生成 +
+    #: 超清」被受理 N 次、各跑一遍（页面上出现多条一样的 4K 结果）。
+    #: 现在：指纹不命中时，用**不含图**的弱指纹找近邻，再比对**图片内容**。
+    accept_dedupe_by_content: bool = True
+    #: 内容级去重的回看窗口（秒）。比"在途"宽 —— 线上重试时前一条往往已经
+    #: 成功（4K 只要 60~70s，调用方 60s 超时后重试）。默认 90s。
+    content_dedupe_window_s: int = 90
 
     # ------------------------------------------------------------ 协调器
     coordinator_enabled: bool = True
@@ -374,6 +383,8 @@ class Settings:
             task_timeout=_f("TASK_TIMEOUT", 1800.0),
             max_queued_per_credential=_i("MAX_QUEUED_PER_CREDENTIAL", 0),
             accept_dedupe_enabled=_b("ACCEPT_DEDUPE_ENABLED", True),
+            accept_dedupe_by_content=_b("ACCEPT_DEDUPE_BY_CONTENT", True),
+            content_dedupe_window_s=_i("CONTENT_DEDUPE_WINDOW_S", 90),
             accept_dedupe_window_s=_i("ACCEPT_DEDUPE_WINDOW_S", 600),
             coordinator_enabled=_b("COORDINATOR_ENABLED", True),
             continue_enabled=_b("CONTINUE_ENABLED", False),

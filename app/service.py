@@ -368,11 +368,17 @@ def _fingerprint(*, model: Any, cap_key: Any, upstream_model: Any, prompt: Any,
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
-def _fingerprint_of_record(rec: TaskRecord) -> str:
-    """库里那条记录 → 指纹（字段与受理侧逐一同名，见 `_fingerprint`）。"""
+def _fingerprint_of_record(rec: TaskRecord, *,
+                           with_images: bool = True) -> str:
+    """库里那条记录 → 指纹（字段与受理侧逐一同名，见 `_fingerprint`）。
+
+    `with_images=False` ⇒ **弱指纹**：不含垫图（供"内容级去重"预筛用，
+    见 `Service._same_inputs`）。
+    """
     return _fingerprint(
         model=rec.model, cap_key=rec.cap_key, upstream_model=rec.upstream_model,
-        prompt=rec.prompt, images=rec.image_refs, size=rec.size,
+        prompt=rec.prompt, images=rec.image_refs if with_images else [],
+        size=rec.size,
         tier=rec.resolution_tier, n=rec.n, seed=rec.seed,
         negative_prompt=rec.negative_prompt, duration_ms=rec.duration_ms,
         aspect_ratio=rec.aspect_ratio,
@@ -487,6 +493,10 @@ class Service:
         #: —— 那就等于去重白做（该花的钱一分没省）。进程内锁足够：`WORKERS=1`
         #: 是架构约束（见 README），不存在跨进程并发受理。
         self._dedupe_lock = threading.Lock()
+        #: 🔴 2026-10-21：**图片内容摘要**的 LRU（URL → sha256）。
+        #: 只有"疑似重复"（弱指纹命中）才会用到，见 `_image_digest`。
+        self._digest_cache: "OrderedDict[str, str]" = OrderedDict()
+        self._digest_lock = threading.Lock()
         # 🔴 2026-10-08（用户口径"不从环境变量取 sessionid，是用 bearer 鉴权"）：
         # **不再**用 `JIMENG_SESSIONID` 建默认客户端 —— 凭据一律由**每个请求的
         # Bearer** 带来（`bundle_for()`按 sessionid 现建/取缓存）。
@@ -709,6 +719,93 @@ class Service:
         except Exception as e:            # noqa: BLE001 —— 读不到就退化，别挡住受理
             log.warning("受理期取能力表失败（改道/档位校验退化为不校验）: %s", e)
             return None
+
+    # -------------------------------------------------------- 内容级去重（2026-10-21）
+    def _image_digest(self, ref: str) -> str | None:
+        """输入图 → **内容摘要**（sha256）—— 认图，不认 URL。
+
+        🔴 线上实测（2026-10-21）：调用方每次重试都把同一张图**重新上传**到 S3，
+        拿到新的预签名 URL（`tmpXXXX.jpg?AWSAccessKey…` 每次都变）。而受理指纹
+        含 URL 原文 ⇒ 同一个请求被受理 N 次，每次都各跑一遍「2k 生成 + 超清」，
+        页面上就是多条一模一样的 4K 结果，而且每次都计费。
+
+        取不到内容 ⇒ 返回 None（调用方视为"不同"）：**宁可多跑一次，
+        也不误把"换图重生成"挡掉**。
+        """
+        key = (ref or "").strip()
+        if not key:
+            return None
+        with self._digest_lock:
+            hit = self._digest_cache.get(key)
+            if hit is not None:
+                self._digest_cache.move_to_end(key)
+                return hit
+        try:
+            blob = load_one(key, self.settings)
+            digest = hashlib.sha256(blob.data).hexdigest()
+        except Exception as e:      # noqa: BLE001 —— 取不到就不复用
+            log.info("内容去重：输入图取不到（%s）⇒ 不复用: %s",
+                     type(e).__name__, str(e)[:80])
+            return None
+        with self._digest_lock:
+            self._digest_cache[key] = digest
+            while len(self._digest_cache) > 256:
+                self._digest_cache.popitem(last=False)
+        return digest
+
+    def _same_inputs(self, new: list[Any], old: list[Any]) -> bool:
+        """两组垫图**内容**是否一致（顺序敏感，与生成语义一致）。"""
+        if len(new) != len(old):
+            return False
+        for a, b in zip(new, old):
+            sa, sb = str(a or "").strip(), str(b or "").strip()
+            if sa == sb:            # 同一个 URL：零成本直接等
+                continue
+            da, db = self._image_digest(sa), self._image_digest(sb)
+            if da is None or db is None or da != db:
+                return False
+        return True
+
+    def _dedupe_by_content(self, credential: str, *, capability: Any,
+                           upstream_model: Any, prompt: Any, images: list[Any],
+                           size: Any, tier: Any, n: Any, seed: Any,
+                           negative_prompt: Any, duration_ms: Any,
+                           aspect_ratio: Any, now: int) -> TaskRecord | None:
+        """弱指纹（不含图）+ **图片内容**比对 —— 救"同一张图换了 URL"的重试。
+
+        ⚠️ 只有弱指纹命中才会下载图片 ⇒ **正常请求零成本**。
+        ⚠️ 回看窗口（`CONTENT_DEDUPE_WINDOW_S`，默认 90s）比"在途"宽：
+        线上重试时前一条往往**已经成功**（4K 只要 60~70s，而调用方 60s 超时）。
+        """
+        lookback = max(0, int(self.settings.content_dedupe_window_s))
+        if lookback <= 0 or not images:
+            return None
+        weak = _fingerprint(
+            model=capability.api_id, cap_key=capability.key,
+            upstream_model=upstream_model, prompt=prompt, images=[],
+            size=size, tier=tier, n=n, seed=seed,
+            negative_prompt=negative_prompt, duration_ms=duration_ms,
+            aspect_ratio=aspect_ratio)
+        try:
+            recent = self.store.list_recent(credential_id=credential, limit=20)
+        except Exception:           # noqa: BLE001 —— 去重是优化，读不到就跳过
+            return None
+        checked = 0
+        for r in recent:
+            if (now - int(r.created_at or 0)) > lookback:
+                continue
+            if _fingerprint_of_record(r, with_images=False) != weak:
+                continue
+            checked += 1
+            if checked > 3:         # 比对要下载图，最多看 3 条候选
+                break
+            if self._same_inputs(images, list(r.image_refs or [])):
+                OBS.info("accept deduped by content", task_id=r.task_id,
+                         model=r.model, capability=r.cap_key, status=r.status,
+                         age_s=now - int(r.created_at or now),
+                         n=r.n, digest_hits=self._dedupe_hits)
+                return r
+        return None
 
     # ------------------------------------------------------------ 凭据上下文
     def _cred_stack_now(self) -> list[tuple[Any, Any, Any, Any]]:
@@ -1627,10 +1724,21 @@ class Service:
                     size=size, tier=tier, n=n, seed=seed,
                     negative_prompt=body.get("negative_prompt"),
                     duration_ms=duration_ms, aspect_ratio=aspect_ratio)
+                actives = self.store.active_for_credential(
+                    credential, since=(now - window) if window > 0 else None)
                 prev = next(
-                    (r for r in self.store.active_for_credential(
-                        credential, since=(now - window) if window > 0 else None)
-                     if _fingerprint_of_record(r) == fp), None)
+                    (r for r in actives if _fingerprint_of_record(r) == fp), None)
+                if prev is None and self.settings.accept_dedupe_by_content:
+                    # 🔴 指纹没命中不代表不是同一个请求：调用方重试时会把同一张图
+                    # **重新上传**到 S3（URL 每次都变）。这里只对"弱指纹命中"的
+                    # 近邻做**内容比对**（要下载图，所以放在最后一道）。
+                    prev = self._dedupe_by_content(
+                        credential, capability=cap,
+                        upstream_model=upstream_model, prompt=prompt,
+                        images=image, size=size, tier=tier, n=n, seed=seed,
+                        negative_prompt=body.get("negative_prompt"),
+                        duration_ms=duration_ms, aspect_ratio=aspect_ratio,
+                        now=now)
                 if prev is not None:
                     self._dedupe_hits += 1
                     OBS.info("accept deduped", task_id=prev.task_id,
