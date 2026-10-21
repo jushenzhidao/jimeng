@@ -1392,9 +1392,12 @@ def test_partial_45_triggers_continue_instead_of_waiting(client, client_state,
 def test_partial_45_without_material_still_waits(client, client_state,
                                                  fake_jimeng, fake_uploader,
                                                  service, monkeypatch):
-    """⚠️ 没有续生成原料（缺草稿）时**不许硬造请求** —— 保持原行为继续等。
+    """⚠️ 续生成**开着**但没有原料（缺草稿）时**不许硬造请求** —— 保持等。
 
     （否则就是拿一个必然失败的请求去刷上游。）
+    ⚠️ 2026-10-21 起这条只在 `CONTINUE_ENABLED=1` 下成立：开关**关**（线上默认）
+    时 45 已改为"已出图即交付"（见 `test_partial_45_delivers_...`）。
+    所以这里必须显式把开关打开，才测得到"没原料"这一支。
     """
     from app.upstream.jimeng.client import GeneratedImage, TaskState
 
@@ -1402,6 +1405,7 @@ def test_partial_45_without_material_still_waits(client, client_state,
     monkeypatch.setattr(
         fake_jimeng, "continue_task",
         lambda *a, **k: (calls.append(a), "cont-sid")[1], raising=False)
+    object.__setattr__(service.settings, "continue_enabled", True)
     partial = TaskState(submit_id="upstream-submit-id", status=45,
                         status_name="partial_success", finished=False, failed=False,
                         history_record_id="44853559987980")
@@ -1414,16 +1418,23 @@ def test_partial_45_without_material_still_waits(client, client_state,
     assert not calls, f"没原料还硬发续生成请求：{calls}"
     rec = service.store.get(tid)
     assert rec.status in ("in_progress", "queued"), rec.status
+    assert [im["url"] for im in rec.images] == ["https://cdn/a.png"], \
+        "半成品要留档（续生成回来要合并）"
 
 
-def test_partial_45_does_nothing_when_switch_is_off(client, client_state,
-                                                    fake_jimeng, fake_uploader,
-                                                    service, monkeypatch):
-    """🔴 **开关默认关**：45（部分成功）时**不许**自动续生成。
+def test_partial_45_delivers_the_finished_image_when_switch_is_off(
+        client, client_state, fake_jimeng, fake_uploader, service, monkeypatch):
+    """🔴 **开关默认关** ⇒ 45（部分成功）不续生成，**按已出的图立刻交付**。
 
-    原因：`action=2` 的触发判据**尚未确定**（实测「有的 history 能续、有的不能」，
-    而区分条件还没找到）。判据确定前开着它 = 按一个错判据去花真实生成额度。
-    关掉时的行为必须回到原样：**只等**（后续由终态补齐/看门狗收口）。
+    🔴 2026-10-21 口径变更（用户：「这种全部取消，全部出 1 张图」）：
+    旧行为是"只等"，直到 `TASK_TIMEOUT` 判死 —— 实测近 4h 有 40 条这样空转
+    （均 601s、合计 24,029 槽秒，占理论容量 42%），而且**最后还判失败**，
+    尽管图早就出了。
+
+    为什么可以不等：上游的 `total_image_count` 跟的是**垫图张数**、不是 `n`
+    （4 垫图 + n=1 ⇒ total=4 / finished=1 / status=45，页面显示"剩余 3 张待生成，
+    将额外消耗 12 积分"）。那"剩余 N 张"是上游在问"要不要再花积分续"，
+    调用方从没要过 ⇒ 从对外契约看任务已经完成。
     """
     from app.upstream.jimeng.client import GeneratedImage, TaskState
 
@@ -1433,17 +1444,21 @@ def test_partial_45_does_nothing_when_switch_is_off(client, client_state,
         lambda *a, **k: (calls.append(a), "cont-sid")[1], raising=False)
     partial = TaskState(submit_id="upstream-submit-id", status=45,
                         status_name="partial_success", finished=False, failed=False,
-                        history_record_id="44853559987980")
+                        history_record_id="44853559987980",
+                        total=4, finished_count=1)
     partial.images = [GeneratedImage(url="https://cdn/a.png", width=1024, height=1024)]
     fake_jimeng.states = [submitted_state(), partial]
 
-    tid = _create(client, model="jimeng-t2i", prompt="x", n=4)
+    tid = _create(client, model="jimeng-t2i", prompt="x", n=1)
     _tick_until_terminal(client_state)
 
     assert not calls, f"开关是关的，竟然续生成了：{calls}"
     rec = service.store.get(tid)
-    assert rec.status in ("in_progress", "queued"), rec.status
+    assert rec.status == "success", "已出图就该交付，不许干等到超时"
+    assert [im["url"] for im in rec.images] == ["https://cdn/a.png"]
     assert (rec.continuations or 0) == 0
+    assert any("部分成功" in d and "未再续生成" in d for d in rec.degradations), \
+        f"交付了半成品却不留痕：{rec.degradations}"
 
 
 def test_dispatch_starvation_is_counted_not_silent(settings):

@@ -1190,6 +1190,31 @@ def test_sync_backlog_guard_can_be_switched_off(client_factory, monkeypatch):
     assert r.json()["error"]["code"] == "sync_timeout", r.text
 
 
+def test_audit_is_not_blocked_by_the_queue_cap(client_factory):
+    """🔴 单凭据排队背压**不拦"不排队"的能力**（audit）。
+
+    线上实测（2026-10-21 16:30）：开了 `MAX_QUEUED_PER_CREDENTIAL=100` 之后，
+    该凭据连 `jimeng-audit` 都回 429 —— 可它受理即终态、不占并发槽，
+    队列再堵也能立刻出结果。拦它属于连坐（预审本来是"提交前省钱"的第一道闸）。
+    """
+    c = client_factory(max_queued_per_credential=1)
+    st = c.app.state
+    # advances=0 ⇒ 任务留在 queued，队列不消化
+    st.coordinator = _InlineCoordinator(st.coordinator, advances=0)
+
+    assert c.post(BASE, json={"model": "jimeng-t2i", "prompt": "a"},
+                  headers=AUTH).status_code == 202
+    # 第 2 条撞上限 ⇒ 429（背压生效）
+    r2 = c.post(BASE, json={"model": "jimeng-t2i", "prompt": "b"}, headers=AUTH)
+    assert r2.status_code == 429, r2.text
+    assert r2.json()["error"]["code"] == "queue_overloaded", r2.text
+
+    # 但 audit 必须放行（异步受理 → 202，受理即终态）
+    r3 = c.post(BASE, json={"model": "jimeng-audit",
+                            "image": [PNG_DATA_URI]}, headers=AUTH)
+    assert r3.status_code == 202, r3.text
+
+
 def test_priority_queue_puts_sync_tasks_first(store):
     """🔴 同步请求（priority=1）必须排在异步积压**前面**。
 

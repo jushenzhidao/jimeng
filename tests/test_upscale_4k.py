@@ -305,6 +305,34 @@ def test_upscale_leg_failure_delivers_the_2k_original(
     #（2026-10-15 文案统一：国内改道与 GPT Image 超分链共用"未能完成超分"）
 
 
+def test_partial_45_on_the_upscale_leg_is_not_delivered_as_final(
+        client, client_state, fake_jimeng, service):
+    """🔴 45（部分成功）落在**超清腿**上时，**不许**按"已出图"提前交付。
+
+    为什么单独钉这条：2026-10-21 让 45 走"已出图即交付"是为了救**生成腿**
+    （`total_image_count` 跟垫图数走，`finished=1` 就够 `n` 了）。超清腿语义不同 ——
+    `_upscale_settle` 把"非终态且无产物"当作**重投信号**（超清免费），
+    45 若落进交付路径，等于把 2k 原图当 4k 交付、还顺手丢掉免费的超清重试。
+    """
+    partial = TaskState(submit_id="upstream-submit-id", status=45,
+                        status_name="partial_success", finished=False, failed=False)
+    partial.history_record_id = HIST
+    partial.images = [GeneratedImage(url="https://cdn/up.png", width=4096,
+                                    height=4096, format="png", item_id=888)]
+    fake_jimeng.states = [
+        submitted_state(),
+        _gen_ok(["https://cdn/gen.png"], items=(777,)),   # 2k 腿成功 ⇒ 开始超清腿
+        partial,                                          # 超清腿报 45
+    ]
+    tid = _create(client, size="4096x4096")
+    drive(client_state, 3)
+
+    rec = service.store.get(tid)
+    assert rec.status == "in_progress", \
+        f"超清腿上的 45 不是终态，不许提前交付（实得 {rec.status}）"
+    assert not rec.images, "2k 原图不该被当成最终产物落库"
+
+
 # ---------------------------------------------------------------------------
 # 超清腿的有界重试（2026-10-12 收尾）
 # ---------------------------------------------------------------------------

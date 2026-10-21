@@ -913,7 +913,19 @@ class Service:
         #: 也更诚实（调用方立刻知道该等，而不是以为服务坏了）。
         #: `MAX_QUEUED_PER_CREDENTIAL=0` = 关闭（默认，既有行为不变）。
         cap_q = self.settings.max_queued_per_credential
+        #: 🔴 2026-10-21（线上实测）：`jimeng-audit` 被这个闸误伤 —— 它**不排队**
+        #: （受理即终态、不占并发槽），队列再堵也能立刻出结果，拦它纯属连坐。
+        #: 这里单独解析一次能力（`cap` 在下面 1021 行才解析，纯字典查找、很轻）。
+        _needs_queue = True
         if cap_q > 0:
+            try:
+                _cap_now, _ = models.resolve(str(body.get("model") or ""),
+                                             has_image=bool(body.get("image")),
+                                             video=video)
+                _needs_queue = _cap_now.name not in NON_SUBMIT_CAPABILITIES
+            except Exception:      # noqa: BLE001 —— 解析失败交给下面报它该报的错
+                _needs_queue = True
+        if cap_q > 0 and _needs_queue:
             waiting = self.store.count_queued_by_session(sessionid)
             if waiting >= cap_q:
                 #: 粗估等待时间：排队长 × 单条实测耗时(≈60s) / 并发位。
@@ -2490,6 +2502,8 @@ class Service:
 
     def _advance(self, rec: TaskRecord, st: Any) -> None:
         """把一次查询结果落到任务上（终态收敛 / 未完成只刷时间）。"""
+        #: 45（部分成功）按已出图交付时的留痕；只在"提前落交付"那一支被赋值。
+        _partial_note: str | None = None
         if not st.finished:
             # 🔴 **`status=45`（部分成功）不是"再等等"，而是上游在问"要不要继续"。**
             # 实测 `action=2` **只在这个状态被接受**（拿已完成的任务去续一律 1002）；
@@ -2500,11 +2514,43 @@ class Service:
                     and (rec.continuations or 0) < CONTINUE_MAX):
                 self._continue_partial(rec, st)
                 return
-            # 其余未完成态：只刷 updated_at（让"上次推进时间"反映真实进度，
-            # 也让 stale 扫描不会把正常轮询的任务误判成卡死）。
-            # ⚠️ 它同时是 ③ 轮询间隔的判据，所以这一步不能省。
-            self.store.patch(rec.task_id, updated_at=int(time.time()))
-            return
+            # 🔴 2026-10-21（用户口径：「这种全部取消，全部出 1 张图」）：
+            # `status=45` 且**已有产物** ⇒ **立刻按已出的图交付**，不再等剩下的。
+            # 为什么这样判不是"少给"：上游的 `total_image_count` 跟的是
+            # **垫图张数**、不是我们要的 `n`（实测 4 垫图 + n=1 ⇒ total=4 /
+            # finished=1 / status=45，页面显示"剩余 3 张待生成，将额外消耗
+            # 12 积分"）。那"剩余 N 张"是上游在问"要不要再花积分续"，
+            # 而调用方从来没要过它们 ⇒ 从对外契约看**任务已经完成**。
+            # 反例（为什么不能一律干等）：`CONTINUE_ENABLED=0`（线上默认）时，
+            # 45 只会刷 `updated_at` 等 `TASK_TIMEOUT` 判死 —— 实测近 4h 有
+            # 40 条这样空转（均 601s、合计 24,029 槽秒，占理论容量 42%），
+            # 而且最后**还是判失败**（图明明已经出了）。
+            # ⚠️ 超清腿（`stage=upscale`）**不走这条**：`_upscale_settle` 会把
+            # "非终态且无产物"当成重投信号，45 落进去会被误判成"超清失败"。
+            _plan_now = self._upscale_plan_of(rec)
+            if _plan_now is not None and _plan_now.get("stage") == "upscale":
+                self.store.patch(rec.task_id, updated_at=int(time.time()))
+                return
+            if st.status == 45 and st.images:
+                OBS.info("partial delivered", task_id=rec.task_id,
+                         upstream_status=st.status,
+                         upstream_total=st.total,
+                         upstream_finished=st.finished_count,
+                         n_requested=rec.n,
+                         elapsed_s=round(max(0.0, time.time() -
+                                             (rec.started_at or rec.created_at)), 1))
+                _partial_note = (
+                    f"上游部分成功（45，完成 {st.finished_count}/{st.total}）："
+                    f"按请求的 n 交付已出的图，其余**未再续生成**"
+                    f"（续生成要额外消耗积分，且调用方未请求这些张）。")
+                # 落到下面的交付路径（不再早退）—— 数量仍按 `n` 收口，
+                # 缺口由 `want > len(images)` 那段用已成功的图补齐并留痕。
+            else:
+                # 其余未完成态：只刷 updated_at（让"上次推进时间"反映真实进度，
+                # 也让 stale 扫描不会把正常轮询的任务误判成卡死）。
+                # ⚠️ 它同时是 ③ 轮询间隔的判据，所以这一步不能省。
+                self.store.patch(rec.task_id, updated_at=int(time.time()))
+                return
 
         # 🔴 4k 改道：**超清腿**的终态走单独一条路 —— 它失败或空产物都
         # **不判任务失败**，而是该张退回 2k 原图 + 留痕（用户口径 2026-10-12）。
@@ -2609,6 +2655,8 @@ class Service:
                    "item_id": im.item_id, "vid": im.vid} for im in st.images]
         notes = [im.note for im in st.images if im.note]
         deg = list(rec.degradations) + [f"产物提示：{n}" for n in notes]
+        if _partial_note:
+            deg.append(_partial_note)
 
         # 🔴 **上游少出图时，用成功的图补齐**（用户口径 2026-09-20 的"优化方案 1"）。
         #
