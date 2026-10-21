@@ -214,7 +214,9 @@ def main() -> int:
     app = create_app()
     svc = app.state.service
     client_ = TestClient(app)
-    auth = {"Authorization": "Bearer sk-e2e-local"}
+    # 🔴 2026-10-21：鉴权已改为「Bearer = sessionid 透传」（API_KEYS 不参与鉴权）。
+    # 原先这里写死 sk-e2e-local ⇒ 服务把它当 sessionid 打上游、恒 1015 login_error。
+    auth = {"Authorization": f"Bearer {sid}"}
     failures: list[str] = []
     catalog: dict = {}
 
@@ -283,15 +285,20 @@ def main() -> int:
                         else _make_test_image())
                 print(f"      本地图 {len(data)} 字节（上传**不扣积分**）")
                 t0 = time.perf_counter()
-                uri = svc.uploader.upload(data)
+                # 🔴 生产装配下 `svc.client` / `svc.uploader` 恒 None（每凭据一套
+                # bundle），必须按 sessionid 取，否则 AttributeError: 'NoneType'
+                # object has no attribute 'upload'（2026-10-21 实测踩到）。
+                b_client, b_uploader, _b_vod, _b_cfg = svc.bundle_for(sid)
+                assert b_uploader is not None, "bundle_for 没给出 uploader"
+                uri = b_uploader.upload(data)
                 ms = (time.perf_counter() - t0) * 1000
-                print(f"{OK} 上传成功 {uri}（{ms:.0f}ms，cached={svc.uploader.last_cached}）")
-                info = svc.client.image_by_uri(uri)
+                print(f"{OK} 上传成功 {uri}（{ms:.0f}ms，cached={b_uploader.last_cached}）")
+                info = b_client.image_by_uri(uri)
                 assert uri in info, f"get_image_by_uri 没认到它：{list(info)}"
                 print(f"{OK} 免费验真通过（get_image_by_uri 认到了它）")
                 # 同一份内容再来一次 ⇒ 应命中内容哈希缓存、零请求
                 t1 = time.perf_counter()
-                uri2 = svc.uploader.upload(data)
+                uri2 = b_uploader.upload(data)
                 ms2 = (time.perf_counter() - t1) * 1000
                 assert uri2 == uri, "同一份字节应命中缓存并返回同一个 uri"
                 print(f"{OK} 二次上传命中缓存 {ms2:.0f}ms（第二次几乎零成本）")
@@ -313,9 +320,11 @@ def main() -> int:
                     print(f"      档位：{args.resolution} × {args.duration}s × "
                           f"{args.aspect_ratio}")
                     return
-                sid_ = svc.client.submit(args.prompt,
-                                         model=upstream or DEFAULT_MODEL,
-                                         size=args.size, count=args.n, dry_run=True)
+                d_client = svc.bundle_for(sid)[0]
+                assert d_client is not None, "bundle_for 没给出 client"
+                sid_ = d_client.submit(args.prompt,
+                                       model=upstream or DEFAULT_MODEL,
+                                       size=args.size, count=args.n, dry_run=True)
                 print(f"{OK} 草稿构造通过（dry_run，**未发任何请求**），submit_id={sid_}")
                 print(f"      将要提交：model={upstream or DEFAULT_MODEL} "
                       f"size={args.size} n={args.n}")
