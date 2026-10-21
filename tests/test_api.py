@@ -1389,3 +1389,51 @@ def test_sync_validates_like_the_async_endpoint(sync_client):
 
 
 _ = (pytest, KEY_B)
+
+
+def test_upscale_begin_is_idempotent(service, monkeypatch):
+    """🔴 同一条任务**不能被启动两次超清队列**（2026-10-21 用户现场）。
+
+    现场：一个 4K 请求（= 2k 生成 + 一次超分）在即梦上留下了 **1 张 2K + 2 张
+    4K** —— 同一张 2k 被超分了两次。`_upscale_begin` 一进来就重置
+    `i / tries / out`，所以第二次 begin 会**在原图上再提交一条超清腿**，
+    而且账本清零后 `tries` 又从 1 开始（看起来只有一次，掩盖了重复）。
+    """
+    from app.store import TaskRecord
+
+    rec = TaskRecord(
+        task_id="t-idem", credential_id="c1", model="jimeng-t2i",
+        cap_key="jimeng:t2i", status="in_progress",
+        extra_json=json.dumps({"upscale": {"stage": "upscale", "i": 0,
+                                           "tries": {"1:0": 1}}}))
+    submitted: list[Any] = []
+    monkeypatch.setattr(service, "_submit_upscale_leg",
+                        lambda *a, **k: (submitted.append(1), (True, "sid", False))[1])
+
+    plan = {"tier": "4k", "levels": 1, "src": [{"url": "u"}], "i": 0}
+    service._upscale_begin(rec, None, [{"url": "u"}], plan, [])
+
+    assert submitted == [], "计划已是 upscale ⇒ 不许再启动一轮（会重复超分）"
+
+
+def test_upscale_pump_hard_caps_submissions(service, monkeypatch):
+    """同一张的超清提交次数有**硬上限**（`预算 + 1`），任何路径都不许绕过。
+
+    软判据（`_upscale_settle` 里的 tries <= budget）依赖账本没被重置；
+    这条是独立兜底：账本说"已经试了 99 次"时，连提交都不发。
+    """
+    from app.store import TaskRecord
+
+    rec = TaskRecord(task_id="t-cap", credential_id="c1", model="jimeng-t2i",
+                     cap_key="jimeng:t2i", status="in_progress")
+    submitted: list[Any] = []
+    monkeypatch.setattr(service, "_submit_upscale_leg",
+                        lambda *a, **k: (submitted.append(1), (True, "sid", False))[1])
+    monkeypatch.setattr(service, "_upscale_finish", lambda *a, **k: None)
+
+    plan = {"src": [{"url": "u"}], "i": 0, "tries": {"1:0": 99}, "notes": [],
+            "out": [], "legs_failed": 0, "level": 1}
+    service._upscale_pump(rec, plan)
+
+    assert submitted == [], "超过硬上限就不该再提交"
+    assert plan["i"] == 1 and plan["legs_failed"] == 1

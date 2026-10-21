@@ -2436,7 +2436,20 @@ class Service:
     def _upscale_begin(self, rec: TaskRecord, st: Any,
                        images: list[dict[str, Any]], plan: dict[str, Any],
                        deg: list[str]) -> None:
-        """2k 生成腿成功后**启动**超清队列（任务保持 `in_progress`，先不判成功）。"""
+        """2k 生成腿成功后**启动**超清队列（任务保持 `in_progress`，先不判成功）。
+
+        🔴 **必须幂等**（2026-10-21 用户现场）：同一个 2k 图被超清了**两次**、
+        产出两个 4k。这条函数一进来就会重置 `i / tries / out` —— 只要它被
+        调用两次，第二次就会在同一张图上**再提交一条超清腿**，而账本被清零
+        后从 1 重新计数（`tries` 看起来永远只有 1 次，掩盖了重复）。
+        计划已经是 `upscale` / `done` ⇒ 直接返回。
+        """
+        _cur = self._upscale_plan_of(rec) or {}
+        if _cur.get("stage") in ("upscale", "done"):
+            OBS.warning("upscale begin ignored (already started)",
+                        task_id=rec.task_id, stage=_cur.get("stage"),
+                        idx=_cur.get("i"), tries=_cur.get("tries"))
+            return
         plan = dict(plan)
         plan.update({
             "stage": "upscale", "src": images, "out": [], "i": 0,
@@ -2487,6 +2500,20 @@ class Service:
             j = plan["i"]
             key = f"{level}:{j}"
             tries[key] = tries.get(key, 0) + 1
+            if tries[key] > budget + 1:
+                #: 🔴 硬上限（2026-10-21）：`settle` 的软判据是"还能不能再试一次"，
+                #: 这里再兜一道 —— 任何路径（计划被重置、键不同构、上游反复
+                #: 给终态无产物）都不允许对**同一张**提交超过 `budget + 1` 次，
+                #: 否则就是"同一张图反复超分"（线上真实发生过）。
+                plan["out"].append(src[j])
+                plan["legs_failed"] += 1
+                plan["notes"].append(
+                    f"⚠️ 第 {j + 1} 张超清提交次数已达硬上限"
+                    f"（{tries[key]} 次）⇒ 该张按 **2k 原图**交付。")
+                OBS.warning("upscale leg hard-capped", task_id=rec.task_id,
+                            index=j, tries=tries[key], budget=budget)
+                plan["i"] = j + 1
+                continue
             ok, sid_or_why, retryable = self._submit_upscale_leg(rec, plan, src[j])
             if ok:
                 self.store.patch(rec.task_id, upstream_submit_id=sid_or_why,
