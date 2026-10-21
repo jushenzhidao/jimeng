@@ -14,8 +14,9 @@ GET    /v1/models                           模型清单（OpenAI 形态）—�
 🔴 **前缀即语义**（2026-09-23 起）：`/v1/*` = 同步语义，`/async/*` = 异步任务语义。
   · `GET /v1/models` —— 同步、无任务语义；**免鉴权**（发现性端点，见该路由 docstring）；
   · `POST /v1/images/generations` —— **真同步**生成：创建+轮询合并进一个请求，
-    预算内（`SYNC_MAX_WAIT`，默认 300s）直接回最终结果；超预算降级回
-    `202 + task_id`，调用方无缝转异步轮询。
+    预算内（`SYNC_MAX_WAIT`，默认 300s）直接回最终结果；超预算**不再降级**
+    （2026-10-21 口径："同步任务就别 202 了"）⇒ 直接 **504 `sync_timeout`**，
+    message 带 task_id，任务仍在跑、可自行去异步端点接着查。
 `/async` 前缀留给**异步任务**语义（受理/查询/删除），它是那道护栏 ——
 拦的是"把**异步**语义的端点挂到 `/v1` 被误读成同步 API"，不是禁止同步端点进 `/v1`。
 
@@ -59,6 +60,7 @@ from .errors import (
     ContentPolicyError,
     EmptyResultError,
     InvalidParameterError,
+    SyncTimeoutError,
     SyncUnavailableError,
 )
 from .observability import (
@@ -353,6 +355,10 @@ async def _chat_sse(cid: str, model: str, created: int,
                                     "finish_reason": None}]})
     try:
         text = await produce()
+    except SyncTimeoutError as e:
+        # 超预算但任务还在跑：流式头已经发出、改不了状态码 ⇒ 把"还在生成 +
+        # 去哪查"当正文吐出去。**别**写成"生成失败"—— 那会误导成永久失败。
+        text = e.message
     except AdapterError as e:
         text = f"生成失败：{e.to_error()['error']['message']}"
     except Exception as e:  # noqa: BLE001
@@ -371,11 +377,9 @@ def _chat_text(rec: TaskRecord) -> str:
     会在对话流里直接渲染成图。多张就多行。
     """
     if rec.status not in ("success", "failure"):
-        # 🔴 预算内没等到终态（还在排队/生成）—— 这**不是失败**，是"还没好"。
-        # 线上实测（2026-10-14）：原先把这条路径写成"生成失败：任务未成功结束"，
-        # 调用方完全看不出"任务其实活着、只是慢"（一条队列堵住的请求会得到
-        # 一句像是永久失败的文案）。与 `/v1/images/generations` 同口径：
-        # 把 **task_id 与去哪继续查** 说清楚。
+        #: ⚠️ 理论上**不可达**（2026-10-21 起 `_sync_generate` 超预算直接抛
+        #: 504 `sync_timeout`，不会把非终态记录返回给这里）—— 保留为防御。
+        #: 真走到这里也别说"生成失败"：任务还活着，只是慢。
         return ("图片仍在生成中（未在预算内完成）。请轮询 "
                 f"GET /async/v1/images/generations/{rec.task_id} 取结果。")
     if rec.status != "success":
@@ -488,6 +492,24 @@ def _empty_success_error(rec: TaskRecord) -> EmptyResultError:
         upstream="jimeng")
 
 
+def _sync_timeout_error(rec: TaskRecord,
+                        wait: float | None = None) -> SyncTimeoutError:
+    """同步预算耗尽、任务仍在跑 ⇒ **504 `sync_timeout`**（2026-10-21 口径）。
+
+    🔴 不再回 202（旧口径 2026-10-14「降级不是失败」已作废）：同步调用方
+    是**一锤子买卖**，202 拿到的是"既不是结果也不是错误"的东西。
+    ⚠️ 任务**没丢、没取消**：message 里带 task_id，可去异步端点接着查；
+    原样重试会命中**受理去重**（同凭据 + 同指纹 + 上一条仍在途）
+    ⇒ 复用同一条任务，不会重复计费。
+    """
+    budget = f"{wait:.0f}s " if wait else ""
+    return SyncTimeoutError(
+        f"同步等待 {budget}内没等到终态：任务**仍在生成**（未取消、未失败）。"
+        f"请用 GET /async/v1/images/generations/{rec.task_id} 继续取结果；"
+        "原样重试会复用同一条在途任务，不会重复计费。",
+        upstream="jimeng")
+
+
 async def _sync_generate(svc: Service, coordinator: Any, settings: Settings,
                          body: dict[str, Any], *, credential: str,
                          sessionid: str | None,
@@ -573,9 +595,15 @@ async def _sync_generate(svc: Service, coordinator: Any, settings: Settings,
     # ⚠️ 异步端点**不受影响**：`view()` 对它是"任务记录"语义，
     # `data: []` + `degradations 里的判定` 正是 `jimeng-audit` 的正规出口
     # （本闸只加在 `_sync_generate` 这条同步链上）。
-    # ⚠️ 也**不动** 202（预算耗尽、任务还在跑）与 200 + `failure` 体：
-    # 前者是"还没好"（2026-10-14 口径：降级不是失败），后者是"任务完了、
-    # 结果是失败"（2026-10-10 口径）—— 两者都**不是**"空图"。
+    # ⚠️ 也**不动** 200 + `failure` 体：那是"任务完了、结果是失败"
+    # （2026-10-10 口径）—— 它不是"空图"。
+    #
+    # 🔴 2026-10-21 用户口径「同步任务就别 202 了」：超预算不再降级转异步，
+    # 直接 **504 `sync_timeout`**（任务仍在跑，message 里带 task_id 供接着查）。
+    # 这条判定必须放在"空产物"闸**之前** —— 非终态的任务本来就没有产物，
+    # 落到下面那条会把"还在跑"误报成"零产物 500"。
+    if not rec.terminal:
+        raise _sync_timeout_error(rec, settings.sync_max_wait)
     if rec.status == "success" and not rec.images:
         # 现场进服务端日志（对外仍然只给 message/type/code，见 `errors.py`）：
         # 排查要靠它区分"上游真零产物"（`_advance` 的 `empty result`）与
@@ -605,6 +633,11 @@ def _sync_view(rec: TaskRecord, *,
     （这条闸只加在同步链上，2026-10-15 口径不变）。
     """
     status_code, payload = view(rec, show_degradations=show_degradations)
+    if status_code == 202:
+        # 防御：同步链的语义是"要么给结果、要么给错误"（2026-10-21 口径：
+        # "同步任务就别 202 了"）。`_sync_generate` 已在超预算时先抛 504，
+        # 走到这里还非终态只可能是将来绕过它的新路径 ⇒ 同样按超时报。
+        raise _sync_timeout_error(rec)
     if status_code != 200:
         return status_code, payload
     empty_body = not payload
@@ -664,8 +697,9 @@ def _install_routes(app: FastAPI) -> None:
 
         语义（与异步族共用同一判定，`view()` 仍是唯一出口）：
           · 预算内到终态 → 直接回终态体（成功 200；失败 200 + `status: failure`）；
-          · 预算耗尽仍在跑 → **202 + `task_id`** + `Location` 指向异步查询端点
-            —— 调用方无缝转异步轮询；任务不会丢、也不会被取消；
+          · 预算耗尽仍在跑 → **504 `sync_timeout`**（2026-10-21 口径："同步任务
+            就别 202 了"）—— 任务不会丢、也不会被取消，`message` 里带 `task_id`
+            供调用方自己去异步端点接着查；
           · 没有推进者（协调器线程没在跑）→ **503**（`sync_unavailable`）快速
             失败，而不是让调用方白等 —— 那种部署形态下任务根本不会被推进。
 
@@ -704,13 +738,9 @@ def _install_routes(app: FastAPI) -> None:
 
         status_code, payload = _sync_view(
             rec, show_degradations=request.app.state.settings.show_degradations)
-        headers: dict[str, str] = {}
-        if status_code == 202:
-            # 预算耗尽但任务仍在跑：告诉调用方"去哪继续查"。
-            # 202 是**降级**而不是失败 —— 任务没丢，转异步轮询即可。
-            headers["Location"] = f"/async/v1/images/generations/{rec.task_id}"
-        return JSONResponse(status_code=status_code, content=payload,
-                            headers=headers)
+        # 🔴 2026-10-21「同步任务就别 202 了」⇒ `_sync_generate` 超预算直接抛
+        # 504，这里只会拿到终态（200 / 500 / 451）—— 不再有 Location 转异步那套。
+        return JSONResponse(status_code=status_code, content=payload)
 
     # ------------------------------------ 兼容面：OpenAI 图片编辑端点（edits）
     @app.post("/v1/images/edits")
@@ -791,11 +821,7 @@ def _install_routes(app: FastAPI) -> None:
                                    preset_degradations=degradations)
         status_code, payload = _sync_view(
             rec, show_degradations=request.app.state.settings.show_degradations)
-        headers2: dict[str, str] = {}
-        if status_code == 202:
-            headers2["Location"] = f"/async/v1/images/generations/{rec.task_id}"
-        return JSONResponse(status_code=status_code, content=payload,
-                            headers=headers2)
+        return JSONResponse(status_code=status_code, content=payload)
 
     # ------------------------------------------------------------- 查询
     @app.get("/async/v1/images/generations/{task_id}")
@@ -1039,16 +1065,8 @@ h2{{color:#7cb0ff}}a{{color:#7cb0ff}}td,th{{border-color:#1e2836}}}}</style></he
             }],
             "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
         }
-        if rec.status not in ("success", "failure"):
-            #: 与 `/v1/images/generations` 同口径：**202 + task_id + Location**。
-            #: 任务没丢、也没被取消 —— 调用方拿 task_id 去异步端点继续轮询。
-            #: （此前这里无视非终态直接回 200，正文还是"生成失败"，
-            #: 等于把"还在跑"谎报成"失败了"。）
-            payload["task_id"] = rec.task_id
-            return JSONResponse(
-                status_code=202, content=payload,
-                headers={"Location":
-                         f"/async/v1/images/generations/{rec.task_id}"})
+        # 🔴 2026-10-21：不再有"202 + task_id + Location"降级 ——
+        # `_sync_generate` 超预算会直接抛 504 `sync_timeout`（与出图端点同口径）。
         return JSONResponse(status_code=200, content=payload)
 
     # ------------------------------------------------------------- 运维

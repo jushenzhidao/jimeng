@@ -587,16 +587,17 @@ def test_chat_completions_without_a_prompt_is_a_clear_400(sync_client):
     assert after == before, "参数校验失败不该建任务"
 
 
-def test_chat_completions_degrades_to_202_when_the_budget_runs_out(client_factory):
-    """🔴 预算耗尽但仍在生成 ⇒ **202 + task_id + Location**，绝不是"生成失败"。
+def test_chat_completions_raises_504_when_the_budget_runs_out(client_factory):
+    """🔴 预算耗尽但仍在生成 ⇒ **504 `sync_timeout`**（2026-10-21 口径）。
 
-    线上实测（2026-10-14）：原先这条路径回 `200` + `content="生成失败：任务未成功结束"`
-    —— 把"还在排队/生成"谎报成永久失败，调用方也拿不到 `task_id`，无法转异步轮询。
-    （触发场景很常见：队列被上游卡住的任务占满时，同步预算必然不够。）
+    旧口径（2026-10-14）是 `202 + task_id + Location` 让调用方转异步；
+    用户随后拍板"同步任务就别 202 了" —— 同步调用方拿 202 得到的是
+    "既不是结果也不是错误"的东西，还得自己实现轮询。
+    任务**仍然活着**（message 带 task_id），异步端点照常可轮询。
     """
     c = client_factory(sync_max_wait=0.05)
     st = c.app.state
-    # advances=0 ⇒ wake() 不推进 ⇒ 任务停在 queued，预算一到就降级
+    # advances=0 ⇒ wake() 不推进 ⇒ 任务停在 queued，预算一到就报超时
     st.coordinator = _InlineCoordinator(st.coordinator, advances=0)
 
     r = c.post("/v1/chat/completions",
@@ -604,17 +605,20 @@ def test_chat_completions_degrades_to_202_when_the_budget_runs_out(client_factor
                      "messages": [{"role": "user", "content": "画一只猫"}]},
                headers=AUTH)
 
-    assert r.status_code == 202, r.text
-    body = r.json()
-    tid = body["task_id"]
-    assert tid.startswith("jimeng_")
-    assert r.headers["location"] == f"/async/v1/images/generations/{tid}"
-    assert "仍在生成" in body["choices"][0]["message"]["content"], body
+    assert r.status_code == 504, r.text
+    assert "location" not in {k.lower() for k in r.headers}, dict(r.headers)
+    err = r.json()["error"]
+    assert err["code"] == "sync_timeout", err
+    assert err["type"] == "timeout_error", err
+    # 对外只给错误信息（2026-10-12 口径）：连 detail 都不出现。
+    assert set(err) == {"message", "type", "code"}, err
+    m = re.search(r"jimeng_[0-9a-f]{32}", err["message"])
+    assert m, err
 
     # 拿到的必须是**真** task_id（能被异步端点查到），不是占位串
-    got = c.get(f"/async/v1/images/generations/{tid}", headers=AUTH)
+    got = c.get(f"/async/v1/images/generations/{m.group(0)}", headers=AUTH)
     assert got.status_code == 202, got.text
-    assert got.json()["task_id"] == tid
+    assert got.json()["task_id"] == m.group(0)
 
 
 # ---------------------------------------------------------------------------
@@ -1087,33 +1091,39 @@ def test_sync_content_policy_raises_451(sync_client, fake_jimeng):
         assert leaked not in err["message"], f"message 不该出现 {leaked!r}"
 
 
-def test_sync_timeout_degrades_to_async_polling(client_factory):
-    """预算耗尽 ⇒ 202 + task_id + Location 指向异步端点；任务不受影响。
+def test_sync_timeout_raises_504(client_factory):
+    """预算耗尽 ⇒ **504 `sync_timeout`**；任务不受影响，异步仍可轮询。
 
-    这就是"超时降级"路径：调用方无缝转异步轮询 —— 任务不会被取消
-    （即梦根本没有取消端点），只是这一个 HTTP 请求不再等它。
+    2026-10-21 用户口径："同步任务就别 202 了" —— 旧行为（202 + Location
+    转异步）作废：同步接口要么给结果、要么给错误，不交付"半截子"。
+    任务不会被取消（即梦根本没有取消端点），只是这个 HTTP 请求不再等它；
+    message 里带 task_id，调用方要结果就自己去异步端点接着查。
     """
     import time as _time
 
     c = client_factory(sync_max_wait=0.05)
     st = c.app.state
-    # advances=0 ⇒ wake() 不推进 ⇒ 任务停在 queued，预算一到就降级
+    # advances=0 ⇒ wake() 不推进 ⇒ 任务停在 queued，预算一到就报超时
     st.coordinator = _InlineCoordinator(st.coordinator, advances=0)
 
     t0 = _time.monotonic()
     r = c.post(SYNC, json={"model": "jimeng-t2i", "prompt": "x"}, headers=AUTH)
     elapsed = _time.monotonic() - t0
 
-    assert r.status_code == 202, r.text
-    body = r.json()
-    assert body["status"] == "queued"
-    tid = body["task_id"]
-    assert r.headers["location"] == f"/async/v1/images/generations/{tid}"
+    assert r.status_code == 504, r.text
+    assert "location" not in {k.lower() for k in r.headers}, dict(r.headers)
+    err = r.json()["error"]
+    assert err["code"] == "sync_timeout", err
+    assert err["type"] == "timeout_error", err
+    # 对外只给错误信息：message / type / code，**无 detail**。
+    assert set(err) == {"message", "type", "code"}, err
+    m = re.search(r"jimeng_[0-9a-f]{32}", err["message"])
+    assert m, err
     # 🔴 防"配置没生效、真等 300s"把用例挂死：耗时必须远小于默认预算
-    assert elapsed < 5, f"降级应当及时，实耗 {elapsed:.1f}s"
+    assert elapsed < 5, f"超预算应当及时报错，实耗 {elapsed:.1f}s"
 
-    # 降级后任务还在（没被取消/删除），异步端点照常可轮询
-    got = c.get(f"/async/v1/images/generations/{tid}", headers=AUTH)
+    # 报错之后任务还在（没被取消/删除），异步端点照常可轮询
+    got = c.get(f"/async/v1/images/generations/{m.group(0)}", headers=AUTH)
     assert got.status_code == 202
     assert got.json()["status"] == "queued"
 

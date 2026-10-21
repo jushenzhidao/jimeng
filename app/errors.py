@@ -168,6 +168,25 @@ class EmptyResultError(AdapterError):
     retryable = False
 
 
+class SyncTimeoutError(AdapterError):
+    """**同步等待**预算耗尽、但任务仍在跑 —— 504（2026-10-21 用户口径）。
+
+    口径："同步任务就别 202 了" —— 同步调用方是一锤子买卖，202 给它的是
+    "既不是结果也不是错误"的东西，还得自己实现转异步轮询。
+
+    🔴 与 `UpstreamTimeoutError` 刻意分开：那个是"上游迟迟不回话"，
+    这个是"上游好好的、只是没在 `SYNC_MAX_WAIT` 内跑完"。
+    任务**没丢、没取消**：message 里带 task_id，可去异步端点接着查；
+    原样重试会命中**受理去重**（同凭据 + 同指纹 + 上一条仍在途）
+    ⇒ 复用同一条任务，不会重复计费。
+    """
+
+    status_code = 504
+    err_type = "timeout_error"
+    err_code = "sync_timeout"
+    retryable = True
+
+
 class UpstreamTimeoutError(AdapterError):
     status_code = 504
     err_type = "upstream_timeout_error"
