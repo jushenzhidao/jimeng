@@ -164,6 +164,10 @@ def render(settings: Settings) -> str:
         "第三方 SDK 的**占位名**走默认模型（Seedream 5.0 Lite，0 积分）—— "
         "**不是**静默换成收费档。完整清单见 `GET /v1/models` 的 `ark_name` 字段。")
     add("")
+    add("⚠️ **带输入图但没写 `model`**（空 / 空串 / 纯空白）也**不再报错**："
+        "固定回退 `jimeng-i2i` + Seedream 5.0 Lite（2k 免费档），"
+        "并在 `degradations` 里写明。")
+    add("")
     add("## 错误表（由 `app/errors.py` 的异常类派生）")
     add("")
     add("| code | HTTP | type | 重试 | 何时出现 |")

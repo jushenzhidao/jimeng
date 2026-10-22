@@ -781,12 +781,26 @@ def note_fallback(requested: str, effective: str) -> None:
     _LAST_FALLBACK[requested] = effective
 
 
+#: 🔴 「调用方**连 model 都没写**」时 `_LAST_FALLBACK` 用的哨兵键。
+#: 为什么要专门区分：兜底有**两种成因**，对外措辞不能混 ——
+#:   · 写了名字但我们没登记 ⇒ "你写的这个名字我不认识"（占位名口径）；
+#:   · 根本没写 ⇒ 说"占位名"会让人以为自己写错了，实际是中间层把字段丢了。
+#: 用不可能与真实模型名相同的哨兵（调用方真写这个字符串也无害：只会被当成
+#: 未登记名，落到同一分支）。
+UNSPECIFIED_MODEL = "(model-not-specified)"
+
+
 def take_fallback_note() -> str | None:
     """取走并清空最近一次兜底记录（取走即清，避免跨请求串味）。"""
     if not _LAST_FALLBACK:
         return None
     requested, effective = next(iter(_LAST_FALLBACK.items()))
     _LAST_FALLBACK.clear()
+    if requested == UNSPECIFIED_MODEL:
+        #: 🔴 2026-10-22 新增：带图但没写 model 的兜底留痕。
+        return (f"请求**没写 model** 且带输入图：已按「图生图 + Seedream 5.0 Lite」"
+                f"受理（实际生效 {effective!r}，2k 免费档）。"
+                f"要指定具体型号/档位请显式传 model，清单见 GET /v1/models。")
     return (f"model={requested!r} 不是本服务已登记的型号（也不在面板名里）"
             f"，已按占位名兜底到 {effective!r}（免费档）。"
             f"要指定具体型号请用 GET /v1/models 里的名字。")
@@ -1059,12 +1073,29 @@ def resolve(model: str | None, *, has_image: bool,
     #: 在 `Service.create` 里按前缀处理，不走这里）。
     #: ⚠️ 这**不是**"静默换档"：占位名兜底一律 `_LAST_FALLBACK` 留痕（见上方
     #: `take_fallback_note`），调用方在响应里看得到"你写的名字我没登记，用了什么"。
-    if raw and has_image and not video:
+    #: 🔴 2026-10-22（用户口径："这种**全部回退**到模型 seedream 5.0 lite"，
+    #: 覆盖 2026-10-14 那条"`raw` 为空 ⇒ 保持 400"的分叉）：
+    #: **连 model 都没写**（`None` / `""` / 纯空白）且带输入图时，也不再 400。
+    #:
+    #: 现场：线上 v0.1.76（已含 10-14 的占位名修复）仍会偶发收到
+    #: "未指定 model，且带输入图时本服务有多个能力可选（jimeng-i2i, jimeng-hd,
+    #: jimeng-pro-hd, jimeng-outpaint, jimeng-audit）" —— 说明那条修复**没覆盖
+    #: 这条路**：报错的前提是 `raw` 为空，也就是 model 根本没到服务端
+    #: （调用方写了 `doubao-seedream-4-0-250828`，中间层把它丢了 ⇒ 空串）。
+    #: 对**带输入图**的请求，"替它选"的经济代价上限就是 2k Lite 的 **0 积分**；
+    #: 而让请求失败，调用方拿到的是一条**与它意图无关**的格式错误 ⇒ 兜底更划算。
+    #: 落点固定为**最便宜**的那条：`i2i + high_aes_general_v50`（5.0 Lite）。
+    #: ⚠️ 必须留痕（`UNSPECIFIED_MODEL` 有独立措辞），否则就是静默换模型。
+    #: ⚠️ **视频族不受影响**（`not video`）：t2v/vfi 的默认要靠 source_task_id
+    #: 才能推，盲选会选错链路 ⇒ 继续保持"无法确定用哪个"的 400
+    #: （tests/test_video.py 钉着这条）。
+    if has_image and not video:
         cap = _BY_NAME["i2i"]
-        _check_shape(cap, raw=raw, has_image=True, n_images=n_images,
+        _check_shape(cap, raw=raw or cap.api_id, has_image=True,
+                     n_images=n_images,
                      upstream_model=DEFAULT_UPSTREAM_MODEL)
-        if _LAST_FALLBACK:
-            _LAST_FALLBACK[raw] = f"{cap.api_id} + {DEFAULT_UPSTREAM_MODEL}"
+        note_fallback(raw or UNSPECIFIED_MODEL,
+                      f"{cap.api_id} + {DEFAULT_UPSTREAM_MODEL}")
         return cap, DEFAULT_UPSTREAM_MODEL
 
     kind = "带输入图" if has_image else "无输入图"

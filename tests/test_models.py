@@ -23,20 +23,29 @@ def test_no_image_defaults_to_t2i_unambiguously():
     assert model, "文生图必须带一个上游模型 key"
 
 
-def test_with_image_refuses_to_guess():
-    """带图时四个能力都能接 ⇒ **必须报错**，不能替调用方挑。
+def test_with_image_and_no_model_falls_back_to_lite():
+    """带图但**没写 model** ⇒ 回退「i2i + Seedream 5.0 Lite」，**不再 400**。
 
-    它们的花费并不相同（实扣：hd 0 / i2i 0 / pro-hd 1；outpaint 未对账），
-    挑错等于替调用方做了他没做的决定。
-    ⚠️ 消息里的量级必须是**实扣口径**（曾误用 forecast 的 9 / 28 / 40 / 91）。
+    🔴 2026-10-22 用户口径（覆盖 2026-10-02 的"必须报错"）：
+    现场是**中间层把 model 丢成空串**（线上 v0.1.76 偶发"未指定 model ..."，
+    调用方明明写了 `doubao-seedream-4-0-250828`）。对带输入图的请求，
+    "替它挑"的经济代价上限就是 2k Lite 的 **0 积分**，而让请求失败等于
+    扔给调用方一条与意图无关的格式错误 ⇒ 兜底更划算。
+
+    钉三件事：① 落点是**最便宜**的 i2i + Lite（绝不能悄悄升到收费档）；
+    ② 必须**留痕**（否则就是静默换模型）；③ 三种"没写"形态一致（None/""/空白）。
+    ⚠️ 视频族**不跟着放宽** —— 见 `test_video.py` 仍断言"无法确定用哪个"。
     """
-    with pytest.raises(InvalidParameterError) as e:
-        resolve(None, has_image=True)
-    msg = e.value.message
-    for api_id in ("jimeng-i2i", "jimeng-hd", "jimeng-pro-hd", "jimeng-outpaint"):
-        assert api_id in msg, f"错误信息里必须列出候选，缺 {api_id}"
-    assert "实扣" in msg and "pro-hd 1" in msg, \
-        "应给出**实扣**量级（forecast 不许进对外消息），让人知道选择的代价"
+    for written in (None, "", "   "):
+        cap, upstream = resolve(written, has_image=True)
+        assert cap.api_id == "jimeng-i2i", "带图兜底只能落 i2i"
+        assert upstream == "high_aes_general_v50", \
+            "兜底必须是免费默认档 Seedream 5.0 Lite，不许换收费模型"
+        note = take_fallback_note()
+        assert note is not None, "兜底不留痕 = 静默换模型"
+        assert "没写 model" in note, "措辞要说清是**没写**，不是名字写错了"
+        assert "high_aes_general_v50" in note, "留痕要写明实际生效的模型"
+        assert take_fallback_note() is None, "取走即清 —— 同一请求不许读到两条"
 
 
 @pytest.mark.parametrize("written,expect", [
