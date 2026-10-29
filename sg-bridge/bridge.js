@@ -68,6 +68,16 @@ async function ensurePage() {
         viewport: { width: 1600, height: 1000 },
         locale: "zh-CN",
       });
+      // 🔴 2026-10-29：改成新版首页后，页面是"创作 feed"，一进去就狂拉
+      // 视频/大图 —— 在 8 核小机器上渲染进程会被堵住几十秒，表现就是
+      // `page.evaluate` **永不返回**（改版适配时整条流程"挂死"的真因，
+      // 单靠加超时只能把挂死变成必然失败）。图片工具只需要 DOM + 文本，
+      // ⇒ 媒体类资源直接 abort，页面立刻轻下来。
+      await ctx.route("**/*", (route) => {
+        const t = route.request().resourceType();
+        if (t === "media") return route.abort();
+        return route.continue();
+      }).catch(() => {});
       page = ctx.pages()[0] || (await ctx.newPage());
       await page.goto(START_URL, { waitUntil: "domcontentloaded",
                                   timeout: NAV_TIMEOUT }).catch(() => {});
@@ -85,10 +95,20 @@ function loggedIn(page_) {
   return page_.evaluate(() => {
     // 登录判定：存在 sessionid cookie（httpOnly 不可见）⇒ 用业务信号：
     // 已登录页面会出现 workspace/feed；未登录跳登录页。
-    const text = document.body ? document.body.innerText.slice(0, 2000) : "";
-    const onLogin = /登入|登錄|log\s?in|sign in/i.test(location.href) ||
-                    /sign in with/i.test(text);
-    return { url: location.href, onLogin };
+    //
+    // 🔴 2026-10-29：原来读 `document.body.innerText` —— **innerText 会强制
+    // 整页布局**，而改版后的首页 DOM 巨大，一次调用要 10~60s（实测把
+    // ensureLogin 拖成"挂死"，所有派发一起卡住）。改用两条廉价信号：
+    //   ① URL 里带 login/sign-in ⇒ 直接判未登录；
+    //   ② 有 `[contenteditable]`（composer）⇒ 一定在已登录的应用内页面；
+    // 只有前两条都不成立时才退回去读文本（此时页面大概率很轻）。
+    const onLoginUrl = /登入|登錄|log\s?in|sign\s?in/i.test(location.href);
+    if (onLoginUrl) return { url: location.href, onLogin: true };
+    if (document.querySelector('[contenteditable="true"]')) {
+      return { url: location.href, onLogin: false };
+    }
+    const text = document.body ? (document.body.textContent || "").slice(0, 2000) : "";
+    return { url: location.href, onLogin: /sign in with/i.test(text) };
   });
 }
 
@@ -195,84 +215,186 @@ const HISTORY_QS = "aid=513641&device_platform=web&region=PH"
   + "&da_version=3.3.30&web_version=7.5.0";
 // UI 流程核心：切 AI Image → （可选）选模型/档位 → 填 prompt → 发送 →
 // 返回 submit_id。终态轮询由调用方直连读接口完成（读接口不受 shark 影响）。
-async function generateUiCore({ prompt, model, resolution, ratio, count }) {
+async function generateUiCore({ prompt, model, resolution, ratio, count,
+                               dryRun = false }) {
   const p0 = await ensureLogin();
-  // 🔴 2026-10-19：提交成功后页面会跳到 `/ai-tool/generate`（结果页），
-  // **那里没有参数行/模型选择器**，点击 "AI Image" 的文本也不存在 ⇒
-  // 三条路（点 tab / 重试 / goto）都走不通，只能**换一个干净标签页**
-  //（cookie 在 context 上，新 page 天然是登录态）。
+  // 🔴 2026-10-29 **SG 前端改版**：`/ai-tool/image` 已 302 到 `/ai-tool/home`，
+  // 图片工具变成首页上的一个 tab（`AI Image`），参数面板也换了形态 ——
+  // 旧的三处判据全部失效：`[class*=generate-count-field]` 已不在 DOM、
+  // 比例/档位合成一行、张数改成 `1 image` 按钮点开 popover。
+  // 线上症状：**793 单**死在「张数控件找不到 1」，而重启 bridge 完全无用。
+  //
+  // 新形态（2026-10-29 在真实页面实测）：
+  //   · 模式 tab      = `<button>AI Image</button>`（点完 URL 变 `?type=image`）
+  //   · 模型          = `[role=combobox]`，文本即当前模型（默认 Seedream 5.0 Lite）
+  //   · 比例 + 档位   = 同一个按钮，文本两行 `16:9\n2K`，点开 popover 里是
+  //                     `LABEL.lv-radio`（Auto/1:1/3:4/16:9/… 与 2K/4K）
+  //   · 张数          = `button[aria-label^="Images to generate"]`（文本 `1 image`），
+  //                     点开 popover 里 `LABEL.lv-radio` 1..8
+  //   ⇒ **就绪判据 = 张数按钮在不在**（`[role=combobox]` 在 AI Agent 模式下
+  //     也存在，拿它判断会直接跳过点 tab —— 这正是本次事故的起点）。
+  const countSel = 'button[aria-label^="Images to generate"]';
+  // 步骤计时（`docker logs sg-bridge` 里看得见）：改版适配期定位卡点用。
+  // 之前一次 dryRun 无响应地挂死过 3 分钟，就是靠这套打点定位的。
+  const _t0 = Date.now();
+  const step = (s) => console.log(`[ui] +${((Date.now() - _t0) / 1000).toFixed(1)}s ${s}`);
+  // 每次页面交互都套一层硬超时：`page.evaluate` 在渲染进程忙/页面导航中会
+  // **永不返回**，而它没有 timeout 参数（Playwright 的 default timeout 不覆盖
+  // evaluate）⇒ 一次卡住就把 UI 锁焊死、后面所有派发排队等死。
+  // 2026-10-29 实测：切参数的第二次调用就是这么挂的。
+  const evR = (label, prom, ms = 15000) => Promise.race([
+    prom,
+    new Promise((_r, rej) => setTimeout(
+      () => rej(new Error(`${label} 无响应 ${ms}ms`)), ms)),
+  ]);
+
+  // 🔴 **不许用 `innerText` 全表扫描**：`innerText` 会为每个元素强制布局，
+  // 而首页按钮上千个 ⇒ 一次"找按钮"要 10~30s，整条流程看起来像挂死
+  //（2026-10-29 实测：dryRun 3 分钟无响应，根因就是这个）。
+  // 正确做法：用 aria-label **精确定位张数按钮**，再在它的**同一个父节点**里取
+  // 兄弟按钮 —— 那里只有 4 个元素，全是 `textContent`（不触发布局）。
+  //
+  // 参数行实测结构：
+  //   div.container-* > div > [button(比例, textContent "3:42K"),
+  //                             button(张数, aria-label "Images to generate: 1"), …]
+  const readParams = () => evR("readParams", p.evaluate((sel) => {
+    const vis = (e) => e.getBoundingClientRect().width > 0;
+    const cnt = [...document.querySelectorAll(sel)].find(vis);
+    if (!cnt) return { count: "", ratio: "", resolution: "" };
+    const rb = [...cnt.parentElement.querySelectorAll("button")]
+      .find((b) => b !== cnt && /\dK$/i.test((b.textContent || "").trim()));
+    // 🔴 解析必须"档位只占一位数字 + K"：`3:4` + `2K` 的 textContent 是
+    // `3:42K`，写成 `(\d+K)$` 会把 `42K` 当档位（实测 got="3:"）。
+    const m = rb ? (rb.textContent || "").trim().match(/^(.+?)(\d(?:\.\d)?K)$/i) : null;
+    return {
+      // aria-label = "Images to generate: 1" ⇒ 取冒号后的数字
+      count: String(cnt.getAttribute("aria-label") || "").split(":").pop().trim(),
+      ratio: m ? m[1] : "",
+      resolution: m ? m[2] : "",
+    };
+  }, countSel), 12000).catch((e) => {
+    step(`readParams FAIL ${e.message}`);
+    return { count: "", ratio: "", resolution: "" };
+  });
+
+  const inImageMode = async () => !!(await readParams()).count;
+
+  // 提交成功后页面会跳到 `/ai-tool/generate`（结果页，没有 tab/参数行）——
+  // 那种状态只能**换页**（cookie 在 context 上，新页天然登录态）。
+  //
+  // 🔴 但**别急着换页**：首页加载是异步的，张数按钮要几秒才渲染出来。
+  // 之前"立刻判断 inImageMode 失败就关页重开"，等于每单都多开一个重页面，
+  // 两个 SG 首页在 8 核机器上互抢 CPU ⇒ 后续所有 evaluate 超时、UI 锁焊死
+  //（2026-10-29 实测，dryRun 连续挂死就是这条）。
+  // ⇒ 现在是「先等 → 点 tab → 再等 → 最后才换页」。
+  const waitCount = async (ms = 15000) => {
+    const dl = Date.now() + ms;
+    while (Date.now() < dl) {
+      if (await inImageMode()) return true;
+      await p.waitForTimeout(500);
+    }
+    return await inImageMode();
+  };
+
   let p = p0.p;
-  {
-    const hasCombo = await p.locator("[role=combobox]").first()
-      .isVisible().catch(() => false);
-    if (!hasCombo) {
+  step(`page ${p.url()}`);
+  // 🔴 tab 是受控组件：必须**真鼠标点击**（`el.click()` 只改视觉不改 state），
+  // 且单次不可靠（渲染慢/被遮挡）⇒ 点 → 校验 → 重试（最多 3 次）。
+  const clickTab = async () => {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const pos = await p.evaluate(() => {
+        const b = [...document.querySelectorAll("button")]
+          .find((x) => (x.textContent || "").trim() === "AI Image");
+        if (!b || b.getBoundingClientRect().width === 0) return null;
+        const r = b.getBoundingClientRect();
+        return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+      }).catch(() => null);
+      step(`tab click ${attempt} pos=${JSON.stringify(pos)}`);
+      if (pos) await p.mouse.click(pos.x, pos.y);
+      if (await waitCount(8000)) return true;
+    }
+    return false;
+  };
+
+  if (!(await waitCount(12000))) {
+    if (!(await clickTab())) {
+      step("换新标签页");
       const ctx = p.context();
       await p.close().catch(() => {});
       p = await ctx.newPage();
       page = p;                       // ← 关键：全局也要指向新 page
-      await p.goto("https://dreamina.capcut.com/ai-tool/image",
+      await p.goto("https://dreamina.capcut.com/ai-tool/home",
                    { waitUntil: "domcontentloaded", timeout: 60000 }).catch(() => {});
-      // 等**模型选择器真的出现**再返回（固定 4s 不够：实测点 click 会 5s 超时）
-      await p.waitForSelector("[role=combobox]", { timeout: 30000 }).catch(() => {});
-      await p.waitForTimeout(1500);
+      step(`goto done ${p.url()}`);
+      if (!(await waitCount(20000)) && !(await clickTab())) {
+        throw new Error("进不去 AI Image 模式（等不到张数按钮）—— 拒绝在未知模式下提交");
+      }
     }
   }
-  // ⚠️ 2026-10-19：这里**不要**加 `goto` 兜底 —— 实测加完会让后续 UI 流程
-  // 卡住（任务一直 in_progress 到 TASK_TIMEOUT）。页面位置由
-  // `ensureLogin()` 的 START_URL 保证；模型选择器不可见时宁可**报错不提交**。
-  // 🔴 模型/模式必须选 AI Image（默认 AI Agent 的提交不走
-  // aigc_draft/generate）。用「locate 坐标 → 真鼠标点击」模式：
-  // DOM 生命周期（React 重渲染）会让 locator.click 卡死，坐标不受影响。
-  await p.waitForSelector('[contenteditable="true"]', { timeout: 30000 });
-  // 🔴 2026-10-19：单次点击不可靠 —— 上一轮结束后页面停在 `/ai-tool/home`，
-  // 那里**没有模型选择器**；点一次 "AI Image" 有时不生效（渲染慢/被遮挡），
-  // 后面就报"模型选择器不可见"。改成**点 → 校验 → 重试**（最多 3 次）。
-  for (let attempt = 0; attempt < 3; attempt++) {
-    const ready = await p.locator("[role=combobox]").first()
-      .isVisible().catch(() => false);
-    if (ready) break;
-    const tabPos = await p.evaluate(() => {
-      const span = [...document.querySelectorAll("span,div")]
-        .find((e) => e.childElementCount === 0
-                      && e.textContent.trim() === "AI Image");
-      if (!span) return null;
-      const r = span.getBoundingClientRect();
-      return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
-    });
-    if (tabPos) {
-      await p.mouse.click(tabPos.x, tabPos.y);
-    }
-    await p.waitForTimeout(1500);
-  }
-  // 🔴 参数面板**必须先打开**：模型选择器也在面板里 —— 面板折叠时它不可见，
-  // 旧代码的 `if (await combo.isVisible())` 会直接跳过 ⇒ 模型根本没换。
-  // 这是 2026-10-19 线上事故的**第二个成因**（第一个是 body 里 model 为空）。
-  // 面板可能是"已开"状态（上次任务留下的），再点一次会**关掉**它 ⇒ 先判。
-  const ensurePanel = async () => {
-    const open = await p.evaluate(() => {
-      const f = document.querySelector("[class*='generate-count-field']");
-      return !!(f && f.getBoundingClientRect().width > 0);
-    }).catch(() => false);
-    if (open) return;
-    await p.evaluate(() => {
-      const b = [...document.querySelectorAll("button")]
-        .find((x) => /2K/.test(x.textContent || "")
-                      && x.getBoundingClientRect().width > 0);
-      if (b) b.click();
-    });
-    await p.waitForTimeout(900);
+  // ⚠️ 这里**不要**加 `goto` 兜底 —— 实测加完会让后续 UI 流程卡住
+  //（任务一直 in_progress 到 TASK_TIMEOUT）。页面位置由 `ensureLogin()` 的
+  // START_URL 保证；状态不对宁可**报错不提交**。
+  // 🔴 比例 / 张数：新 UI 都是「点参数行按钮 → 弹层里点 `LABEL.lv-radio`」。
+  // 弹层 DOM 是 `.lv-popover-content`（页面上会残留历史节点）⇒ 取**最后一个
+  // 可见的**；选项是受控 radio，`.click()` 只改视觉不改 React state
+  //（2026-10-19 实测：读回 1、提交出去还是 4）⇒ **一律真鼠标点坐标**。
+  const popoverPick = (want) => evR("popoverPick", p.evaluate((w) => {
+    const vis = (e) => e.getBoundingClientRect().width > 0;
+    const pops = [...document.querySelectorAll(".lv-popover-content")].filter(vis);
+    const pop = pops[pops.length - 1];
+    if (!pop) return null;
+    const lab = [...pop.querySelectorAll("label.lv-radio")]
+      .find((e) => (e.textContent || "").trim() === w
+                   && e.getBoundingClientRect().width > 0);
+    if (!lab) return null;
+    const r = lab.getBoundingClientRect();
+    return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+  }, String(want)), 12000).catch((e) => {
+    step(`popoverPick FAIL ${e.message}`);
+    return null;
+  });
+
+  // 比例按钮 = 张数按钮的**前一个兄弟**（同父节点内，文本以档位 `2K/4K` 结尾）
+  const openRatioBtn = () => evR("openRatioBtn", p.evaluate((sel) => {
+    const vis = (e) => e.getBoundingClientRect().width > 0;
+    const cnt = [...document.querySelectorAll(sel)].find(vis);
+    if (!cnt) return null;
+    const rb = [...cnt.parentElement.querySelectorAll("button")]
+      .find((b) => b !== cnt && /\dK$/i.test((b.textContent || "").trim()));
+    if (!rb) return null;
+    const r = rb.getBoundingClientRect();
+    return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+  }, countSel), 12000).catch((e) => {
+    step(`btn FAIL ${e.message}`);
+    return null;
+  });
+
+  const openCountBtn = () => evR("openCountBtn", p.evaluate((sel) => {
+    const vis = (e) => e.getBoundingClientRect().width > 0;
+    const b = [...document.querySelectorAll(sel)].find(vis);
+    if (!b) return null;
+    const r = b.getBoundingClientRect();
+    return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+  }, countSel), 12000).catch((e) => {
+    step(`btn FAIL ${e.message}`);
+    return null;
+  });
+
+  const closePopover = async () => {
+    await p.keyboard.press("Escape").catch(() => {});
+    await p.waitForTimeout(300);
   };
-  if (ratio || resolution || count || model) {
-    await ensurePanel();
-  }
-  // 🔴 模型选择：参数行 combobox（当前值如 "GPT Image 2.5 Sunburst"）。
+
+  // 🔴 模型选择：参数行 combobox（当前值如 "Seedream 5.0 Lite"）。
   //
   // 🔴 2026-10-19 实测事故：原来用 `p.getByText(model)` **全局**找选项 ——
   // 它会命中页面上任意同名文本（模型介绍卡、历史记录…），点完下拉直接关掉，
   // 模型**没换**。线上 n=1 测试就这么静默跑了 `dreamina_gpt_image_2_5_flare`
   // （实扣 51/张），而调用方以为在用 Lite（36/张）。
-  // ⇒ 三条修正：① 面板先打开；② 只在**下拉弹层内**找选项；③ 选完**读回校验**，
-  //    对不上就抛错（没提交 = 不花钱，比"用错模型扣钱"好得多）。
+  // ⇒ 三条修正：① 先确保在图片模式（上面已做）；② 只在**下拉弹层内**找选项；
+  //    ③ 选完**读回校验**，对不上就抛错（没提交 = 不花钱，比"用错模型扣钱"好得多）。
+  // 2026-10-29 改版后 combobox 仍在（默认 `Seedream 5.0 Lite`），选项文本不变。
+  step(`mode=image params=${JSON.stringify(await readParams())}`);
   if (model) {
     const combo = p.locator("[role=combobox]").first();
     if (!(await combo.isVisible().catch(() => false))) {
@@ -286,11 +408,13 @@ async function generateUiCore({ prompt, model, resolution, ratio, count }) {
           || document.querySelector("[class*='lv-select-popup']")
           || document.querySelector("[class*='select-popup']");
         const root = lb || document;
-        const nodes = [...root.querySelectorAll("[role=option],li,div,span")]
-          .filter((e) => e.childElementCount === 0
-                         && e.getBoundingClientRect().width > 0);
-        const el = nodes.find((e) => (e.textContent || "").trim() === want)
-          || nodes.find((e) => (e.textContent || "").includes(want));
+        // 先按**文本**筛（textContent 不触发布局），再对候选量尺寸
+        const all = [...root.querySelectorAll("[role=option],li,div,span")]
+          .filter((e) => e.childElementCount === 0);
+        const cand = all.filter((e) => (e.textContent || "").trim() === want);
+        const el = cand.find((e) => e.getBoundingClientRect().width > 0)
+          || all.filter((e) => (e.textContent || "").includes(want))
+            .find((e) => e.getBoundingClientRect().width > 0);
         if (!el) return false;
         el.click();
         return true;
@@ -303,72 +427,68 @@ async function generateUiCore({ prompt, model, resolution, ratio, count }) {
       }
     }
   }
-  // 🔴 比例/档位都在**参数面板**里（点参数行的档位按钮才渲染——实测
-  // 面板不开时控件不在 DOM）。比例 = 面板顶部格子（SPAN 叶子，文本
-  // "1:1"/"16:9"/…）；档位 = radiogroup 的 radio（value 1k/2k/4k）。
-  if (ratio || resolution || count) {
-    // 🔴 选模型会让参数面板重渲染/关闭 ⇒ 这里必须再确保一次打开，
-    // 否则比例/档位/张数全在"面板不在 DOM"的状态下静默失败
-    //（2026-10-19 实测：模型选对了、张数没选上，出了 4 张 = 144）。
-    await ensurePanel();
-    if (ratio) {
-      await p.evaluate((want) => {
-        const span = [...document.querySelectorAll("span")]
-          .find((e) => e.childElementCount === 0
-                        && e.textContent.trim() === want);
-        if (span) (span.closest("button") || span).click();
-      }, String(ratio)).catch(() => {});
-      await p.waitForTimeout(500);
-    }
-    if (resolution) {
-      await p.evaluate((want) => {
-        const radio = [...document.querySelectorAll('[role=radio]')]
-          .find((r) => r.getAttribute("value") === want);
-        if (radio) radio.click();
-      }, String(resolution)).catch(() => {});
-      await p.waitForTimeout(500);
-    }
-    // 🔴 2026-10-19：张数（"Images to generate"，1..8 的 radio-group）。
-    // 不选就按面板默认 4 张出图 —— 国际站 36/张，4 张 = 144，
-    // 调用方要 1 张时等于多花 3 倍。实测 DOM：
-    //   [class*='generate-count-field'] > .lv-radio-group（选项是叶子节点文本 1..8）
-    if (count) {
-      // 🔴 必须用**真实鼠标点击**（坐标），不能用 `el.click()`：
-      // 这是受控的 radio-group，`.click()` 只改视觉、不改 React state
-      // —— 实测现象：读回显示已变 1，提交出去的 `gen_count` 仍是 4。
-      const pos = await p.evaluate((want) => {
-        const field = document.querySelector("[class*='generate-count-field']");
-        if (!field) return null;
-        const el = [...field.querySelectorAll("span,div,label")]
-          .find((e) => e.childElementCount === 0
-                       && (e.textContent || "").trim() === String(want)
-                       && e.getBoundingClientRect().width > 0);
-        if (!el) return null;
-        const r = el.getBoundingClientRect();
-        return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
-      }, String(count)).catch(() => null);
-      if (!pos) throw new Error(`张数控件找不到 ${count}`);
-      await p.mouse.click(pos.x, pos.y);
-      await p.waitForTimeout(600);
-      // 档位/模型的重渲染可能把张数冲掉 ⇒ 读回不符就再点一次（最多 3 轮）
-      for (let attempt = 0; attempt < 2; attempt++) {
-        const cur = await p.evaluate(() => {
-          const el = document.querySelector("[class*='generate-count-content']");
-          return el ? (el.textContent || "").trim() : "";
-        }).catch(() => "");
-        if (cur === String(count)) break;
-        await p.mouse.click(pos.x, pos.y);
+  // 比例：点参数行按钮 → 弹层点 `16:9` 之类 → 读回按钮第一行校验
+  if (ratio) {
+    step(`ratio want=${ratio}`);
+    let got = (await readParams()).ratio;
+    for (let attempt = 0; attempt < 3 && got !== String(ratio); attempt++) {
+      const btn = await openRatioBtn();
+      step(`ratio#${attempt} btn=${JSON.stringify(btn)}`);
+      if (!btn) break;
+      await p.mouse.click(btn.x, btn.y);
+      await p.waitForTimeout(800);
+      const opt = await popoverPick(ratio);
+      step(`ratio#${attempt} opt=${JSON.stringify(opt)}`);
+      if (opt) {
+        await p.mouse.click(opt.x, opt.y);
         await p.waitForTimeout(700);
       }
-      // 🔴 读回校验：张数没选上就**别提交**（UI 默认 4 张 = 3 倍成本）
-      const gotCount = await p.evaluate(() => {
-        const el = document.querySelector("[class*='generate-count-content']");
-        return el ? (el.textContent || "").trim() : "";
-      }).catch(() => "");
-      if (gotCount !== String(count)) {
-        throw new Error(`张数选择失败：want=${count} got=${gotCount || "?"}`);
-      }
+      await closePopover();
+      got = (await readParams()).ratio;
+      step(`ratio#${attempt} got=${got}`);
     }
+    if (got !== String(ratio)) {
+      throw new Error(`比例选择失败：want=${ratio} got=${got || "?"}`);
+    }
+  }
+  // 🔴 张数（"Images to generate"，1..8）：不选就按 UI 默认出 **4 张** ——
+  // 国际站 36/张，4 张 = 144，也就是"调用方要 1 张、我们却花 4 倍的钱"。
+  // ⇒ 读回不符**绝不提交**。读回源 = 按钮的 `aria-label="Images to generate: N"`。
+  //
+  // ⚠️ **档位（2K/4K）刻意不碰**：服务端也不传 resolution
+  //（`service.py` 的 `_submit_via_bridge` 里记着实测：点档位会触发重渲染、
+  //  把张数重置回 4，n=1 被吃掉）。默认档就是 2K。
+  if (count) {
+    step(`count want=${count}`);
+    step("count readParams...");
+    let got = (await readParams()).count;
+    step(`count current=${got}`);
+    for (let attempt = 0; attempt < 3 && got !== String(count); attempt++) {
+      const btn = await openCountBtn();
+      step(`count#${attempt} btn=${JSON.stringify(btn)}`);
+      if (!btn) break;
+      await p.mouse.click(btn.x, btn.y);
+      await p.waitForTimeout(800);
+      const opt = await popoverPick(count);
+      step(`count#${attempt} opt=${JSON.stringify(opt)}`);
+      if (opt) {
+        await p.mouse.click(opt.x, opt.y);
+        await p.waitForTimeout(700);
+      }
+      await closePopover();
+      got = (await readParams()).count;
+      step(`count#${attempt} got=${got}`);
+    }
+    if (got !== String(count)) {
+      throw new Error(`张数选择失败：want=${count} got=${got || "?"}`);
+    }
+  }
+  // 🧪 dryRun：只跑到"参数选完 + 读回校验通过"就返回，**不键入、不提交**
+  //（零积分）—— 给 `/debug/ui-params` 用，改版适配期靠它做无成本回归。
+  if (dryRun) {
+    const got = await readParams();
+    step(`dryRun done ${JSON.stringify(got)}`);
+    return got;
   }
   const comp = p.locator('[contenteditable="true"]').first();
   await comp.click({ force: true, timeout: 10000 });
@@ -425,18 +545,54 @@ app.post("/generate-ui", async (req, res) => {
 // 🔴 UI 互斥锁：同一 page 同时只能跑一个 UI 流程 —— 并发任务的
 // 面板点击/键入互相污染（实测 4 连发时比例错乱：1:1 和 16:9 都出了
 // 上一任务的 3:4）。后来者排队等前一个完成。
-let _uiBusy = null;
+let _uiBusy = false;
+let _uiBusySince = 0;
+//: 僵尸流程最多占用 UI 多久（超过就强制放锁）。页面渲染进程被堵住时
+//: `page.evaluate` 不会返回 ⇒ 没有这个看门狗，一次卡死会把**所有**后续
+//: 派发焊在锁上（2026-10-29 实测：连续 6 次调用全部 60s 超时，日志一行没有）。
+const UI_LOCK_MAX = 240 * 1000;
 async function withUiLock(fn) {
-  while (_uiBusy) { await _uiBusy.catch(() => {}); }
-  let release;
-  _uiBusy = new Promise((r) => { release = r; });
+  while (_uiBusy) {
+    if (Date.now() - _uiBusySince > UI_LOCK_MAX) {
+      console.log("[sg-bridge] UI 锁持有超时（僵尸流程），强制释放");
+      _uiBusy = false;
+      break;
+    }
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  _uiBusy = true;
+  _uiBusySince = Date.now();
+  console.log("[ui] lock acquired");
   try {
     return await fn();
   } finally {
-    release();
-    _uiBusy = null;
+    _uiBusy = false;
+    console.log("[ui] lock released");
   }
 }
+
+// 🧪 无提交探针：跑完整套「进图片模式 → 选模型/比例/张数 → 读回校验」，
+// 但**不键入 prompt、不点发送** ⇒ 零积分。SG 前端改版后先打它，
+// 读回值对得上再放真实任务进来（2026-10-29 改版适配就是靠它验证的）。
+app.post("/debug/ui-params", async (req, res) => {
+  const { model, ratio, count = 1, timeoutMs = 120000 } = req.body || {};
+  try {
+    // 🔴 硬超时：UI 流程里任何一步卡住（页面重渲染/弹层没关）都会让请求
+    // 无限挂起，而 `withUiLock` 没有超时 ⇒ 后面所有请求排在锁上一起挂。
+    // 2026-10-29 实测踩过：一次 dryRun 挂了 3 分钟，把锁焊死。
+    console.log("[ui] dryRun requested");
+    const got = await Promise.race([
+      withUiLock(() => generateUiCore({
+        prompt: "", model, ratio, count, dryRun: true })),
+      new Promise((_r, rej) => setTimeout(
+        () => rej(new Error(`dryRun 超时 ${timeoutMs}ms`)), timeoutMs)),
+    ]);
+    return res.json({ ok: true, got });
+  } catch (e) {
+    console.log(`[ui] dryRun 失败：${String(e).slice(0, 200)}`);
+    return res.status(502).json({ ok: false, error: String(e).slice(0, 300) });
+  }
+});
 
 // 🔱 异步入口（jimeng-service 派发线程用）：立即返回 handle，UI 流程后台跑。
 // 派发线程 20s+ 的 UI 流程会阻塞 WORKERS=1 的串行派发 —— 绝不能同步等。

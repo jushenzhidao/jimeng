@@ -34,16 +34,23 @@ def test_service_forwards_count_to_bridge():
 def test_bridge_js_can_pick_image_count():
     """`bridge.js` 的 UI 流程必须能选 "Images to generate"。
 
-    选择器依据（2026-10-19 实测 DOM）：
-      `[class*='generate-count-field']` 里是 1..8 的叶子节点文本。
-    上游改版时这里会红 —— 那时按新 DOM 改选择器即可（别删断言）。
+    选择器依据（2026-10-29 实测 DOM —— SG 前端改版后**换了形态**）：
+      · 图片模式 = 首页上的 `AI Image` tab（`button` 文本，点完 URL 变 `?type=image`）；
+      · 张数按钮 = `button[aria-label^="Images to generate"]`（文本 `1 image`），
+        点开的 popover 里是 `label.lv-radio` 1..8，读回值也是这个 aria-label。
+    旧形态（`[class*='generate-count-field']`）已从 DOM 消失，线上 793 单
+    死在「张数控件找不到」。上游再改版时这里会红 —— 按新 DOM 改选择器即可。
     """
     src = (ROOT / "sg-bridge" / "bridge.js").read_text(encoding="utf-8")
-    assert "generate-count-field" in src, "bridge.js 没有张数控件选择器"
-    assert "generateUiCore({ prompt, model, resolution, ratio, count })" in src, \
-        "generateUiCore 的入参少了 count"
-    assert "ratio || resolution || count" in src, \
-        "只传 count 时也必须打开参数面板，否则控件不在 DOM 里"
+    assert 'aria-label^="Images to generate"' in src, "bridge.js 没有张数按钮选择器"
+    assert "label.lv-radio" in src, "张数/比例选项必须在 popover 的 radio 里点"
+    assert "inImageMode" in src and '"AI Image"' in src, \
+        "进图片模式的判据/tab 点击不能删（AI Agent 模式也有 combobox，会误判）"
+    assert "张数选择失败" in src, "张数读回校验不能删（默认 4 张 = 4 倍成本）"
+    assert "ratio, count," in src, "generateUiCore 的入参少了 count"
+    #: 无提交探针：改版适配/回归都靠它（零积分）
+    assert "/debug/ui-params" in src and "dryRun" in src, \
+        "缺少零积分的参数探针，改版后无法在不花钱的前提下验证"
 
 
 def test_bridge_submit_falls_back_to_default_model():
