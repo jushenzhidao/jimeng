@@ -3019,13 +3019,23 @@ class Service:
                 param="video")
         return blob
 
-    def _transfer_one(self, blob: Any) -> tuple[str, list[str], int]:
+    def _transfer_one(self, blob: Any,
+                      uploader: Any = None) -> tuple[str, list[str], int]:
         """归一化 + 上传**一张**，返回 (uri, 降级说明, 字节数)。
 
         可被多线程并发调用。安全性依据（两处都已在别处钉过）：
           · `JimengUploader.token()` 是**双检锁** —— 并发 N 张只会取一次 STS，
             不会退化成"每张各签一次"（`upload.py` 的模块注释里记着实测）；
           · 上传走 `httpx.Client`，它对并发请求是线程安全的。
+
+        🔴 **`uploader` 必须由调用方显式传进来**（2026-10-29 线上事故）。
+        `self.uploader` 读的是 `_cur_cred()`，而凭据上下文是**每线程一份**的栈
+        （见 `_cred_stack_now`）。多张垫图走 `ThreadPoolExecutor` 时，worker 线程
+        的栈是**空的** ⇒ 回落到 `_default_cred`，而生产的 `_default_cred` 恒为
+        `None`（凭据是每个请求的 Bearer 带的，`Service(settings)` 不注入）⇒
+        `AttributeError: 'NoneType' object has no attribute 'upload'`。
+        测试里注入过默认 uploader，所以这条**在测试里永远绿**——线上两天 111 单
+        全部是多图（≥2 张）任务。
 
         ## 🔴 为什么这里要单独退避重试
 
@@ -3037,11 +3047,15 @@ class Service:
         **风控（`retryable=False`）立刻抛出** —— 持续施压只会延长标记，
         重试反而是帮倒忙。`normalize` 也放在循环**外**：同一份字节不该重复算。
         """
+        up = uploader if uploader is not None else self.uploader
+        if up is None:                      # pragma: no cover - 防御：派发前已挡
+            raise CapabilityUnavailableError(
+                "本次任务没有可用的上游凭据，无法上传输入图", upstream="jimeng")
         norm = normalize(blob, self.settings)
         delay = 0.5
         for attempt in range(1, UPLOAD_MAX_ATTEMPTS + 1):
             try:
-                uri = self.uploader.upload(norm.data)   # type: ignore[union-attr]
+                uri = up.upload(norm.data)
                 if attempt > 1:
                     OBS.info("upload retried ok", attempt=attempt)
                 return uri, list(norm.notes), norm.size
@@ -3062,6 +3076,11 @@ class Service:
         多张时用线程池并发，但用 `Executor.map`（**保序**），
         绝不是"谁先传完谁排前面"。
 
+        🔴 **uploader 在这里取一次，再显式传给 `_transfer_one`**（2026-10-29）：
+        凭据上下文是**每线程一份**的栈，线程池的 worker 线程里拿不到 ⇒ 会回落到
+        `_default_cred`（生产恒为 None）⇒ 多图任务全挂 `AttributeError`。
+        详见 `_transfer_one` 的 docstring。
+
         张数上限已在受理时校验（`Capability.max_images`），所以这里可以放心地
         "来几张传几张"；不会出现"下载了 N 张只用第 1 张"那种静默浪费。
 
@@ -3073,7 +3092,10 @@ class Service:
         守卫（host + hex key）与代价见 `media.reuse_image_uri`；
         可复用的与需要搬运的可以混在一批里，**顺序照旧按 `image_refs` 回填**。
         """
-        assert self.uploader is not None
+        up = self.uploader
+        if up is None:
+            raise CapabilityUnavailableError(
+                "本次任务没有可用的上游凭据，无法上传输入图", upstream="jimeng")
         started = time.monotonic()
         reused = [reuse_image_uri(r) for r in rec.image_refs]
         pending = [r for r, u in zip(rec.image_refs, reused) if u is None]
@@ -3085,14 +3107,16 @@ class Service:
             blobs = load_images(pending, self.settings)
             if len(blobs) <= 1:
                 # 单张：不值得为一次调用付线程池的钱；顺带 `last_cached` 此时是准确的
-                results = [self._transfer_one(b) for b in blobs]
-                cached = self.uploader.last_cached
+                results = [self._transfer_one(b, up) for b in blobs]
+                cached = up.last_cached
             else:
                 # 🔴 多张**并发**：用 `Executor.map`（**保序**），
                 # 绝不是"谁先传完谁排前面"。
+                # 🔴 `up` 必须**闭包带进 worker 线程**（见上方 docstring）。
                 parallel = min(len(blobs), MAX_UPLOAD_PARALLELISM)
                 with ThreadPoolExecutor(max_workers=parallel) as pool:
-                    results = list(pool.map(self._transfer_one, blobs))
+                    results = list(pool.map(
+                        lambda b: self._transfer_one(b, up), blobs))
                 # ⚠️ 并发下 `last_cached` 是**共享字段**，取值不可靠 ⇒ 不报它。
                 cached = None
             notes = [n for _, ns, _ in results for n in ns]
@@ -3373,7 +3397,12 @@ class Service:
         # 直出路径一直是 `or DEFAULT_MODEL`，这里对齐。
         model = rec.upstream_model or DEFAULT_MODEL
         display = models.UPSTREAM_WEB_NAMES.get(model, model) or model
-        w, h = (int(x) for x in (rec.size or "2048x2048").split("x"))
+        #: 🔴 2026-10-29 线上实测：调用方把 `size` 填成**档位串**（`"2K"`）是
+        #: 合法请求 —— `parse_size` 早就接受 `1k/1.5k/2k/4k` 并按 1:1 展开
+        #: （2026-10-14 用户口径）。这里原先手写 `int(x) for x in size.split("x")`，
+        #: 于是 `size="2K"` 直接 `ValueError: invalid literal for int() with base 10: '2K'`
+        #: 被记成"未预期的内部错误"（线上 10 单）—— **和参数校验用的是两套解析**。
+        w, h = parse_size(rec.size or "2048x2048")
         # 🔴 bridge 生成腿**恒 2k 直出**（2026-10-16 口径"1-2k 定向到2k
         # 即可"）：1k/2k 请求都按 2k 交付（1k 档 UI 自动化的坑就此绕开）；
         # 4k 请求已由改道块把生成腿定为 2k，交付 4096 由超分链补。

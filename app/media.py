@@ -30,8 +30,9 @@ from .errors import InvalidParameterError, UpstreamUnavailableError
 #: 并发 4 对 10 张只是分三波，下载是纯网络等待、并发收益接近线性，够用。
 MAX_DOWNLOAD_PARALLELISM = 4
 
-#: 上游产物 URL 的形态（实测）：
-#:   https://p26-dreamina-sign.byteimg.com/tos-cn-i-tb4s082cfz/<32位hex>~tplv-...png?x-signature=...
+#: 上游产物 URL 的形态（实测，**两个站各一条**）：
+#:   CN: https://p26-dreamina-sign.byteimg.com/tos-cn-i-tb4s082cfz/<32位hex>~tplv-...png?x-signature=...
+#:   SG: tos-alisg-i-wopfjsm1ax-sg/<32位hex>
 #: 而草稿要的 `image_uri` 就是 `<space>/<key>` —— 上传流程产出的也是**同一形态**：
 #:   `tos-cn-i-tb4s082cfz/e103c9b4f36543cbbdce65a42f8acaf3`（见 submit 回执的 resources.key）
 #: ⇒ 所以"把上一次的产物当下一次输入"时，**整段下载+归一化+上传都能跳过**。
@@ -40,9 +41,19 @@ MAX_DOWNLOAD_PARALLELISM = 4
 #:   · **必须限定 host**：只看路径的话，任意站点上一个恰好长这样的路径都会被认成
 #:     我们的资产 —— 于是拿着一个不存在的 key 去建任务；
 #:   · **key 必须是 hex**：挡住 `/tos-cn-i-x/../../etc` 这类路径穿越式的怪值。
+#:
+#: 🔴 2026-10-29：**空间前缀必须两个站都认**。原先写死 `tos-cn-i-`，而国际站上传
+#: 回执是 `tos-alisg-i-<space>-sg/<hex>`（`<space>` 本身带连字符）⇒ 这里返回 None
+#: ⇒ 重试时把**上游自己的 uri** 当外链去下载 ⇒ `load_one` 判定"既不是 URL 也不是
+#: data URI/base64" ⇒ 抛出 `image 需为 http(s) URL、data URI 或 base64 字符串`。
+#: 后果是**把上游真错（SG 写接口 `ret=-6 shark not pass reject`）整段盖住**，
+#: 线上两天 644 单被读成"调用方参数错"（排查方向完全跑偏）。
+#: ⇒ 认的空间前缀 = 只认**这两个站**（`cn` / `alisg`），不做"任意 region"的通配：
+#: 认错了会拿一个不存在的 key 去建任务，宁严勿松。
 _TOS_HOST_SUFFIX = ".byteimg.com"
 _TOS_ASSET_RE = re.compile(
-    r"^/?(?P<uri>tos-cn-i-[a-z0-9]+/(?P<key>[0-9a-fA-F]{16,}))(?:~|\?|$)")
+    r"^/?(?P<uri>tos-(?:cn|alisg)-i-[a-z0-9]+(?:-[a-z0-9]+)*/"
+    r"(?P<key>[0-9a-fA-F]{16,}))(?:~|\?|$)")
 
 
 def reuse_image_uri(ref: str) -> str | None:
@@ -57,18 +68,19 @@ def reuse_image_uri(ref: str) -> str | None:
 
     ## 守卫与代价
 
-    - 只认 `<hex>.byteimg.com` 下的 `tos-cn-i-<space>/<16+ 位 hex>` 路径，其余一律
-      走原路（下载+上传）。**不猜、不宽松匹配** —— 认错了会拿一个不存在的 key 去建任务。
+    - 只认 `<hex>.byteimg.com` 下的 `tos-cn-i-<space>/<16+ 位 hex>`（国内站）与
+      `tos-alisg-i-<space>-sg/<16+ 位 hex>`（国际站）路径，其余一律走原路
+      （下载+上传）。**不猜、不宽松匹配** —— 认错了会拿一个不存在的 key 去建任务。
     - 复用时**拿不到原图字节**，所以"magic bytes / 体积上限"这两道校验做不了；
       对象不存在的话会在**建任务**那一步暴露（上游拒绝或任务失败）。
     """
     text = (ref or "").strip()
     #: 🔴 2026-10-21：**裸 `image_uri` 也必须认**。`task.image_refs` 现在会在
-    #: 首次派发成功后替换成上传回执里的 `tos-cn-i-<space>/<key>`（见
+    #: 首次派发成功后替换成上传回执里的 `<space>/<key>`（见
     #: `Service._prepare_input_images`）—— 那是一条**没有 host 的裸路径**。
     #: 改动前这里只认 `http(s)://…byteimg.com/…`，于是重试时会把裸 uri 当外链
     #: 去下载 ⇒ 直接失败 ⇒ **把一次可重试的失败变成必然失败**。
-    #: 守卫不变（同一份 `_TOS_ASSET_RE`：限定 `tos-cn-i-<space>/<16+ hex>`）。
+    #: 守卫不变（同一份 `_TOS_ASSET_RE`：限定空间前缀 + `<16+ hex>`）。
     if text.lower().startswith("tos-"):
         m = _TOS_ASSET_RE.match(text)
         return m.group("uri") if m else None

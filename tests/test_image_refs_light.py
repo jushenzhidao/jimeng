@@ -38,6 +38,10 @@ PNG_DIGEST = "sha256:" + hashlib.sha256(PNG_BYTES).hexdigest()
 #: 上游 `image_uri` 的真实形态（`<space>/<32 位 hex>`，见 media 模块注释）
 BARE_URI = "tos-cn-i-tb4s082cfz/" + "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"
 
+#: 🔴 **国际站**（SG）上传回执的形态 —— 空间前缀是 `tos-alisg-i-<space>-sg`，
+#: 取自线上真实行：`tasks.image_refs = ["tos-alisg-i-wopfjsm1ax-sg/<32 hex>"]`。
+BARE_URI_SG = "tos-alisg-i-wopfjsm1ax-sg/" + "60ec172d5dda4e208660156a98532e97"
+
 
 # ---------------------------------------------------------------------------
 # 受理期：摘要落库（原文照旧，因为还不知道上游 uri）
@@ -141,11 +145,30 @@ def test_reuse_image_uri_accepts_bare_uri():
     assert reuse_image_uri(BARE_URI) == BARE_URI
 
 
+def test_reuse_image_uri_accepts_sg_bare_uri():
+    """🔴 **国际站**的裸 uri 也必须被认出来（2026-10-29 线上事故）。
+
+    原先 `_TOS_ASSET_RE` 写死 `tos-cn-i-`，而国际站上传回执是
+    `tos-alisg-i-<space>-sg/<hex>` ⇒ 返回 None ⇒ 重试时把这个**上游自己的 uri**
+    当外链去下载 ⇒ `load_one` 判定"既不是 URL 也不是 base64" ⇒ 抛出
+    `image 需为 http(s) URL、data URI 或 base64 字符串` ——
+    **把上游真错（SG 写接口 `ret=-6 shark not pass reject`）整段盖住**，
+    两天 644 单被记成"调用方参数错"，排查方向完全跑偏。
+
+    这条用例就是那个缺口：原先只覆盖 CN 前缀，SG 空间**从来没被测过**。
+    """
+    assert reuse_image_uri(BARE_URI_SG) == BARE_URI_SG
+
+
 def test_reuse_image_uri_rejects_lookalikes():
     """守卫不放宽：路径穿越 / 非 hex key / 别的桶一律不认。"""
     assert reuse_image_uri("tos-cn-i-x/../../etc/passwd") is None
     assert reuse_image_uri("tos-cn-i-x/short") is None
     assert reuse_image_uri("https://evil.example.com/tos-cn-i-x/" + "a" * 32) is None
+    #: 空间前缀只认 `cn` / `alisg` 两个站 —— 不做"任意 region"通配
+    assert reuse_image_uri("tos-us-i-bucket/" + "a" * 32) is None
+    assert reuse_image_uri("tos-alisg-i-bucket/../../etc/passwd") is None
+    assert reuse_image_uri("tos-alisg-i-bucket/short") is None
 
 
 # ---------------------------------------------------------------------------

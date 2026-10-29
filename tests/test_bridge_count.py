@@ -59,6 +59,52 @@ def test_bridge_submit_falls_back_to_default_model():
         "必须兜底：跑 bridge 的 body 里 model 不能是空串"
 
 
+def test_bridge_accepts_tier_size_string(settings, store, monkeypatch):
+    """`size="2K"` 必须能被 bridge 路径解析（2026-10-29 线上 `ValueError`）。
+
+    调用方按 OpenAI 风格把 `size` 填成**档位串**是合规请求 —— `parse_size`
+    早就接受 `1k/1.5k/2k/4k` 并按 1:1 展开（2026-10-14 用户口径）。
+    而 `_submit_via_bridge` 原先手写 `int(x) for x in size.split("x")`，
+    跟参数校验用的是**两套解析** ⇒ `int("2K")` 抛
+    `ValueError: invalid literal for int() with base 10: '2K'`，
+    被记成"未预期的内部错误"（线上 10 单）。
+    """
+    import httpx
+
+    from app.store import TaskRecord
+
+    seen: dict = {}
+
+    class _R:
+        status_code = 200
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {"ok": True, "handle": "h-1"}
+
+    def _fake_post(url, **kw):
+        seen["url"] = url
+        seen["body"] = kw["json"]
+        return _R()
+
+    monkeypatch.setattr(httpx, "post", _fake_post)
+    svc = Service(settings.replace(sg_bridge_url="http://sg-bridge:8300"),
+                  store=store)
+    rec = store.put(TaskRecord(
+        task_id="jimeng_size_tier", credential_id="cred-a", model="jimeng-t2i",
+        cap_key="jimeng:t2i", status="queued", prompt="p", size="2K", n=1,
+        created_at=0, updated_at=0))
+
+    sid = svc._submit_via_bridge(rec)
+
+    assert sid == "bridge:h-1"
+    assert seen["body"]["ratio"] == "1:1", \
+        f"档位串没被展开成像素：{seen['body']}"
+    assert seen["body"]["count"] == 1
+
+
 def test_sg_i2i_upload_signs_with_passed_region():
     """国际站上传的 AWS4 **密钥推导**必须用传入的 region（2026-10-19）。
 

@@ -167,6 +167,41 @@ def test_prepare_input_images_preserves_order_despite_out_of_order_completion(
     assert uris == expected, f"顺序没保住：实得 {uris}，应为 {expected}"
 
 
+def test_multi_image_upload_works_without_injected_default_creds(
+        settings, store, fake_uploader, fake_jimeng):
+    """🔴 **生产形态**（不注入默认凭据）下，多张垫图的上传也必须成功。
+
+    2026-10-29 线上事故：`self.uploader` 读的是**每线程一份**的凭据栈
+    （`_cred_stack_now`）。多图走 `ThreadPoolExecutor` ⇒ worker 线程的栈是空的
+    ⇒ 回落到 `_default_cred`；而生产的 `_default_cred` **恒为 None**
+    （凭据由每个请求的 Bearer 带来，`Service(settings)` 什么都不注入）⇒
+    `AttributeError: 'NoneType' object has no attribute 'upload'`，
+    线上两天 **111 单**（全部是 ≥2 张垫图的任务）判死。
+
+    ⚠️ 为什么以前的用例抓不到：`service` 夹具把 uploader 注入了**默认那套**，
+    worker 线程回落到默认值照样拿得到 ⇒ 这条缺陷在测试里是**结构性隐身**的。
+    所以这里必须显式构造 `Service(settings, store=store)`（零注入），
+    再用 `_push_cred` 模拟派发期的换入 —— 与生产 `_run_dispatch` 同一条路。
+    """
+    svc = Service(settings.replace(normalize_uploads=False), store=store)
+    refs = [_data_uri(b) for b in _PNGS[:3]]
+    rec = store.put(TaskRecord(
+        task_id="jimeng_thread_cred_test", credential_id="cred-a",
+        model="jimeng-i2i", cap_key="jimeng:i2i", status="queued", prompt="p",
+        image_refs=refs, size="2048x2048", n=1, created_at=0, updated_at=0))
+
+    svc._push_cred(fake_jimeng, fake_uploader, None, None, rec)
+    try:
+        uris = svc._prepare_input_images(rec)
+    finally:
+        svc._pop_cred()
+
+    assert len(uris) == 3, f"三张垫图没有全部上传：{uris}"
+    assert len(set(uris)) == 3, "三张各自换到不同的 uri"
+    assert store.get(rec.task_id).image_refs == uris, \
+        "派发后 image_refs 必须换成上游 uri（省空间那一刀）"
+
+
 def test_multi_image_uploads_run_in_parallel(
         client, client_state, fake_jimeng, fake_uploader, service):
     """多张垫图的上传**并发**跑 —— 用**计数**判定，不掐墙钟。
