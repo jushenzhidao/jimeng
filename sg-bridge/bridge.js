@@ -217,7 +217,10 @@ const HISTORY_QS = "aid=513641&device_platform=web&region=PH"
 // 返回 submit_id。终态轮询由调用方直连读接口完成（读接口不受 shark 影响）。
 async function generateUiCore({ prompt, model, resolution, ratio, count,
                                dryRun = false }) {
+  const _t = Date.now();
+  console.log(`[ui] core enter dryRun=${dryRun}`);
   const p0 = await ensureLogin();
+  console.log(`[ui] core login ok +${((Date.now() - _t) / 1000).toFixed(1)}s`);
   // 🔴 2026-10-29 **SG 前端改版**：`/ai-tool/image` 已 302 到 `/ai-tool/home`，
   // 图片工具变成首页上的一个 tab（`AI Image`），参数面板也换了形态 ——
   // 旧的三处判据全部失效：`[class*=generate-count-field]` 已不在 DOM、
@@ -490,26 +493,39 @@ async function generateUiCore({ prompt, model, resolution, ratio, count,
     step(`dryRun done ${JSON.stringify(got)}`);
     return got;
   }
+  // 键入 prompt。
+  // ⚠️ 改版后**不要再按 Escape**（旧代码用它关参数面板）：新版 Escape 会把
+  // composer 收起来，`Generate` 按钮随之消失 ⇒ 提交恒超时。
   const comp = p.locator('[contenteditable="true"]').first();
-  await comp.click({ force: true, timeout: 10000 });
-  await p.keyboard.press("Escape").catch(() => {});
-  await comp.click({ force: true, timeout: 10000 });
-  await p.keyboard.type(String(prompt).slice(0, 400), { delay: 15 });
+  await comp.click({ force: true, timeout: 15000 });
   await p.waitForTimeout(400);
-  // 发送按钮：**精确**定位 primary（容器内唯一），禁用则等它启用
-  const sendBtn = p.locator(
-    "[class*='collapsed-submit-button-container'] button.lv-btn-primary"
-  ).first();
-  await sendBtn.waitFor({ state: "visible", timeout: 10000 })
-    .catch(() => {});
-  await p.waitForFunction(
-    () => { const b = document.querySelector(
-      "[class*='collapsed-submit-button-container'] button.lv-btn-primary");
-      return b && !b.disabled; }, { timeout: 15000 }).catch(() => {});
-  await sendBtn.evaluate((b) => {
-    b.click();   // 🔴 DOM click：React onClick 绑定在组件树内，直接触发
-  });
-  const dl0 = Date.now() + 10000;
+  await p.keyboard.type(String(prompt).slice(0, 400), { delay: 15 });
+  await p.waitForTimeout(600);
+  step("prompt typed");
+  // 🔴 发送按钮：2026-10-29 改版后是 composer 右下角的圆形 primary 按钮，
+  // 唯一定位属性 = `aria-label="Generate"`（旧的
+  // `[class*=collapsed-submit-button-container] button.lv-btn-primary` 已消失，
+  // 线上表现为 "locator.evaluate: Timeout 30000ms exceeded"）。
+  const sendPos = () => evR("sendPos", p.evaluate(() => {
+    const vis = (e) => e.getBoundingClientRect().width > 0;
+    const b = [...document.querySelectorAll('button[aria-label="Generate"]')]
+      .find(vis);
+    if (!b) return null;
+    const r = b.getBoundingClientRect();
+    return { x: r.x + r.width / 2, y: r.y + r.height / 2,
+             disabled: !!b.disabled };
+  }), 12000).catch(() => null);
+  // 等它变可用（prompt 落地后 React 才 enable），最多 15s
+  let sp = null;
+  for (let i = 0; i < 30; i++) {
+    sp = await sendPos();
+    if (sp && !sp.disabled) break;
+    await p.waitForTimeout(500);
+  }
+  if (!sp) throw new Error("找不到发送按钮（aria-label=Generate）");
+  if (sp.disabled) throw new Error("发送按钮始终 disabled（prompt 没进 composer？）");
+  step(`send click ${JSON.stringify(sp)}`);
+  await p.mouse.click(sp.x, sp.y);
   // 提交完成即返回 —— submit_id 由入口的请求监听器捕获
   await (await ensurePage()).waitForTimeout(1500);
 }
